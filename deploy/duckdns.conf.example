@@ -1,0 +1,8 @@
+# Copy this to duckdns.conf and fill it in.
+#
+# DUCKDNS_DOMAIN is just the subdomain - if your address is
+# your-name.duckdns.org then put your-name here, nothing else.
+DUCKDNS_DOMAIN=your-subdomain
+
+# From the top of duckdns.org once you are signed in. Treat it like a password.
+DUCKDNS_TOKEN=paste-your-token-here

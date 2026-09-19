@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  .custom-cursor * {
+    cursor: none !important;
+  }
+  body {
+    @apply bg-zinc-950 text-zinc-100;
+  }
+
+  /* Custom Scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-zinc-950;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-zinc-700 rounded-full hover:bg-zinc-600;
+  }
+}
+
+@layer utilities {
+  .animate-stagger-fade-in {
+    /* NOTE: no `opacity: 0` here on purpose. It used to be a base style with
+       the animation relied on to restore it - so any browser that did not run
+       the animation (reduced-motion, in particular) left every card at zero
+       opacity: invisible, but still laid out and clickable. `both` fill-mode
+       gives the same fade while leaving the resting state visible. */
+    animation: fade-in-up 0.5s ease-out both;
+  }
+
+  @keyframes fade-in-up {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .delay-stagger {
+    animation-delay: var(--delay, 0s);
+  }
+
+  .animate-shimmer {
+    animation: shimmer 1.5s infinite linear;
+    background: linear-gradient(to right, #27272a 0%, #3f3f46 50%, #27272a 100%);
+    background-size: 200% 100%;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  /* Jobs indicator: breathes only while work is outstanding */
+  .job-pulse {
+    animation: job-pulse 2.1s ease-in-out infinite;
+  }
+
+  @keyframes job-pulse {
+    0%, 100% {
+      border-color: rgba(63, 63, 70, 0.9);
+      box-shadow: 0 0 0 0 rgba(255, 92, 31, 0);
+    }
+    50% {
+      border-color: rgba(255, 92, 31, 0.95);
+      box-shadow: 0 0 14px -2px rgba(255, 92, 31, 0.55);
+    }
+  }
+
+  .job-dot-pulse {
+    animation: job-dot-pulse 2.1s ease-in-out infinite;
+  }
+
+  @keyframes job-dot-pulse {
+    0%, 100% { opacity: 0.45; transform: scale(0.85); }
+    50%      { opacity: 1;    transform: scale(1.15); }
+  }
+
+  /* Modal / lightbox entrance */
+  .animate-shade-in { animation: shade-in 0.22s ease both; }
+  @keyframes shade-in { from { opacity: 0; } to { opacity: 1; } }
+
+  .animate-pop-in { animation: pop-in 0.34s cubic-bezier(0.22, 1, 0.36, 1) both; }
+  @keyframes pop-in {
+    from { opacity: 0; transform: scale(0.94) translateY(12px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+  }
+
+  /* Respect the OS reduced-motion setting */
+  @media (prefers-reduced-motion: reduce) {
+    .job-pulse, .job-dot-pulse, .animate-pop-in, .animate-shade-in,
+    .animate-stagger-fade-in {
+      animation: none !important;
+      opacity: 1 !important;
+      transform: none !important;
+    }
+  }
+
+  .animate-zoom-in {
+    animation: zoom-in 0.3s ease-out forwards;
+  }
+
+  @keyframes zoom-in {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+  }
+}

@@ -1,0 +1,25 @@
+# Fallback for when you do not have a domain yet.
+#
+# Caddy issues its own certificate. Traffic IS encrypted, but browsers will
+# warn that the issuer is not trusted, because it isn't - it is your own
+# machine. Fine for you and one colleague who can click through once; not
+# something to hand to a client.
+#
+# Run with:  caddy run --config Caddyfile.local
+
+:9443 {
+	tls internal
+
+	encode zstd gzip
+	request_body {
+		max_size 200GB
+	}
+	reverse_proxy localhost:9600 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+			dial_timeout 10s
+		}
+	}
+}

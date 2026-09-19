@@ -1,0 +1,134 @@
+ZERKO FILE MANAGER
+==================
+
+A catalogue for your footage. It reads your drive, builds thumbnails, makes
+everything searchable by what is SAID on camera, tags clips automatically, and
+lets you send clips to clients with a link.
+
+Your files are never moved, renamed or changed. It only reads them.
+
+
+BEFORE YOU START - INSTALL UBUNTU
+---------------------------------
+
+Zerko runs inside WSL (Windows Subsystem for Linux). Most PCs have the WSL
+feature switched on but NO Linux actually installed - that counts as not
+installed, and is the most common thing to trip over.
+
+Check: open PowerShell and run
+
+    wsl -- echo works
+
+If you see "works", you are ready - skip to GETTING STARTED.
+
+If you see "no installed distributions" or an error:
+
+  1. Right-click the Start button -> Terminal (Admin)
+  2. Run:
+
+        wsl --install -d Ubuntu
+
+  3. Restart your PC if it asks.
+  4. Ubuntu opens and asks you to create a username and password.
+     WRITE THAT PASSWORD DOWN. You will need it occasionally, and there is
+     no way to recover it - only to reset it.
+  5. Run the check above again.
+
+This is a one-time thing and takes about five minutes, most of it waiting.
+
+
+GETTING STARTED
+---------------
+
+1. Put this folder somewhere sensible, e.g. C:\Zerko
+
+2. Double-click   Start Zerko.bat
+
+3. The first run installs what it needs inside WSL. A few minutes, once only.
+   Leave the black window open - that window IS the server.
+
+4. Your browser opens by itself. If not, go to:   http://localhost:9600
+
+5. Answer three questions:
+     - the username and password you want
+     - which folder your footage is in
+     - whether to generate proxies (yes) and transcribe speech (see below)
+
+6. It starts cataloguing. A big library takes a while. You can use it meanwhile.
+
+
+TRANSCRIPTION (optional, do it later)
+-------------------------------------
+
+Searching your footage by what you SAY is the best part of this, but it needs
+a 2-3 GB download and really wants an NVIDIA graphics card.
+
+When you are ready:   double-click  Enable Transcription.bat
+
+It detects your GPU and installs the right build. Then restart Zerko.
+
+
+WHERE YOUR DRIVE IS
+-------------------
+
+Inside WSL your Windows drives appear under /mnt - so E:\Footage is /mnt/e/Footage.
+The setup wizard shows you a folder browser, so you can just click through it.
+
+
+DAY TO DAY
+----------
+
+Start:  double-click Start Zerko.bat
+Stop:   close the black window
+Use:    http://localhost:9600
+
+
+SHARING IT BEYOND YOUR OWN PC
+-----------------------------
+
+The deploy folder has scripts for putting it on the internet properly, with a
+real HTTPS certificate, so you can send clients a link. Read deploy/ when you
+get to that - it is not needed for using it at home.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+
+"WSL is not set up"
+    See BEFORE YOU START above.
+
+Thumbnails are blank
+    ffmpeg did not install. In PowerShell:
+        wsl -- bash -lc "sudo apt install -y ffmpeg"
+
+"This site can't be reached" / localhost refused to connect
+    The server is fine - Windows just is not forwarding localhost into WSL.
+    Two options:
+      a) use the address the server window prints next to "On your network",
+         e.g. http://172.29.70.27:9600 - this always works
+      b) double-click  Fix Localhost Access.bat  to make localhost work
+         properly (switches WSL to mirrored networking, restarts WSL)
+
+Port 9600 already in use
+    Something else is using it. Open start.sh in Notepad and change
+    PORT="${PORT:-9600}" to another number, e.g. 9601.
+
+You forgot the password
+    Run:  wsl -- bash -lc "cd /mnt/c/Zerko && ./venv/bin/python reset_password.py"
+    (adjust the path to wherever you put the folder)
+
+It is slow over the network
+    Generate proxies - Dashboard, then the Proxies panel. They are small
+    streaming copies, about 1% of your library size. Without them anyone
+    watching remotely downloads the full-size original.
+
+
+WHAT ARE ALL THESE FILES
+------------------------
+
+venv            the Python it installed for itself
+*.db            the catalogue (your footage is NOT in here, only notes about it)
+zerko.config    which folder you chose
+deploy/         scripts for putting it online later
+
+Deleting the .db files resets the catalogue. Your footage is untouched.

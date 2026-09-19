@@ -1,0 +1,22 @@
+# Anything belonging to a running installation, never to the repo
+venv/
+.venv/
+*.db
+*.db-wal
+*.db-shm
+.env
+zerko.config.json
+duckdns.conf
+Caddyfile
+*.log
+.setup-done
+.requirements-installed
+.update-staged/
+.update-backup/
+thumbnails/
+proxies/
+uploads/
+transcriptions/
+__pycache__/
+*.pyc
+node_modules/
