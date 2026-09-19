@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
-# Pushes this folder to GitHub. Run it from WSL:
-#   cd /mnt/c/Users/$USER_WINDOWS_NAME/odysseus/data/zerko-installer/repo
+# Pushes this folder to GitHub.
 #   bash push-to-github.sh
 #
-# You will be asked for your GitHub username and a Personal Access Token
-# (the token is the password - your normal GitHub password will NOT work).
-# Make a token at: https://github.com/settings/tokens?type=beta
-#   - Repository access: Only select repositories -> zerko-file-manager
-#   - Permissions: Contents = Read and write
+# There is ONE prompt, and it asks for a PASSWORD.
+# Paste your fine-grained Personal Access Token there. Nothing appears
+# on screen while you paste - that is normal. Press Enter.
 set -e
 
 OWNER="${1:-z3r0fx}"
@@ -21,16 +18,25 @@ if [ ! -d .git ]; then
     git commit -m "Zerko File Manager v1.0.0"
 fi
 
+# Username lives in the URL so git never asks for it.
 git remote remove origin 2>/dev/null || true
-git remote add origin "https://github.com/$OWNER/$REPO.git"
+git remote add origin "https://$OWNER@github.com/$OWNER/$REPO.git"
+
+# Remember it, so this is the only time you paste the token.
+git config credential.helper store
 
 echo
-echo "Pushing to https://github.com/$OWNER/$REPO"
-echo "Username: $OWNER"
-echo "Password: paste your Personal Access Token (it stays hidden as you paste)"
+echo "Repo:   https://github.com/$OWNER/$REPO"
 echo
+echo "You will see ONE prompt:  Password for 'https://$OWNER@github.com':"
+echo "Paste the TOKEN there (starts with github_pat_). It stays invisible."
+echo
+
 git push -u origin main
 
 echo
-echo "Done. Now tag the release:"
-echo "  git tag v1.0.0 && git push origin v1.0.0"
+echo "Pushed. Tagging v1.0.0..."
+git tag -f v1.0.0
+git push -f origin v1.0.0
+echo
+echo "Done. Next: make the Release on GitHub and attach the zip."
