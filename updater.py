@@ -33,7 +33,7 @@ CONFIG_PATH = Path(os.environ.get("ZERKO_CONFIG", APP_DIR / "zerko.config.json")
 
 # Where updates come from. Only this repo - never a URL from a response,
 # which is how an update channel turns into an attack.
-GITHUB_OWNER = os.environ.get("ZERKO_GH_OWNER", "")
+GITHUB_OWNER = os.environ.get("ZERKO_GH_OWNER", "z3r0fx")
 GITHUB_REPO = os.environ.get("ZERKO_GH_REPO", "zerko-file-manager")
 
 USER_AGENT = "ZerkoFileManager-Updater"
