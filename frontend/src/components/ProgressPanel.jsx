@@ -12,7 +12,7 @@ export default function ProgressPanel({ tasks, onClose }) {
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-700 bg-gray-900">
         <div className="flex items-center gap-2">
-          <Upload className="w-4 h-4 text-orange-500" />
+          <Upload className="w-4 h-4 text-accent" />
           <h3 className="font-semibold">
             Uploads ({activeTasks.length} active)
           </h3>
@@ -31,7 +31,7 @@ export default function ProgressPanel({ tasks, onClose }) {
         {activeTasks.map(task => (
           <div key={task.id} className="p-4 border-b border-gray-700">
             <div className="flex items-center gap-3 mb-2">
-              <Upload className="w-4 h-4 text-orange-500 animate-pulse" />
+              <Upload className="w-4 h-4 text-accent animate-pulse" />
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium truncate">{task.filename}</p>
                 <p className="text-xs text-gray-400">
@@ -42,7 +42,7 @@ export default function ProgressPanel({ tasks, onClose }) {
             {/* Progress Bar */}
             <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
               <div
-                className="bg-orange-500 h-full transition-all duration-300"
+                className="bg-accent h-full transition-all duration-300"
                 style={{ width: `${task.progress}%` }}
               />
             </div>

@@ -8,6 +8,7 @@ from sqlalchemy import func, select, or_, case, text
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 import os
+import mimetypes
 import re
 import subprocess
 import threading
@@ -23,6 +24,7 @@ from typing import Optional, List
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, Response
 from PIL import Image
 
+import permissions
 from database import init_db, get_db, SessionLocal, User, IndexedFolder, Video, Tag, Note, video_tags, TranscriptionSegment, Share, ShareSelect
 from auth import (
     get_password_hash, verify_password, create_access_token,
@@ -31,6 +33,8 @@ from auth import (
 )
 from video_processor import scan_folder, format_file_size, format_duration, generate_thumbnail, get_video_duration, get_duration_fast, get_technical_metadata, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS
 import previews
+import files_api
+import photo_proxy
 from media_type_utils import get_media_type
 from job_manager import job_manager
 
@@ -503,29 +507,51 @@ _LOGIN_MAX_FAILS = 8
 # X-Forwarded-For is a header the CLIENT writes. Believing it from anyone lets an
 # attacker send a new made-up address with every guess and never reach the
 # limit. It is only trusted when the connection really comes from a proxy we
-# run - Caddy on this machine by default (see deploy/). Add other proxy
-# addresses, comma-separated, in the TRUSTED_PROXIES environment variable.
-_TRUSTED_PROXIES = {"127.0.0.1", "::1"} | {
-    p.strip() for p in os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()
-}
+# run: Caddy on this machine, seen here as loopback or as the WSL/Docker
+# gateway (172.16.0.0/12). Add other proxies, comma-separated addresses or
+# CIDR ranges, in the TRUSTED_PROXIES environment variable.
+import ipaddress
+import contextvars
+
+
+def _parse_nets(items):
+    nets = []
+    for it in items:
+        try:
+            nets.append(ipaddress.ip_network(it.strip(), strict=False))
+        except ValueError:
+            pass
+    return nets
+
+
+_TRUSTED_NETS = _parse_nets(
+    ["127.0.0.0/8", "::1/128", "172.16.0.0/12"]
+    + [p for p in os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()])
+
+
+def _is_trusted_proxy(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in n for n in _TRUSTED_NETS if n.version == ip.version)
 
 
 def _client_ip(request: Request) -> str:
     peer = request.client.host if request.client else "unknown"
-    if peer in _TRUSTED_PROXIES:
+    if _is_trusted_proxy(peer):
         fwd = request.headers.get("x-forwarded-for")
         if fwd:
             # The proxy appends the address it saw, so the real client is the
             # right-most entry that is not itself one of our proxies.
             for hop in reversed([h.strip() for h in fwd.split(",") if h.strip()]):
-                if hop not in _TRUSTED_PROXIES:
+                if not _is_trusted_proxy(hop):
                     return hop
     return peer
 
 
 # The share endpoints do not take a Request, so the caller's address is
 # remembered per request here for their password limiter to read.
-import contextvars
 _request_ip = contextvars.ContextVar("request_ip", default="unknown")
 
 
@@ -659,7 +685,15 @@ def admin_set_password(user_id: int, payload: dict = Body(...), db: Session = De
 
 @app.get("/api/me")
 def get_me(current_user: User = Depends(get_current_user)):
-    return {"id": current_user.id, "username": current_user.username, "role": current_user.role}
+    # The capability list is what the UI hides buttons with. It is a
+    # convenience, never the guard - the middleware is the guard.
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "role": current_user.role,
+        "role_label": permissions.ROLE_LABELS.get(current_user.role, current_user.role),
+        "capabilities": sorted(permissions.caps_for(current_user.role)),
+    }
 
 @app.post("/api/videos/batch-transcribe")
 def batch_transcribe(request: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -845,12 +879,49 @@ def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_a
     } for u in db.query(User).all()]
 
 @app.post("/api/register")
-def register_user(user: UserCreate, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
-    hashed_password = get_password_hash(user.password)
-    new_user = User(username=user.username, email=user.email, hashed_password=hashed_password, role=user.role)
+def register_user(user: UserCreate, db: Session = Depends(get_db),
+                  current_user: User = Depends(get_current_user)):
+    """Create an account.
+
+    Admins may create any role. Editors may create clients and viewers only -
+    an account that can mint its own peers can mint an admin one persuaded
+    colleague later, so the ceiling is deliberate and checked here rather than
+    in the browser.
+    """
+    role = (user.role or "client").lower()
+    if role not in permissions.VALID_ROLES:
+        raise HTTPException(status_code=400,
+                            detail=f"Role must be one of {', '.join(permissions.VALID_ROLES)}")
+
+    if current_user.role != "admin":
+        if not permissions.can(current_user.role, permissions.CREATE_CLIENTS):
+            raise HTTPException(status_code=403, detail="Your account cannot create other accounts.")
+        if role not in permissions.EDITOR_MAY_CREATE:
+            raise HTTPException(
+                status_code=403,
+                detail="You can create client and view-only accounts. "
+                       "Ask an administrator for anything above that.")
+
+    username = (user.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+    # Same floor as changing your own password - a new account should not be
+    # allowed to start weaker than an existing one is allowed to become.
+    if len(user.password or "") < 10:
+        raise HTTPException(status_code=400, detail="Password must be at least 10 characters")
+    # Without this the unique index raises an IntegrityError and the caller
+    # gets a 500 that says nothing.
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail="That username is already taken")
+    if user.email and db.query(User).filter(User.email == user.email).first():
+        raise HTTPException(status_code=400, detail="That email is already in use")
+
+    new_user = User(username=username, email=user.email,
+                    hashed_password=get_password_hash(user.password), role=role)
     db.add(new_user)
     db.commit()
-    return {"message": "User created successfully"}
+    return {"message": "User created successfully", "id": new_user.id,
+            "username": new_user.username, "role": new_user.role}
 
 @app.delete("/api/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
@@ -930,6 +1001,12 @@ def descendant_folder_ids(db: Session, folder_id: int):
 def list_folders_tree(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Folders as a nested tree, mirroring the directory structure on disk."""
     counts = dict(db.query(Video.folder_id, func.count(Video.id)).group_by(Video.folder_id).all())
+    # how many of each kind (video / photo / audio) each folder holds directly
+    by_type = {}
+    for fid, mt, n in (db.query(Video.folder_id, Video.media_type, func.count(Video.id))
+                       .filter((Video.is_active == True) | (Video.is_active == None))
+                       .group_by(Video.folder_id, Video.media_type).all()):
+        by_type.setdefault(fid, {})[mt or "video"] = n
     folders = db.query(IndexedFolder).order_by(IndexedFolder.name.asc()).all()
 
     by_parent = {}
@@ -939,6 +1016,11 @@ def list_folders_tree(db: Session = Depends(get_db), current_user: User = Depend
     def build(folder):
         kids = [build(c) for c in by_parent.get(folder.id, [])]
         own = counts.get(folder.id, 0)
+        own_types = by_type.get(folder.id, {})
+        total_types = dict(own_types)
+        for k in kids:
+            for t, n in k["total_by_type"].items():
+                total_types[t] = total_types.get(t, 0) + n
         return {
             "id": folder.id,
             "name": (folder.relative_path or folder.name or "").split("/")[-1] or folder.name,
@@ -947,10 +1029,16 @@ def list_folders_tree(db: Session = Depends(get_db), current_user: User = Depend
             "path": folder.path,
             "video_count": own,
             "total_count": own + sum(k["total_count"] for k in kids),
+            "by_type": own_types,
+            "total_by_type": total_types,
             "children": kids,
         }
 
     return [build(f) for f in by_parent.get(None, [])]
+
+
+_thumb_repair = {"running": False, "done": 0, "fixed": 0, "total": 0,
+                 "message": "idle", "failures": []}
 
 
 @app.post("/api/rescan")
@@ -973,6 +1061,53 @@ def rescan_media_root(payload: Optional[dict] = Body(None), db: Session = Depend
             result = index_tree(queue_proxies=queue_proxies, progress=progress)
             _rescan_state["stats"] = result
             _rescan_state["message"] = "Scan complete"
+
+            # Anything that failed to thumbnail during the walk gets another
+            # go - a file still being copied in is the common case.
+            try:
+                from indexer import make_thumbnail, thumb_name
+                thumbs_dir = UPLOAD_ROOT / "thumbnails"
+                thumbs_dir.mkdir(parents=True, exist_ok=True)
+                s2 = SessionLocal()
+                redrawn = 0
+                try:
+                    for v in (s2.query(Video)
+                              .filter(Video.is_active != False,
+                                      Video.media_type.in_(("video", "photo")),
+                                      Video.thumbnail_path.is_(None)).all()):
+                        real = resolve_media_path(v.filepath)
+                        if not real or not os.path.exists(real):
+                            continue
+                        name = thumb_name(real)
+                        if make_thumbnail(real, str(thumbs_dir / name), v.media_type):
+                            v.thumbnail_path = f"/thumbnails/{name}"
+                            redrawn += 1
+                    s2.commit()
+                finally:
+                    s2.close()
+                if redrawn:
+                    print(f"[rescan] redrew {redrawn} thumbnail(s)", flush=True)
+            except Exception as e:
+                print(f"[rescan] thumbnail pass failed: {e}", flush=True)
+
+            # Tag what just arrived. Tagging otherwise only ran at setup and
+            # after a transcription, so footage copied in sat untagged until
+            # something else happened to it - and tags are the only way most
+            # of this library is findable.
+            try:
+                _rescan_state["message"] = "Scan complete - tagging new files..."
+                import enrich
+                tagged = enrich.run_tagging(
+                    progress=lambda m: _rescan_state.update(message=f"Tagging: {m}"),
+                    include_transcripts=True)
+                _rescan_state["message"] = "Scan complete"
+                if isinstance(tagged, dict) and tagged.get("tagged"):
+                    _rescan_state["message"] = (
+                        f"Scan complete - {tagged['tagged']} files tagged")
+            except Exception as e:
+                # A tagging failure must not make a successful scan look failed.
+                print(f"[rescan] tagging after scan failed: {e}", flush=True)
+                _rescan_state["message"] = "Scan complete (tagging failed)"
         except Exception as e:
             _rescan_state["message"] = f"Scan failed: {e}"
         finally:
@@ -980,6 +1115,104 @@ def rescan_media_root(payload: Optional[dict] = Body(None), db: Session = Depend
 
     threading.Thread(target=run, daemon=True).start()
     return {"status": "started"}
+
+
+@app.post("/api/thumbnails/repair")
+def repair_thumbnails(db: Session = Depends(get_db),
+                      current_user: User = Depends(get_admin_user)):
+    """Redraw thumbnails that are missing, and say why any cannot be.
+
+    A thumbnail can fail the first time for ordinary reasons - the file was
+    still being copied, ffmpeg timed out on a huge clip - and nothing ever
+    tried again. This finds rows with no thumbnail, rows pointing at a file
+    that is gone, and empty leftovers, tries several methods on each, refreshes
+    the size and length of clips that were indexed while still incomplete, and
+    keeps the reason for every one it could not fix so the panel can show it.
+    """
+    if _thumb_repair["running"]:
+        return {"status": "already_running", "message": _thumb_repair["message"]}
+    _thumb_repair.update(running=True, done=0, fixed=0, total=0,
+                         message="Looking...", failures=[])
+
+    def run():
+        from indexer import thumb_name
+        s = SessionLocal()
+        try:
+            thumbs_dir = UPLOAD_ROOT / "thumbnails"
+            thumbs_dir.mkdir(parents=True, exist_ok=True)
+            rows = (s.query(Video)
+                    .filter(or_(Video.is_active == True, Video.is_active == None),
+                            Video.media_type.in_(("video", "photo")))
+                    .all())
+            todo = []
+            for v in rows:
+                if not v.thumbnail_path:
+                    todo.append(v)
+                    continue
+                try:
+                    good = (thumbs_dir / os.path.basename(v.thumbnail_path)).stat().st_size > 0
+                except OSError:
+                    good = False
+                if not good:
+                    todo.append(v)
+
+            _thumb_repair["total"] = len(todo)
+            for v in todo:
+                real = resolve_media_path(v.filepath)
+                name = thumb_name(real or v.filepath)
+                out = thumbs_dir / name
+                try:
+                    if out.exists() and out.stat().st_size == 0:
+                        out.unlink()               # an empty leftover counts as missing
+                except OSError:
+                    pass
+                if not real or not os.path.exists(real):
+                    ok, why = False, ("the file is not where the catalog expects it "
+                                      "(moved, renamed, or its drive is not connected)")
+                else:
+                    ok, why = previews.make_thumbnail(real, str(out), v.media_type)
+                if ok:
+                    v.thumbnail_path = f"/thumbnails/{name}"
+                    _thumb_repair["fixed"] += 1
+                    # A clip indexed while it was still being copied has the
+                    # size and length it had THEN. It is readable now, so update.
+                    try:
+                        if v.media_type == "video":
+                            v.file_size = os.path.getsize(real)
+                            if not v.duration:
+                                v.duration = get_duration_fast(real) or 0.0
+                    except Exception:
+                        pass
+                elif len(_thumb_repair["failures"]) < 100:
+                    _thumb_repair["failures"].append(
+                        {"id": v.id, "filename": v.filename, "reason": why})
+                _thumb_repair["done"] += 1
+                _thumb_repair["message"] = f"{_thumb_repair['done']}/{len(todo)}"
+                if _thumb_repair["done"] % 20 == 0:
+                    s.commit()
+            s.commit()
+            bad = len(todo) - _thumb_repair["fixed"]
+            if not todo:
+                _thumb_repair["message"] = "Every thumbnail is already there"
+            elif bad:
+                _thumb_repair["message"] = (
+                    f"Redrew {_thumb_repair['fixed']} of {len(todo)}. "
+                    f"{bad} could not be drawn - see why below.")
+            else:
+                _thumb_repair["message"] = f"Redrew all {len(todo)} missing thumbnails"
+        except Exception as e:
+            _thumb_repair["message"] = f"Failed: {e}"
+        finally:
+            s.close()
+            _thumb_repair["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/thumbnails/repair/status")
+def repair_thumbnails_status(current_user: User = Depends(get_current_user)):
+    return _thumb_repair
 
 
 @app.get("/api/rescan/status")
@@ -1304,8 +1537,8 @@ def delete_video(video_id: int, delete_file: bool = False, permanent: bool = Fal
     # Default: move the file into _Trash and keep the record, so it can be put
     # back. Only an explicit permanent delete destroys anything.
     if delete_file and not permanent:
-        if current_user.role != "admin":
-            raise HTTPException(status_code=403, detail="Only admins can change files on disk")
+        if not permissions.can(current_user.role, permissions.TRASH):
+            raise HTTPException(status_code=403, detail="Your account cannot delete files.")
         try:
             if real and os.path.exists(real):
                 video.original_path = video.original_path or video.filepath
@@ -1319,8 +1552,11 @@ def delete_video(video_id: int, delete_file: bool = False, permanent: bool = Fal
 
     removed_file = False
     if permanent:
-        if current_user.role != "admin":
-            raise HTTPException(status_code=403, detail="Only admins can delete files from disk")
+        if not permissions.can(current_user.role, permissions.HARD_DELETE):
+            raise HTTPException(
+                status_code=403,
+                detail="Only an administrator can delete files permanently. "
+                       "Move them to the trash instead.")
         try:
             if real and os.path.exists(real):
                 os.remove(real)
@@ -1500,6 +1736,8 @@ def bulk_action(payload: dict = Body(...), db: Session = Depends(get_db),
             v.tags = [tg for tg in v.tags if tg.id not in tag_ids]
             affected += 1
     elif action == "move":
+        if not permissions.can(current_user.role, permissions.ORGANISE):
+            raise HTTPException(status_code=403, detail="Your account cannot move or rename files.")
         folder_id = payload.get("folder_id")
         folder = db.query(IndexedFolder).filter(IndexedFolder.id == folder_id).first() if folder_id else None
         for v in videos:
@@ -1516,18 +1754,35 @@ def bulk_action(payload: dict = Body(...), db: Session = Depends(get_db),
             v.status = new_status
             affected += 1
     elif action == "delete":
+        # Bulk delete used to drop the database rows and leave the files on
+        # disk - which meant the footage still ate the drive but no longer
+        # appeared anywhere, and nothing could put it back. It moves things to
+        # the trash instead; emptying the trash is the permanent step, and
+        # that is an administrator's to take.
+        if not permissions.can(current_user.role, permissions.TRASH):
+            raise HTTPException(status_code=403, detail="Your account cannot delete files.")
         for v in videos:
-            db.query(TranscriptionSegment).filter(TranscriptionSegment.video_id == v.id).delete()
-            db.query(Note).filter(Note.media_id == v.id).delete()
-            v.tags = []
-            db.delete(v)
-            affected += 1
+            try:
+                real = resolve_media_path(v.filepath)
+                if real and os.path.exists(real):
+                    v.original_path = v.original_path or v.filepath
+                    v.filepath = move_to_trash(real)
+                v.is_active = False
+                affected += 1
+            except Exception as e:
+                print(f"Trash failed for {v.filename}: {e}")
     elif action == "transcribe":
+        if not permissions.can(current_user.role, permissions.TRANSCRIBE):
+            raise HTTPException(status_code=403, detail="Your account cannot start transcriptions.")
         for v in videos:
             if v.media_type in ("video", "audio"):
                 job_manager.add_job(v.id, "transcribe")
                 affected += 1
     elif action == "proxy":
+        if not permissions.can(current_user.role, permissions.PROXY):
+            raise HTTPException(
+                status_code=403,
+                detail="Only an administrator can start or stop proxy generation.")
         for v in videos:
             if v.media_type == "video":
                 job_manager.add_job(v.id, "proxy")
@@ -2049,16 +2304,8 @@ def upload_chunk(
 
 WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
-# The only writes a read-only account may perform: signing in, changing their
-# OWN password, and minting the short-lived tokens that let their browser
-# stream and download the media they can already see.
-VIEWER_WRITE_ALLOWLIST = (
-    "/api/login",
-    "/api/logout",
-    "/api/me/password",
-    "/api/video-access-token",
-)
-VIEWER_WRITE_ALLOWED_SUFFIXES = ("/download-token",)
+# What each role may do now lives in permissions.py, as one table rather than
+# an allowlist of exceptions to a single hardcoded role.
 
 
 def _role_from_request(request: Request) -> Optional[str]:
@@ -2080,17 +2327,25 @@ def _role_from_request(request: Request) -> Optional[str]:
 
 
 @app.middleware("http")
-async def enforce_read_only_role(request: Request, call_next):
+async def enforce_role_permissions(request: Request, call_next):
+    """The single place roles are enforced.
+
+    Every /api/ request is matched against the rule table in permissions.py.
+    Requests with no usable token fall through untouched - those are rejected
+    by the endpoint's own dependency, which is what produces a 401 rather than
+    a confusing 403.
+    """
     path = request.url.path
-    if (request.method in WRITE_METHODS
-            and path.startswith("/api/")
-            and path not in VIEWER_WRITE_ALLOWLIST
-            and not path.endswith(VIEWER_WRITE_ALLOWED_SUFFIXES)):
-        if _role_from_request(request) == "viewer":
-            return JSONResponse(
-                status_code=403,
-                content={"detail": "Your account has view-only access."},
-            )
+    if path.startswith("/api/"):
+        matched, cap = permissions.required_capability(request.method, path)
+        if matched and cap is not None and cap not in permissions.UNIVERSAL_CAPS:
+            role = _role_from_request(request)
+            if role is not None and not permissions.can(role, cap):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": permissions.DENIALS.get(
+                        cap, "Your account does not have access to that.")},
+                )
     return await call_next(request)
 
 # ---------------------------------------------------------------------------
@@ -2111,7 +2366,7 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 
 # --- roles and account security -------------------------------------------
 
-VALID_ROLES = ("admin", "user", "viewer")
+VALID_ROLES = permissions.VALID_ROLES
 
 
 @app.post("/api/users/{user_id}/role")
@@ -2985,6 +3240,36 @@ def _share_state(db: Session, token: str, password: Optional[str] = None) -> Sha
     return share
 
 
+def _intake_folder(db: Session, title: str):
+    """A holding folder for one upload link, under _Incoming.
+
+    Kept out of the library's own folder tree by the leading underscore, the
+    same convention _Trash uses, so it sorts to the top and is obviously not
+    a project.
+    """
+    safe = re.sub(r'[<>:"|?*/\\]', "_", (title or "Uploads")).strip() or "Uploads"
+    base = UPLOAD_ROOT / "_Incoming"
+    target = base / safe
+    n = 2
+    while target.exists() and db.query(IndexedFolder).filter(
+            IndexedFolder.path == str(target)).first():
+        target = base / f"{safe} ({n})"
+        n += 1
+    target.mkdir(parents=True, exist_ok=True)
+    row = ensure_folder_row(db, target)
+    return row.id if row else None
+
+
+def _share_folder_name(db: Session, share: Share) -> Optional[str]:
+    """Where an upload link drops files, in words the viewer can recognise.
+    Share has no folder relationship, so this is a plain lookup rather than
+    an attribute that would quietly be None."""
+    if not share.folder_id:
+        return None
+    row = db.query(IndexedFolder).filter(IndexedFolder.id == share.folder_id).first()
+    return row.name if row else None
+
+
 def _share_payload(db: Session, share: Share):
     vids = _share_videos(db, share)
     return {
@@ -2992,6 +3277,9 @@ def _share_payload(db: Session, share: Share):
         "message": share.message,
         "allow_download": bool(share.allow_download),
         "allow_selects": bool(share.allow_selects),
+        "allow_upload": bool(share.allow_upload),
+        "intake_folder_id": share.intake_folder_id,
+        "upload_folder": _share_folder_name(db, share),
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
         "count": len(vids),
         "videos": [{
@@ -3015,8 +3303,19 @@ def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
 
     folder_id = payload.get("folder_id")
     video_ids = payload.get("video_ids") or []
-    if folder_id is None and not video_ids:
+    # An upload-only link is legitimate with neither: it starts empty and
+    # fills up from a phone, so it needs no folder and no selection.
+    if folder_id is None and not video_ids and not payload.get("allow_upload"):
         raise HTTPException(status_code=400, detail="Share a folder or a selection")
+    # An upload link gets a holding folder of its own rather than writing
+    # straight into the library. Whatever a phone sends stays there until
+    # someone at a desk looks at it and decides where it belongs - which is
+    # the difference between an inbox and a mess.
+    intake_id = None
+    if payload.get("allow_upload"):
+        intake_id = _intake_folder(db, payload.get("title") or "Uploads")
+        if folder_id is None:
+            folder_id = intake_id
 
     days = payload.get("expires_days")
     expires = None
@@ -3041,6 +3340,8 @@ def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
         expires_at=expires,
         allow_download=bool(payload.get("allow_download", False)),
         allow_selects=bool(payload.get("allow_selects", True)),
+        allow_upload=bool(payload.get("allow_upload", False)),
+        intake_folder_id=intake_id,
         created_by=current_user.username,
     )
     db.add(share)
@@ -3072,6 +3373,16 @@ def list_shares(db: Session = Depends(get_db),
             "views": sh.view_count or 0,
             "last_viewed_at": sh.last_viewed_at.isoformat() if sh.last_viewed_at else None,
             "selects": picked,
+            "allow_upload": bool(sh.allow_upload),
+            "uploads": sh.upload_count or 0,
+            "intake_folder_id": sh.intake_folder_id,
+            # How much is sitting in the inbox right now - uploads counts
+            # everything ever sent, this counts what is still unfiled.
+            "intake_waiting": (
+                db.query(func.count(Video.id))
+                  .filter(Video.folder_id == sh.intake_folder_id,
+                          Video.is_active != False).scalar()
+                if sh.intake_folder_id else 0),
             "created_by": sh.created_by,
             "created_at": sh.created_at.isoformat() if sh.created_at else None,
         })
@@ -3295,9 +3606,28 @@ def public_stream(token: str, video_id: int, password: Optional[str] = None,
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(path, filename=v.filename,
-                        media_type="application/octet-stream",
-                        headers={"Accept-Ranges": "bytes"})
+    # Content type matters more than it looks. FileResponse(filename=...) sets
+    # Content-Disposition: attachment, and octet-stream tells the browser "this
+    # is a blob" - between them, a <video> on iOS Safari refuses to play and
+    # the clip downloads instead. So: a real media type and inline when the
+    # viewer is watching, attachment only when they asked to keep it.
+    ctype = mimetypes.guess_type(v.filename or path)[0]
+    if not ctype:
+        ctype = "video/mp4" if (v.media_type or "video") == "video" else "application/octet-stream"
+
+    if download:
+        return FileResponse(path, filename=v.filename,
+                            media_type="application/octet-stream",
+                            headers={"Accept-Ranges": "bytes"})
+
+    return FileResponse(
+        path,
+        media_type=ctype,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{os.path.basename(v.filename or "clip")}"',
+        },
+    )
 
 
 
@@ -3411,6 +3741,167 @@ def public_download_zip(token: str, ids: Optional[str] = None,
     )
 
 
+@app.get("/api/shares/{share_id}/intake")
+def share_intake(share_id: int, db: Session = Depends(get_db),
+                 current_user: User = Depends(get_current_user)):
+    """What has arrived through this link and not been filed yet."""
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Link not found")
+    if not share.intake_folder_id:
+        return {"folder_id": None, "folder": None, "count": 0, "items": []}
+
+    folder = db.query(IndexedFolder).filter(
+        IndexedFolder.id == share.intake_folder_id).first()
+    rows = (db.query(Video)
+            .filter(Video.folder_id == share.intake_folder_id, Video.is_active != False)
+            .order_by(Video.uploaded_at.desc())
+            .all())
+    return {
+        "folder_id": share.intake_folder_id,
+        "folder": folder.name if folder else None,
+        "count": len(rows),
+        "items": [{
+            "id": v.id,
+            "filename": v.filename,
+            "media_type": v.media_type,
+            "file_size": v.file_size,
+            "duration": v.duration,
+            "thumbnail_path": v.thumbnail_path,
+            "uploaded_by": v.uploaded_by,
+            "uploaded_at": v.uploaded_at.isoformat() if v.uploaded_at else None,
+        } for v in rows],
+    }
+
+
+@app.post("/api/shares/{share_id}/intake/file")
+def file_intake(share_id: int, payload: dict = Body(...),
+                db: Session = Depends(get_db),
+                current_user: User = Depends(get_current_user)):
+    """Move some or all of an inbox into a folder - an existing one, or a new
+    project created on the spot. This is the deliberate step: nothing a phone
+    sends reaches the library proper until someone does this."""
+    if not permissions.can(current_user.role, permissions.ORGANISE):
+        raise HTTPException(status_code=403, detail="Your account cannot move files.")
+
+    share = db.query(Share).filter(Share.id == share_id).first()
+    if not share:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    video_ids = (payload or {}).get("video_ids")
+    folder_id = (payload or {}).get("folder_id")
+    new_name = ((payload or {}).get("new_folder") or "").strip()
+
+    if new_name:
+        if any(ch in new_name for ch in ("/", "\\", "..")) or new_name in (".", ".."):
+            raise HTTPException(status_code=400, detail="Name cannot contain slashes or ..")
+        safe = re.sub(r'[<>:"|?*]', "_", new_name)
+        target_dir = UPLOAD_ROOT / safe
+        target_dir.mkdir(parents=True, exist_ok=True)
+        row = ensure_folder_row(db, target_dir)
+        if not row:
+            raise HTTPException(status_code=500, detail="Could not create that folder")
+        folder_id = row.id
+
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="Choose a folder, or name a new one")
+
+    folder = db.query(IndexedFolder).filter(IndexedFolder.id == folder_id).first()
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    q = db.query(Video).filter(Video.folder_id == share.intake_folder_id,
+                               Video.is_active != False)
+    if video_ids:
+        q = q.filter(Video.id.in_([int(v) for v in video_ids]))
+    rows = q.all()
+
+    moved, failed = 0, []
+    for v in rows:
+        try:
+            move_media_file(db, v, folder)
+            moved += 1
+        except Exception as e:
+            failed.append(f"{v.filename}: {e}")
+    db.commit()
+    return {"status": "ok", "moved": moved, "folder": folder.name,
+            "folder_id": folder.id, "failed": failed}
+
+
+@app.post("/api/public/share/{token}/upload")
+def public_upload(token: str,
+                  file: UploadFile = File(...),
+                  password: Optional[str] = Form(None),
+                  sender: Optional[str] = Form(None),
+                  db: Session = Depends(get_db)):
+    """Accept a file through a share link that has uploads switched on.
+
+    This is how a phone gets footage into the library without an account: the
+    token is the credential, it can expire, and it can only ever write into
+    the one folder the link was made for. Nothing here trusts a path from the
+    request - the filename is stripped to a basename and made unique inside
+    the destination, so '../' in a filename goes nowhere.
+    """
+    share = _share_state(db, token, password)
+    if not share.allow_upload:
+        raise HTTPException(status_code=403, detail="This link does not accept uploads")
+    target_folder_id = share.intake_folder_id or share.folder_id
+    if target_folder_id is None:
+        raise HTTPException(status_code=400, detail="This link has no destination folder")
+
+    os.makedirs(UPLOAD_ROOT, exist_ok=True)
+    dest_dir = upload_destination_dir(db, target_folder_id)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    safe_name = os.path.basename(file.filename or "upload")
+    if not safe_name or safe_name in (".", ".."):
+        raise HTTPException(status_code=400, detail="That file has no usable name")
+    file_path = unique_destination(dest_dir, safe_name)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer, COPY_BUFFER)
+
+    media_type = get_media_type(safe_name)
+    os.makedirs(UPLOAD_ROOT / "thumbnails", exist_ok=True)
+    thumbnail_filename = f"{uuid.uuid4()}.jpg"
+    thumb_path = UPLOAD_ROOT / "thumbnails" / thumbnail_filename
+
+    def generate_thumb_bg():
+        try:
+            if media_type in ('video', 'photo'):
+                ok, why = previews.make_thumbnail(str(file_path), str(thumb_path), media_type)
+                if not ok:
+                    print(f"Thumbnail failed for {file_path}: {why}")
+        except Exception as e:
+            print(f"Thumbnail generation failed for {file_path}: {e}")
+
+    threading.Thread(target=generate_thumb_bg, daemon=True).start()
+
+    who = (sender or "").strip()[:60] or "share link"
+    video = Video(
+        filename=file_path.name,
+        filepath=str(file_path),
+        file_size=os.path.getsize(file_path),
+        duration=get_duration_fast(str(file_path)) if media_type == "video" else 0.0,
+        thumbnail_path=(f"/thumbnails/{thumbnail_filename}" if media_type in ("video", "photo") else None),
+        folder_id=target_folder_id,
+        uploaded_by=f"{who} (link)",
+        uploaded_at=datetime.utcnow(),
+        status="raw",
+        media_type=media_type,
+    )
+    db.add(video)
+    share.upload_count = (share.upload_count or 0) + 1
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Could not save that file")
+    db.refresh(video)
+    return {"status": "ok", "id": video.id, "filename": video.filename,
+            "media_type": video.media_type, "size": video.file_size}
+
+
 @app.post("/api/public/share/{token}/select")
 def public_select(token: str, payload: dict = Body(...),
                   db: Session = Depends(get_db)):
@@ -3477,6 +3968,13 @@ def verify_latest_backup(current_user: User = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="No backups yet")
     ok = catalog_backup.verify(latest)
     return {"status": "ok" if ok else "failed", "name": latest.name}
+
+
+# Files: a general shared file store (routes, tables and storage location).
+files_api.install(app, UPLOAD_ROOT)
+
+# Photo export: 16:9 copies of photos as a ZIP, plus saved per-photo framing.
+photo_proxy.install(app, UPLOAD_ROOT, resolve_media_path)
 
 
 # --- first-run setup -------------------------------------------------------
@@ -3556,6 +4054,15 @@ if __name__ == "__main__":
         _start_update_watcher()
     except Exception as e:
         print(f"  [!] Could not start the update watcher: {e}")
+
+    # Dynamic DNS, in-process. The scheduled task this replaces opened a
+    # console window every fifteen minutes and took focus with it.
+    try:
+        import dns_refresh
+        if dns_refresh.start_scheduler():
+            print("  Dynamic DNS refresh: on (every 15 minutes)", flush=True)
+    except Exception as e:
+        print(f"  [!] Could not start the DNS refresh: {e}")
 
     port = int(os.environ.get("PORT", 9600))
     host = os.environ.get("HOST", "0.0.0.0")

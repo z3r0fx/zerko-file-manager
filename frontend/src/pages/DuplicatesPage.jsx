@@ -145,8 +145,8 @@ export default function DuplicatesPage() {
           </div>
         ) : (
           <>
-            <div className="mb-5 flex items-center gap-3 rounded-xl border border-[#ff5c1f]/30 bg-[#ff5c1f]/10 px-4 py-3">
-              <HardDrive className="h-5 w-5 shrink-0 text-[#ff5c1f]" />
+            <div className="mb-5 flex items-center gap-3 rounded-xl border border-accent/30 bg-accent/10 px-4 py-3">
+              <HardDrive className="h-5 w-5 shrink-0 text-accent" />
               <p className="text-sm text-zinc-200">
                 <strong className="font-mono">{data.reclaimable_formatted}</strong> can be reclaimed
                 across <strong>{data.group_count}</strong> groups.
@@ -160,7 +160,7 @@ export default function DuplicatesPage() {
             {plans?.plans?.length > 0 && (
               <div className="mb-6 rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
                 <h2 className="mb-1 flex items-center gap-2 text-sm font-semibold text-zinc-100">
-                  <Zap className="h-4 w-4 text-[#ff5c1f]" /> Quick cleanup
+                  <Zap className="h-4 w-4 text-accent" /> Quick cleanup
                 </h2>
                 <p className="mb-4 text-xs leading-relaxed text-zinc-500">
                   Your duplicates aren't random — the same folders copy each other over and over.
@@ -173,7 +173,7 @@ export default function DuplicatesPage() {
                     <div key={p.key} className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-3">
                       <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[11px] text-zinc-500">
                         <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-zinc-300">{p.groups} groups</span>
-                        <span className="text-[#ff5c1f]">{p.reclaimable_formatted}</span>
+                        <span className="text-accent">{p.reclaimable_formatted}</span>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
                         {p.folders.map((f, i) => (
@@ -231,7 +231,7 @@ export default function DuplicatesPage() {
                     <span className="flex items-center gap-2 font-mono text-xs text-zinc-400">
                       <Copy className="h-3.5 w-3.5" />
                       {g.files.length} copies · {g.size_formatted} each ·
-                      <span className="text-[#ff5c1f]">reclaim {g.reclaimable_formatted}</span>
+                      <span className="text-accent">reclaim {g.reclaimable_formatted}</span>
                       {!g.verified && (
                         <span className="flex items-center gap-1 text-amber-500" title="Matched on a partial signature">
                           <AlertTriangle className="h-3 w-3" /> quick match
@@ -295,7 +295,7 @@ export default function DuplicatesPage() {
             <div className="border-b border-zinc-800 px-5 py-4">
               <h2 className="text-base font-medium text-zinc-100">{preview.label}</h2>
               <p className="mt-1 text-sm text-zinc-400">
-                <strong className="font-mono text-[#ff5c1f]">{preview.delete_count} files</strong> would go to the trash,
+                <strong className="font-mono text-accent">{preview.delete_count} files</strong> would go to the trash,
                 freeing <strong className="font-mono">{preview.reclaimable_formatted}</strong>.
                 One copy of every clip is kept.
                 {preview.skipped > 0 && (

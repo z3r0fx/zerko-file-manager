@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Link2, Copy, Check, Trash2, Heart, Eye, Clock, Download, RefreshCw, ExternalLink } from 'lucide-react';
+import { Link2, Copy, Check, Trash2, Heart, Eye, Clock, Download, RefreshCw, ExternalLink, Inbox, QrCode } from 'lucide-react';
 import { apiCall } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
+import IntakePanel from '../components/shared/IntakePanel';
+import ShareDialog from '../components/shared/ShareDialog';
+import QRCode from 'qrcode';
 
 export default function SharesPage() {
   const navigate = useNavigate();
@@ -9,6 +12,9 @@ export default function SharesPage() {
   const [loading, setLoading] = useState(true);
   const [openId, setOpenId] = useState(null);
   const [selects, setSelects] = useState(null);
+  const [intakeShare, setIntakeShare] = useState(null);
+  const [qrShare, setQrShare] = useState(null);
+  const [creating, setCreating] = useState(false);
   const [copiedId, setCopiedId] = useState(null);
 
   const load = useCallback(async () => {
@@ -46,14 +52,22 @@ export default function SharesPage() {
       <div className="mx-auto max-w-5xl">
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-medium text-zinc-100">Client links</h1>
+            <h1 className="text-xl font-medium text-zinc-100">Portals</h1>
             <p className="mt-1 text-sm text-zinc-500">
               Links you have sent out, and what came back.
             </p>
           </div>
-          <button onClick={load} className="flex items-center gap-2 rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800">
-            <RefreshCw className="h-4 w-4" /> Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={load} className="flex items-center gap-2 rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 transition hover:border-zinc-600 hover:bg-zinc-800">
+              <RefreshCw className="h-4 w-4" /> Refresh
+            </button>
+            <button
+              onClick={() => setCreating(true)}
+              className="flex items-center gap-2 rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi"
+            >
+              <Link2 className="h-4 w-4" /> New portal
+            </button>
+          </div>
         </div>
 
         {loading ? (
@@ -61,9 +75,9 @@ export default function SharesPage() {
         ) : shares.length === 0 ? (
           <div className="rounded-xl border border-dashed border-zinc-800 py-16 text-center">
             <Link2 className="mx-auto mb-3 h-8 w-8 text-zinc-700" />
-            <p className="text-zinc-400">No client links yet.</p>
+            <p className="text-zinc-400">No portals yet.</p>
             <p className="mt-1 text-sm text-zinc-600">
-              Right-click a folder in the sidebar, or select some clips, and choose Share.
+              Make one with New portal above, or right-click a folder in the sidebar.
             </p>
           </div>
         ) : (
@@ -81,8 +95,16 @@ export default function SharesPage() {
                         <span>{sh.count} clips</span>
                         <span className="flex items-center gap-1"><Eye className="h-3 w-3" />{sh.views}</span>
                         {sh.selects > 0 && (
-                          <span className="flex items-center gap-1 text-[#ff5c1f]">
+                          <span className="flex items-center gap-1 text-accent">
                             <Heart className="h-3 w-3" fill="currentColor" />{sh.selects} picked
+                          </span>
+                        )}
+                        {sh.allow_upload && (
+                          <span className="flex items-center gap-1 text-emerald-400">
+                            <Inbox className="h-3 w-3" />
+                            {sh.intake_waiting > 0
+                              ? `${sh.intake_waiting} waiting`
+                              : 'accepts uploads'}
                           </span>
                         )}
                         {sh.has_password && <span className="text-amber-500">password</span>}
@@ -98,9 +120,29 @@ export default function SharesPage() {
                     </div>
 
                     <div className="flex shrink-0 items-center gap-2">
+                      {sh.allow_upload && (
+                        <button
+                          onClick={() => setIntakeShare(sh)}
+                          className={
+                            'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs transition ' +
+                            (sh.intake_waiting > 0
+                              ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                              : 'border border-zinc-700 text-zinc-400 hover:bg-zinc-800')
+                          }
+                        >
+                          <Inbox className="h-3.5 w-3.5" />
+                          {sh.intake_waiting > 0 ? `Review ${sh.intake_waiting}` : 'Inbox'}
+                        </button>
+                      )}
+                      {!dead && (
+                        <button onClick={() => setQrShare(sh)} title="Show QR code"
+                                className="rounded-lg border border-zinc-700 p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200">
+                          <QrCode className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                       {sh.selects > 0 && (
                         <button onClick={() => openSelects(sh.id)}
-                                className="rounded-lg bg-[#ff5c1f]/15 px-3 py-1.5 text-xs text-[#ff5c1f] hover:bg-[#ff5c1f]/25">
+                                className="rounded-lg bg-accent/15 px-3 py-1.5 text-xs text-accent hover:bg-accent/25">
                           View picks
                         </button>
                       )}
@@ -126,6 +168,25 @@ export default function SharesPage() {
         )}
       </div>
 
+      {creating && (
+        <ShareDialog
+          folderId={null}
+          folderName={null}
+          videoIds={null}
+          onClose={() => { setCreating(false); load(); }}
+        />
+      )}
+
+      {intakeShare && (
+        <IntakePanel
+          share={intakeShare}
+          onClose={() => setIntakeShare(null)}
+          onFiled={load}
+        />
+      )}
+
+      {qrShare && <QrModal share={qrShare} onClose={() => setQrShare(null)} />}
+
       {openId != null && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4"
              onClick={() => setOpenId(null)}>
@@ -137,7 +198,7 @@ export default function SharesPage() {
               </h2>
               <div className="flex gap-2">
                 <button onClick={() => exportPicks('fcpxml')}
-                        className="flex items-center gap-1.5 rounded-lg bg-[#ff5c1f] px-3 py-1.5 text-xs font-medium text-black hover:bg-[#ff7a45]">
+                        className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-accent-foreground hover:bg-accent-hi">
                   <Download className="h-3.5 w-3.5" /> FCPXML for Resolve
                 </button>
                 <button onClick={() => exportPicks('csv')}
@@ -171,7 +232,7 @@ export default function SharesPage() {
                         className={
                           'group flex w-full items-start gap-3 rounded-lg border p-3 text-left transition ' +
                           (s.picked
-                            ? 'border-zinc-800 hover:border-[#ff5c1f]/60 hover:bg-zinc-800/40'
+                            ? 'border-zinc-800 hover:border-accent/60 hover:bg-zinc-800/40'
                             : 'border-zinc-800/60 bg-zinc-950/40 hover:border-zinc-700 hover:bg-zinc-800/30')
                         }
                       >
@@ -184,7 +245,7 @@ export default function SharesPage() {
                           />
                         ) : (
                           <Heart
-                            className={'mt-0.5 h-4 w-4 shrink-0 ' + (s.picked ? 'text-[#ff5c1f]' : 'text-zinc-700')}
+                            className={'mt-0.5 h-4 w-4 shrink-0 ' + (s.picked ? 'text-accent' : 'text-zinc-700')}
                             fill={s.picked ? 'currentColor' : 'none'}
                           />
                         )}
@@ -193,7 +254,7 @@ export default function SharesPage() {
                           <p className="flex items-center gap-2 truncate text-sm text-zinc-200">
                             {s.thumbnail_path && (
                               <Heart
-                                className={'h-3.5 w-3.5 shrink-0 ' + (s.picked ? 'text-[#ff5c1f]' : 'text-zinc-700')}
+                                className={'h-3.5 w-3.5 shrink-0 ' + (s.picked ? 'text-accent' : 'text-zinc-700')}
                                 fill={s.picked ? 'currentColor' : 'none'}
                               />
                             )}
@@ -207,7 +268,7 @@ export default function SharesPage() {
                           </p>
                         </div>
 
-                        <ExternalLink className="mt-1 h-3.5 w-3.5 shrink-0 text-zinc-700 transition group-hover:text-[#ff5c1f]" />
+                        <ExternalLink className="mt-1 h-3.5 w-3.5 shrink-0 text-zinc-700 transition group-hover:text-accent" />
                       </button>
                     </li>
                   ))}
@@ -217,6 +278,45 @@ export default function SharesPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The link as a QR code, for pointing a phone at. Generated in the browser -
+ * sending the URL to a QR service would hand a stranger a working link to
+ * the footage.
+ */
+function QrModal({ share, onClose }) {
+  const [src, setSrc] = useState(null);
+  const url = `${window.location.origin}${share.url}`;
+
+  useEffect(() => {
+    let alive = true;
+    QRCode.toDataURL(url, { margin: 1, width: 420, color: { dark: '#0b0b0d', light: '#ffffff' } })
+      .then((d) => { if (alive) setSrc(d); })
+      .catch(() => { if (alive) setSrc(null); });
+    return () => { alive = false; };
+  }, [url]);
+
+  return (
+    <div className="animate-shade-in fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4"
+         onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="animate-pop-in w-full max-w-xs rounded-xl border border-zinc-700 bg-zinc-900 p-5 text-center shadow-2xl">
+        <h2 className="mb-1 truncate text-sm font-medium text-zinc-100">{share.title || 'Link'}</h2>
+        <p className="mb-4 text-xs text-zinc-500">
+          {share.allow_upload
+            ? 'Scan with a phone to send photos and clips in.'
+            : 'Scan with a phone to open this link.'}
+        </p>
+        {src
+          ? <img src={src} alt="QR code" className="mx-auto w-full rounded-lg bg-white p-2" />
+          : <p className="py-10 text-xs text-zinc-600">Could not draw the code.</p>}
+        <button onClick={onClose}
+                className="mt-4 w-full rounded-lg border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
+          Close
+        </button>
+      </div>
     </div>
   );
 }

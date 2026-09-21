@@ -79,9 +79,9 @@ export default function UpdatePanel() {
 
   if (applying) {
     return (
-      <div className="rounded-lg border border-[#ff5c1f]/40 bg-[#ff5c1f]/10 p-4">
+      <div className="rounded-lg border border-accent/40 bg-accent/10 p-4">
         <p className="flex items-center gap-3 text-sm text-zinc-100">
-          <Loader2 className="h-5 w-5 animate-spin text-[#ff5c1f]" />
+          <Loader2 className="h-5 w-5 animate-spin text-accent" />
           Updating and restarting — this page will come back on its own.
         </p>
       </div>
@@ -114,7 +114,7 @@ export default function UpdatePanel() {
             Version {st.staged_version} is downloaded and ready.
           </p>
           <button onClick={applyNow}
-                  className="rounded bg-[#ff5c1f] px-4 py-2 text-sm font-medium text-black transition hover:bg-[#ff7a45]">
+                  className="rounded bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi">
             Install and restart
           </button>
           <p className="mt-2 text-[11px] text-zinc-600">
@@ -125,7 +125,7 @@ export default function UpdatePanel() {
       ) : available ? (
         <>
           <p className="mb-2 text-sm text-zinc-200">
-            Version <strong className="font-mono text-[#ff5c1f]">{info.latest}</strong> is available
+            Version <strong className="font-mono text-accent">{info.latest}</strong> is available
             <span className="text-zinc-500"> — you have {st.current_version}</span>
           </p>
           {info.notes && (
@@ -135,7 +135,7 @@ export default function UpdatePanel() {
           )}
           <button onClick={() => act('dl', '/api/updates/download')}
                   disabled={busy === 'dl' || st.downloading}
-                  className="flex items-center gap-2 rounded bg-[#ff5c1f] px-4 py-2 text-sm font-medium text-black transition hover:bg-[#ff7a45] disabled:opacity-50">
+                  className="flex items-center gap-2 rounded bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi disabled:opacity-50">
             {st.downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
             {st.downloading ? 'Downloading…' : 'Download update'}
           </button>
@@ -166,19 +166,19 @@ export default function UpdatePanel() {
             <label className="flex-1">
               <span className="mb-1 block text-[11px] text-zinc-500">GitHub account</span>
               <input value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="your-username"
-                     className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-[#ff5c1f]" />
+                     className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-accent" />
             </label>
             <label className="flex-1">
               <span className="mb-1 block text-[11px] text-zinc-500">Repository</span>
               <input value={repo} onChange={(e) => setRepo(e.target.value)} placeholder="zerko-file-manager"
-                     className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-[#ff5c1f]" />
+                     className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-accent" />
             </label>
           </div>
 
           <label className="flex cursor-pointer items-start gap-2">
             <input type="checkbox" checked={!!st.settings?.auto_check}
                    onChange={(e) => act('set', '/api/updates/settings', { auto_check: e.target.checked })}
-                   className="mt-0.5 h-3.5 w-3.5 accent-[#ff5c1f]" />
+                   className="mt-0.5 h-3.5 w-3.5 accent-accent" />
             <span>
               <span className="block text-xs text-zinc-300">Check for updates automatically</span>
               <span className="block text-[11px] text-zinc-600">Looks once an hour. Never installs on its own.</span>
@@ -188,7 +188,7 @@ export default function UpdatePanel() {
           <label className="flex cursor-pointer items-start gap-2">
             <input type="checkbox" checked={!!st.settings?.auto_apply}
                    onChange={(e) => act('set', '/api/updates/settings', { auto_apply: e.target.checked })}
-                   className="mt-0.5 h-3.5 w-3.5 accent-[#ff5c1f]" />
+                   className="mt-0.5 h-3.5 w-3.5 accent-accent" />
             <span>
               <span className="block text-xs text-zinc-300">Download updates in the background</span>
               <span className="block text-[11px] text-zinc-600">

@@ -18,7 +18,26 @@ from video_processor import (
     SIDECAR_EXTENSIONS,
 )
 
-DOC_EXTENSIONS = {'.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.md', '.csv'}
+DOC_EXTENSIONS = {
+    # Documents and text
+    '.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.md', '.csv',
+    '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
+    '.pages', '.numbers', '.key', '.epub', '.log', '.json', '.xml.txt',
+}
+
+# Everything else somebody might reasonably keep here: archives, installers,
+# fonts, 3D, code. Not media, not a project file - just a file. They get the
+# file-manager view: stored as-is, renamed, moved, downloaded, and nothing
+# tries to thumbnail or transcribe them.
+ARCHIVE_EXTENSIONS = {
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.iso', '.dmg',
+}
+APP_EXTENSIONS = {
+    '.exe', '.msi', '.apk', '.appimage', '.deb', '.rpm', '.jar', '.bat', '.sh',
+}
+FONT_EXTENSIONS = {'.ttf', '.otf', '.woff', '.woff2'}
+DESIGN_EXTENSIONS = {'.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.afphoto', '.afdesign'}
+MODEL_EXTENSIONS = {'.obj', '.fbx', '.stl', '.gltf', '.glb', '.3ds', '.dae'}
 
 # Project / scratch files from the edit suite. They belong beside the footage
 # but they are not media: never thumbnail, proxy or transcribe them.
@@ -47,6 +66,35 @@ def get_media_type(filename):
     if ext in PROJECT_EXTENSIONS or ext in SIDECAR_EXTENSIONS:
         return 'project'
     return 'other'
+
+
+# Anything that is not video, photo or audio is "a file" as far as the
+# interface is concerned: no rating, no notes, no transcript, no proxy - just
+# a name, a size, a date, and somewhere to put it.
+def is_media(filename):
+    return get_media_type(filename) in ('video', 'photo', 'audio')
+
+
+FILE_KINDS = {
+    'archive': ARCHIVE_EXTENSIONS,
+    'app': APP_EXTENSIONS,
+    'font': FONT_EXTENSIONS,
+    'design': DESIGN_EXTENSIONS,
+    'model': MODEL_EXTENSIONS,
+    'project': PROJECT_EXTENSIONS,
+}
+
+
+def file_kind(filename):
+    """A finer label for non-media, used only to choose an icon. 'document'
+    covers anything textual; the rest name themselves."""
+    ext = os.path.splitext(filename or '')[1].lower()
+    if ext in DOC_EXTENSIONS:
+        return 'document'
+    for kind, exts in FILE_KINDS.items():
+        if ext in exts:
+            return kind
+    return 'file'
 
 
 def is_playable(filename):

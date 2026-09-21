@@ -48,7 +48,7 @@ export default function TrashPanel({ open, onClose, onChanged }) {
 
         <div className="px-5 py-4 border-b border-zinc-800 flex items-center gap-4">
           <div className="flex items-center gap-2.5 flex-1">
-            <HardDrive className="w-4 h-4 text-[#ff5c1f]" />
+            <HardDrive className="w-4 h-4 text-accent" />
             <div>
               <div className="text-lg font-semibold text-zinc-100 leading-none">
                 {data.total_size_formatted || '0 B'}

@@ -1,4 +1,4 @@
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useEffect } from 'react';
 
 /**
  * Wraps a card so it leans toward the pointer, with a soft highlight that
@@ -13,15 +13,21 @@ export default function TiltCard({
   className = '',
   maxTilt = 10,
   lift = 18,
+  hoverScale = 1.04,   // the whole tile grows a little under the pointer
+  restScale = 1,       // ...and stays a little larger while it is selected
   disabled = false,
   ...rest
 }) {
   const ref = useRef(null);
   const glowRef = useRef(null);
   const raf = useRef(null);
+  const hovering = useRef(false);
+  const restRef = useRef(restScale);
+  restRef.current = restScale;
 
   const onMouseMove = useCallback((e) => {
     if (disabled || !ref.current) return;
+    hovering.current = true;
     const node = ref.current;
     const r = node.getBoundingClientRect();
     const px = (e.clientX - r.left) / r.width;
@@ -33,7 +39,7 @@ export default function TiltCard({
       const ry = (px - 0.5) * maxTilt * 1.15;
       node.style.willChange = 'transform';
       node.style.transform =
-        `perspective(1000px) rotateX(${rx.toFixed(2)}deg) rotateY(${ry.toFixed(2)}deg) translateZ(${lift}px)`;
+        `perspective(1000px) rotateX(${rx.toFixed(2)}deg) rotateY(${ry.toFixed(2)}deg) translateZ(${lift}px) scale(${(restRef.current * hoverScale).toFixed(3)})`;
       node.style.transition = 'box-shadow 260ms ease, border-color 200ms ease';
       node.style.boxShadow = '0 26px 46px -18px rgba(0,0,0,0.85)';
       if (glowRef.current) {
@@ -42,15 +48,16 @@ export default function TiltCard({
           `radial-gradient(240px circle at ${(px * 100).toFixed(1)}% ${(py * 100).toFixed(1)}%, rgba(255,255,255,0.18), rgba(255,255,255,0) 62%)`;
       }
     });
-  }, [disabled, maxTilt, lift]);
+  }, [disabled, maxTilt, lift, hoverScale]);
 
   const onMouseLeave = useCallback(() => {
+    hovering.current = false;
     if (!ref.current) return;
     if (raf.current) cancelAnimationFrame(raf.current);
     const node = ref.current;
     node.style.transition =
       'transform 520ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 300ms ease, border-color 200ms ease';
-    node.style.transform = 'perspective(1000px) rotateX(0deg) rotateY(0deg) translateZ(0)';
+    node.style.transform = `perspective(1000px) rotateX(0deg) rotateY(0deg) translateZ(0) scale(${restRef.current})`;
     // Empty string REMOVES the inline declaration. Setting it to a transparent
     // shadow instead would keep overriding any class-based box-shadow - which
     // is exactly what was wiping the selection ring off hovered cards.
@@ -60,6 +67,15 @@ export default function TiltCard({
     // stays permanently promoted and the compositor grinds to a halt.
     window.setTimeout(() => { if (node) node.style.willChange = 'auto'; }, 560);
   }, []);
+
+  // Selecting / deselecting a tile grows or settles it. While the pointer is
+  // on it the tilt handler owns the transform and already reads restScale.
+  useEffect(() => {
+    const node = ref.current;
+    if (!node || hovering.current) return;
+    node.style.transition = 'transform 260ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 260ms ease, border-color 200ms ease';
+    node.style.transform = restScale === 1 ? '' : `scale(${restScale})`;
+  }, [restScale]);
 
   return (
     <div

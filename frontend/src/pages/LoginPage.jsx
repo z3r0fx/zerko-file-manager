@@ -139,7 +139,7 @@ export default function LoginPage() {
             )}
 
             <button type="submit" disabled={loading}
-                    className="w-full bg-red-600 hover:bg-red-500 disabled:bg-red-700 text-white font-semibold rounded-lg px-4 py-2.5 transition-colors">
+                    className="w-full bg-accent hover:bg-accent-hi disabled:opacity-60 text-accent-foreground font-semibold rounded-lg px-4 py-2.5 transition-colors">
               {loading ? 'Working...' : recovering ? 'Reset password' : 'Login'}
             </button>
 

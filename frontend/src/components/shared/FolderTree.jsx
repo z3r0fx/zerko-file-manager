@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChevronRight, ChevronDown, Folder, FolderOpen } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { hasFiles } from '../../lib/dropUpload';
 
 function FolderNode({ node, depth, selectedId, onSelect, onDropMedia, onDropFiles, expanded, toggle, onContextMenu, marked }) {
   const [dragOver, setDragOver] = useState(false);
+  const openTimer = useRef(null);
   const hasKids = (node.children || []).length > 0;
   const isOpen = expanded.has(node.id);
   const isSelected = selectedId === node.id;
@@ -12,12 +13,20 @@ function FolderNode({ node, depth, selectedId, onSelect, onDropMedia, onDropFile
   return (
     <div>
       <div
+        data-folder-drop
         onClick={(e) => onSelect(node.id, e)}
         onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); onContextMenu?.(e, node); }}
-        onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
+        onDragOver={(e) => {
+          e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move'; setDragOver(true);
+          // hover a closed folder for a moment and it opens, so you can drop into a subfolder
+          if (hasKids && !isOpen && !openTimer.current) {
+            openTimer.current = setTimeout(() => { openTimer.current = null; toggle(node.id); }, 550);
+          }
+        }}
+        onDragLeave={() => { setDragOver(false); clearTimeout(openTimer.current); openTimer.current = null; }}
         onDrop={(e) => {
           e.preventDefault(); e.stopPropagation(); setDragOver(false);
+          clearTimeout(openTimer.current); openTimer.current = null;
           // Files dragged in from the desktop: upload them INTO this folder
           if (hasFiles(e.dataTransfer)) {
             onDropFiles?.(node.id, node.name, e.dataTransfer);
@@ -32,8 +41,8 @@ function FolderNode({ node, depth, selectedId, onSelect, onDropMedia, onDropFile
         className={cn(
           'group flex items-center gap-1 pr-2 py-1.5 rounded-md cursor-pointer transition text-sm select-none',
           isSelected ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200',
-          marked?.has(node.id) && 'bg-[#ff5c1f]/15 text-orange-100 ring-1 ring-[#ff5c1f]/60',
-          dragOver && 'ring-1 ring-red-500 bg-red-500/10'
+          marked?.has(node.id) && 'bg-accent/15 text-accent-hi ring-1 ring-accent/60',
+          dragOver && 'bg-accent/25 ring-2 ring-accent text-zinc-50'
         )}
         title={node.relative_path || node.name}
       >
@@ -89,8 +98,20 @@ export default function FolderTree({ tree = [], selectedId, onSelect, onDropMedi
     });
   };
 
+  const rootRef = useRef(null);
+  const onDragOverCapture = (e) => {
+    // capture phase: the nodes stop propagation of their own dragover
+    let el = rootRef.current;
+    while (el && el.scrollHeight <= el.clientHeight + 1) el = el.parentElement;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const zone = 48;
+    if (e.clientY < r.top + zone) el.scrollTop -= 14;
+    else if (e.clientY > r.bottom - zone) el.scrollTop += 14;
+  };
+
   return (
-    <div className="space-y-0.5">
+    <div ref={rootRef} className="space-y-0.5" onDragOverCapture={onDragOverCapture}>
       <div
         onClick={() => onSelect(null)}
         className={cn(

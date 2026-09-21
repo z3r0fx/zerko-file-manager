@@ -304,7 +304,7 @@ export default function VideoModal({ videoId, onClose, mediaList = [], currentIn
                       return (
                         <div key={i} onClick={() => seekTo(seg.start)} className={cn(
                           "p-1.5 rounded cursor-pointer transition flex gap-2",
-                          isNow ? "bg-[#ff5c1f]/25 text-orange-50"
+                          isNow ? "bg-accent/25 text-accent-hi"
                             : isHit ? "bg-yellow-500/10 hover:bg-yellow-500/20"
                             : isTagMoment ? "bg-emerald-500/10 ring-1 ring-emerald-500/30 hover:bg-emerald-500/20"
                             : "hover:bg-zinc-700")}>

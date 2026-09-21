@@ -4,9 +4,11 @@ import { AuthContext } from '../context/AuthContext';
 import { DataContext } from '../context/DataContext';
 import { apiCall } from '../lib/api';
 import ConfirmDialog from '../components/shared/ConfirmDialog';
+import { CAP } from '../lib/capabilities';
 
 export default function AdminPage() {
-  const { user } = useContext(AuthContext);
+  const { user, can } = useContext(AuthContext);
+  const isAdmin = can(CAP.ADMIN);
   const { stats, loadStats } = useContext(DataContext);
   const navigate = useNavigate();
 
@@ -14,15 +16,17 @@ export default function AdminPage() {
   const [usersUsage, setUsersUsage] = useState([]);
   const [deleteUserTarget, setDeleteUserTarget] = useState(null);
 
-  const [newUser, setNewUser] = useState({ username: '', email: '', password: '', role: 'user' });
+  const [newUser, setNewUser] = useState({ username: '', email: '', password: '', role: 'client' });
   const [createUserError, setCreateUserError] = useState('');
 
   useEffect(() => {
-    if (user?.role !== 'admin') return;
-    loadUsers();
-    loadStats();
-    loadUsersUsage();
-  }, [user]);
+    if (!user) return;
+    if (isAdmin) {
+      loadUsers();
+      loadStats();
+      loadUsersUsage();
+    }
+  }, [user, isAdmin]);
 
   const loadUsers = async () => {
     try {
@@ -70,7 +74,7 @@ export default function AdminPage() {
         method: 'POST',
         body: JSON.stringify(newUser),
       });
-      setNewUser({ username: '', email: '', password: '', role: 'user' });
+      setNewUser({ username: '', email: '', password: '', role: 'client' });
       loadUsers();
     } catch (err) {
       setCreateUserError(err.message || 'Failed to create user');
@@ -78,7 +82,7 @@ export default function AdminPage() {
     }
   };
 
-  if (user?.role !== 'admin') {
+  if (!isAdmin && !can(CAP.CREATE_CLIENTS)) {
     return (
       <div className="flex items-center justify-center h-full">
         <div className="bg-red-900/20 border border-red-700 text-red-300 rounded-lg p-8 text-center">
@@ -99,6 +103,7 @@ export default function AdminPage() {
     <div className="flex h-full">
 <div className="flex-1 space-y-8 p-6 h-full overflow-y-auto">
       {/* Stats Overview */}
+      {isAdmin && (
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-6">
           <p className="text-sm text-zinc-400 mb-1">Total Files</p>
@@ -117,14 +122,25 @@ export default function AdminPage() {
           <p className="text-3xl font-bold text-zinc-100">{users.length}</p>
         </div>
       </div>
+      )}
 
       {/* User Management */}
       <section>
-        <h2 className="text-xl font-semibold text-zinc-100 mb-4">User Management</h2>
+        <h2 className="text-xl font-semibold text-zinc-100 mb-4">
+          {isAdmin ? 'User Management' : 'Client accounts'}
+        </h2>
+        {!isAdmin && (
+          <p className="mb-4 max-w-prose text-sm text-zinc-400">
+            You can create accounts for clients and agents. A client can browse, upload,
+            download and tidy up; they cannot delete anything permanently or reach the
+            admin dashboard. Anything above that is an administrator's to hand out.
+          </p>
+        )}
 
         {/* Create Account Form */}
         <form onSubmit={handleCreateUser} className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 mb-4">
           <h3 className="text-sm font-medium text-zinc-300 mb-3">Create Account</h3>
+          <p className="mb-3 text-xs text-zinc-500">Passwords must be at least 10 characters.</p>
           <div className="flex gap-3 items-end">
             <div className="flex-1">
               <label className="block text-xs text-zinc-500 mb-1">Username</label>
@@ -166,13 +182,15 @@ export default function AdminPage() {
                 onChange={(e) => setNewUser((u) => ({ ...u, role: e.target.value }))}
                 className="w-full bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:border-zinc-500"
               >
-                <option value="user">user</option>
-                <option value="admin">admin</option>
+                <option value="client">Client / agent</option>
+                <option value="viewer">View only</option>
+                {isAdmin && <option value="editor">Editor</option>}
+                {isAdmin && <option value="admin">Administrator</option>}
               </select>
             </div>
             <button
               type="submit"
-              className="bg-red-600 hover:bg-red-500 text-white rounded-lg px-4 py-2 font-medium transition-colors"
+              className="rounded-lg bg-accent px-4 py-2 font-medium text-accent-foreground transition-colors hover:bg-accent-hi"
             >
               Create Account
             </button>
@@ -183,6 +201,7 @@ export default function AdminPage() {
         </form>
 
         {/* User Table */}
+        {isAdmin && (
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
           <table className="w-full text-sm">
             <thead>
@@ -224,7 +243,7 @@ export default function AdminPage() {
                     {u.is_active && u.id !== user.id && (
                       <button
                         onClick={() => handleForceLogout(u.id)}
-                        className="text-orange-400 hover:text-orange-300 transition-colors text-xs"
+                        className="text-accent-hi hover:text-accent-hi transition-colors text-xs"
                       >
                         Force Logout
                       </button>
@@ -242,9 +261,11 @@ export default function AdminPage() {
             </tbody>
           </table>
         </div>
+        )}
       </section>
 
       {/* Per-Account Usage */}
+      {isAdmin && (
       <section>
         <h2 className="text-xl font-semibold text-zinc-100 mb-4">Per-Account Usage</h2>
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg overflow-hidden">
@@ -274,6 +295,7 @@ export default function AdminPage() {
           </table>
         </div>
       </section>
+      )}
 
       {/* Inline Delete Confirmation Modal */}
       {deleteUserTarget && (

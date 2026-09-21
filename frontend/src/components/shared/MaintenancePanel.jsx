@@ -16,6 +16,7 @@ export default function MaintenancePanel() {
   const [security, setSecurity] = useState(null);
   const [busy, setBusy] = useState(null);
   const [note, setNote] = useState(null);
+  const [thumbs, setThumbs] = useState(null);   // thumbnail repair progress + reasons
 
   const isAdmin = user?.role === 'admin';
 
@@ -38,6 +39,16 @@ export default function MaintenancePanel() {
     return () => clearInterval(t);
   }, [scan?.running, load]);
 
+  // The thumbnail repair runs in the background; follow it until it finishes.
+  useEffect(() => {
+    if (!thumbs?.running) return undefined;
+    const t = setInterval(async () => {
+      const r = await apiCall('/api/thumbnails/repair/status').catch(() => null);
+      if (r) setThumbs(r);
+    }, 1200);
+    return () => clearInterval(t);
+  }, [thumbs?.running]);
+
   if (!isAdmin) return null;
 
   const say = (m) => { setNote(m); setTimeout(() => setNote(null), 5000); };
@@ -46,7 +57,9 @@ export default function MaintenancePanel() {
     setBusy(key);
     try {
       const r = await apiCall(path, { method: 'POST', body: JSON.stringify(body || {}) });
-      if (r?.status === 'started' && key === 'scan') say('Scanning your media folder…');
+      if (key === 'thumbs' && (r?.status === 'started' || r?.status === 'already_running')) {
+        setThumbs({ running: true, message: 'Starting…', failures: [] });
+      } else if (r?.status === 'started' && key === 'scan') say('Scanning your media folder…');
       else if (r?.queued != null) say(`Queued ${r.queued} clips for proxy generation.`);
       else if (r?.cancelled != null) say(`Cancelled ${r.cancelled} queued jobs.`);
       else if (r?.name) say(`Backup written: ${r.name}`);
@@ -83,11 +96,11 @@ export default function MaintenancePanel() {
         {/* Scan for new files */}
         <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
           <h2 className="mb-3 flex items-center gap-2 font-semibold text-zinc-200">
-            <FolderSearch className="h-5 w-5 text-[#ff5c1f]" /> Media folder
+            <FolderSearch className="h-5 w-5 text-accent" /> Media folder
           </h2>
           {scan?.running ? (
             <div className="flex items-start gap-3">
-              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-[#ff5c1f]" />
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-accent" />
               <div className="min-w-0">
                 <p className="text-sm text-zinc-200">Scanning…</p>
                 <p className="truncate font-mono text-xs text-zinc-500">{scan.message}</p>
@@ -104,13 +117,40 @@ export default function MaintenancePanel() {
                   last scan: {scan.stats.added ?? 0} added · {scan.stats.folders ?? 0} folders
                 </p>
               )}
-              <button
-                onClick={() => run('scan', '/api/rescan', { queue_proxies: true })}
-                disabled={busy === 'scan'}
-                className="flex items-center gap-1.5 rounded bg-[#ff5c1f] px-3 py-1.5 text-xs font-medium text-black transition hover:bg-[#ff7a45] disabled:opacity-40"
-              >
-                <FolderSearch className="h-3.5 w-3.5" /> Scan for new files
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => run('scan', '/api/rescan', { queue_proxies: true })}
+                  disabled={busy === 'scan'}
+                  className="flex items-center gap-1.5 rounded bg-accent px-3 py-1.5 text-xs font-medium text-accent-foreground transition hover:bg-accent-hi disabled:opacity-40"
+                >
+                  <FolderSearch className="h-3.5 w-3.5" /> Scan for new files
+                </button>
+                <button
+                  onClick={() => run('thumbs', '/api/thumbnails/repair', {})}
+                  disabled={busy === 'thumbs'}
+                  title="Redraw thumbnails that failed the first time"
+                  className="flex items-center gap-1.5 rounded border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-200 transition hover:border-zinc-500 hover:bg-zinc-800 disabled:opacity-40"
+                >
+                  <FolderSearch className="h-3.5 w-3.5" /> Fix missing thumbnails
+                </button>
+              </div>
+              {thumbs && (
+                <div className="mt-3 rounded border border-zinc-800 bg-zinc-950 p-3 text-xs">
+                  <p className={thumbs.running ? 'text-zinc-400' : 'text-zinc-200'}>
+                    {thumbs.running ? 'Redrawing thumbnails… ' : ''}{thumbs.message}
+                    {thumbs.running && thumbs.total ? ` (${thumbs.fixed || 0} fixed)` : ''}
+                  </p>
+                  {!thumbs.running && thumbs.failures?.length > 0 && (
+                    <ul className="mt-2 max-h-40 space-y-1.5 overflow-y-auto pr-1">
+                      {thumbs.failures.map((f) => (
+                        <li key={f.id} className="leading-snug text-zinc-500">
+                          <span className="font-mono text-zinc-300">{f.filename}</span> — {f.reason}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </>
           )}
         </div>

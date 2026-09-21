@@ -1,18 +1,24 @@
-import { useState } from 'react';
-import { Link2, Copy, Check, X } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Link2, Copy, Check, X, Smartphone } from 'lucide-react';
 import { apiCall } from '../../lib/api';
+import QRCode from 'qrcode';
 
 /**
- * Create a client link for a folder or the current selection.
+ * Create a portal: a link that lets someone view, download and send in
+ * files, without an account. The same token machinery either way - a
+ * portal that only shows things is what used to be called a client link.
  * Defaults are the safe ones: no downloads, picking on, 30-day expiry.
  */
 export default function ShareDialog({ folderId, folderName, videoIds, onClose }) {
-  const [title, setTitle] = useState(folderName ? `${folderName}` : 'Media for review');
+  const [title, setTitle] = useState(folderName || 'Media for review');
   const [message, setMessage] = useState('');
   const [expiresDays, setExpiresDays] = useState(30);
   const [password, setPassword] = useState('');
   const [allowDownload, setAllowDownload] = useState(false);
   const [allowSelects, setAllowSelects] = useState(true);
+  // With no folder and no selection there is nothing to show, so the only
+  // thing such a portal can be is one that receives.
+  const [allowUpload, setAllowUpload] = useState(!folderId && !(videoIds?.length));
   const [includeSubfolders, setIncludeSubfolders] = useState(true);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -30,6 +36,7 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
         password: password || undefined,
         allow_download: allowDownload,
         allow_selects: allowSelects,
+        allow_upload: allowUpload,
       };
       if (count > 0) body.video_ids = videoIds;
       else { body.folder_id = folderId; body.include_subfolders = includeSubfolders; }
@@ -63,8 +70,8 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
       >
         <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
           <h2 className="flex items-center gap-2 text-base font-medium text-zinc-100">
-            <Link2 className="h-4 w-4 text-[#ff5c1f]" />
-            {result ? 'Link ready' : 'Share with a client'}
+            <Link2 className="h-4 w-4 text-accent" />
+            {result ? 'Portal ready' : 'Create a portal'}
           </h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200"><X className="h-4 w-4" /></button>
         </div>
@@ -72,8 +79,9 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
         {result ? (
           <div className="space-y-4 px-5 py-5">
             <p className="text-sm text-zinc-400">
-              {result.count} {result.count === 1 ? 'clip' : 'clips'}. Anyone with this link can view
-              {allowDownload ? ' and download' : ''} — no account needed.
+              {allowUpload && result.count === 0
+                ? 'Anyone with this link can send files in. They land in an inbox for you to file — no account needed.'
+                : `${result.count} ${result.count === 1 ? 'clip' : 'clips'}. Anyone with this link can view${allowDownload ? ' and download' : ''}${allowUpload ? ', and send files back' : ''} — no account needed.`}
             </p>
             <div className="flex gap-2">
               <input
@@ -84,12 +92,14 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
               />
               <button
                 onClick={copy}
-                className="flex items-center gap-2 rounded-lg bg-[#ff5c1f] px-4 py-2 text-sm font-medium text-black transition hover:bg-[#ff7a45]"
+                className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi"
               >
                 {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
                 {copied ? 'Copied' : 'Copy'}
               </button>
             </div>
+            <ScanToOpen url={result.fullUrl} upload={allowUpload} />
+
             <button onClick={onClose} className="w-full rounded-lg border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
               Done
             </button>
@@ -98,8 +108,10 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
           <div className="space-y-4 px-5 py-5">
             <p className="text-sm text-zinc-400">
               {count > 0
-                ? `Sharing ${count} selected ${count === 1 ? 'clip' : 'clips'}.`
-                : `Sharing the folder "${folderName}".`}
+                ? `A portal showing ${count} selected ${count === 1 ? 'clip' : 'clips'}.`
+                : folderName
+                  ? `A portal onto the folder "${folderName}".`
+                  : 'A portal for receiving files. It starts empty and fills up from whoever you send it to.'}
             </p>
 
             <Field label="Title">
@@ -135,6 +147,11 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
                       label="Allow downloads"
                       hint="Off means view-only streaming of the proxy." />
               {count === 0 && (
+                <Toggle checked={allowUpload} onChange={setAllowUpload}
+                        label="Let them send files in"
+                        hint="Uploads land in a holding folder of their own. Nothing joins the library until you review the inbox under Portals and file it - so a phone can never drop footage into the wrong project." />
+              )}
+              {count === 0 && (
                 <Toggle checked={includeSubfolders} onChange={setIncludeSubfolders}
                         label="Include subfolders" />
               )}
@@ -146,9 +163,9 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
               <button
                 onClick={create}
                 disabled={busy}
-                className="flex-1 rounded-lg bg-[#ff5c1f] px-4 py-2 text-sm font-medium text-black transition hover:bg-[#ff7a45] disabled:opacity-50"
+                className="flex-1 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi disabled:opacity-50"
               >
-                {busy ? 'Creating…' : 'Create link'}
+                {busy ? 'Creating…' : 'Create portal'}
               </button>
               <button onClick={onClose} className="rounded-lg border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
                 Cancel
@@ -162,7 +179,7 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
 }
 
 const inputCls =
-  'w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-[#ff5c1f]';
+  'w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent';
 
 function Field({ label, children, className = '' }) {
   return (
@@ -177,11 +194,47 @@ function Toggle({ checked, onChange, label, hint }) {
   return (
     <label className="flex cursor-pointer items-start gap-3">
       <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)}
-             className="mt-0.5 h-4 w-4 accent-[#ff5c1f]" />
+             className="mt-0.5 h-4 w-4 accent-accent" />
       <span>
         <span className="block text-sm text-zinc-200">{label}</span>
         {hint && <span className="block text-xs text-zinc-500">{hint}</span>}
       </span>
     </label>
+  );
+}
+
+/**
+ * A QR code for the link, so the phone in your hand can open it without
+ * anyone typing a 43-character token. Rendered locally - the URL is never
+ * sent to a QR service, which would hand a third party a working link to
+ * the footage.
+ */
+function ScanToOpen({ url, upload }) {
+  const [src, setSrc] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    QRCode.toDataURL(url, { margin: 1, width: 320, color: { dark: '#0b0b0d', light: '#ffffff' } })
+      .then((d) => { if (alive) setSrc(d); })
+      .catch(() => { if (alive) setSrc(null); });
+    return () => { alive = false; };
+  }, [url]);
+
+  if (!src) return null;
+
+  return (
+    <div className="flex items-center gap-4 rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+      <img src={src} alt="QR code for this link" className="h-24 w-24 shrink-0 rounded bg-white p-1" />
+      <div className="min-w-0">
+        <p className="flex items-center gap-1.5 text-sm font-medium text-zinc-200">
+          <Smartphone className="h-4 w-4 text-accent" /> Scan to open on a phone
+        </p>
+        <p className="mt-1 text-xs leading-relaxed text-zinc-500">
+          {upload
+            ? 'Point your camera at this and the phone opens straight on the upload screen - pick photos or video and they land in the folder.'
+            : 'Point a camera at this to open the link on a phone. Works for your client too, if you are showing them in person.'}
+        </p>
+      </div>
+    </div>
   );
 }

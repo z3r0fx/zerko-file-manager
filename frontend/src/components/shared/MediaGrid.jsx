@@ -4,7 +4,7 @@ import VideoTable from './VideoTable';
 import Skeleton from './Skeleton';
 import { cn } from '../../lib/utils';
 
-export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize = 'medium', loading, onVideoClick, onContextMenu, onStatusChange, onTagClick, onMove, onDelete, selectedVideoIds = new Set(), onToggleSelect, onRangeSelect, totalSelectedCount = 0, searchTerm = '' }) {
+export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize = 'medium', loading, onVideoClick, onContextMenu, onStatusChange, onTagClick, onMove, onDelete, selectedVideoIds = new Set(), onToggleSelect, onRangeSelect, onSelectOnly, totalSelectedCount = 0, searchTerm = '' }) {
   // Render a screenful at a time. Mounting 1,200 cards at once pinned the main
   // thread hard enough to make the cursor itself lag.
   const PAGE = 60;
@@ -53,7 +53,7 @@ export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize
 
   if (loading) {
     return (
-      <div className={cn("grid gap-4", viewMode === 'grid' ? getGridClasses(gridSize) : 'grid-cols-1')}>
+      <div className={cn("grid", viewMode !== 'grid' && 'grid-cols-1 gap-4')} style={viewMode === 'grid' ? gridStyle(gridSize) : undefined}>
         {[...Array(12)].map((_, i) => (
             <Skeleton key={i} className="aspect-video" />
         ))}
@@ -61,12 +61,15 @@ export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize
     );
   }
 
-  function getGridClasses(size) {
-    switch(size) {
-        case 'small': return 'grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10';
-        case 'large': return 'grid-cols-1 sm:grid-cols-2 md:grid-cols-3';
-        default: return 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6';
-    }
+  // Tiles fill the row: as many as fit at the wanted width. The wanted width
+  // follows the Grid size buttons AND the Density setting, so Compact packs in
+  // noticeably more and Roomy noticeably fewer, larger ones.
+  function gridStyle(size) {
+    const min = { small: 150, large: 340 }[size] || 225;
+    return {
+      gridTemplateColumns: `repeat(auto-fill, minmax(min(100%, calc(${min}px * var(--tile-scale, 1))), 1fr))`,
+      gap: 'calc(1rem * var(--gap-scale, 1))',
+    };
   }
 
   if (viewMode === 'list') {
@@ -78,13 +81,14 @@ export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize
             selectedVideoIds={selectedVideoIds} 
             onToggleSelect={onToggleSelect} 
             onRangeSelect={onRangeSelect}
+            onSelectOnly={onSelectOnly}
         />
       );
   }
 
   return (
     <>
-    <div className={cn("grid gap-4", getGridClasses(gridSize))}>
+    <div className="grid" style={gridStyle(gridSize)}>
       {mediaItems.slice(0, shown).map((media, index) => (
         <div
             key={media.id}
@@ -111,6 +115,8 @@ export default function MediaGrid({ mediaItems = [], viewMode = 'grid', gridSize
             isSelected={selectedVideoIds.has(media.id)}
             onToggleSelect={onToggleSelect}
             onRangeSelect={onRangeSelect}
+            onSelectOnly={onSelectOnly}
+            selectedIds={selectedVideoIds}
             totalSelectedCount={totalSelectedCount}
             searchTerm={searchTerm}
             />

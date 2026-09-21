@@ -168,8 +168,18 @@ def _expected_sha256(assets: list, zip_asset: dict):
     return None
 
 
+LIVE_BUILD_MARKER = APP_DIR / ".live-build"
+LIVE_BUILD_MSG = ("This install is a private build with features the public "
+                  "releases do not have. Updating from GitHub would replace them, "
+                  "so updates are turned off here.")
+
+
 def check() -> dict:
     """Ask GitHub for the newest release. Never downloads anything."""
+    if LIVE_BUILD_MARKER.exists():
+        return {"ok": True, "current": current_version(), "latest": current_version(),
+                "update_available": False, "notes": LIVE_BUILD_MSG, "has_asset": False,
+                "download_url": None, "checked_at": datetime.utcnow().isoformat()}
     s = settings()
     if not s["owner"]:
         return {"ok": False, "error": "No GitHub repository configured yet.",
@@ -219,6 +229,8 @@ def download(info: dict = None) -> dict:
 
     Nothing in the live folder is touched here - this only prepares.
     """
+    if LIVE_BUILD_MARKER.exists():
+        return {"ok": False, "error": LIVE_BUILD_MSG}
     info = info or check()
     if not info.get("ok"):
         return info

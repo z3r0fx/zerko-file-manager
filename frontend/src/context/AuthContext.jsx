@@ -1,4 +1,4 @@
-import { createContext, useState, useEffect, useContext } from 'react';
+import { createContext, useState, useEffect, useContext, useMemo } from 'react';
 import { apiCall } from '../lib/api.js';
 import { login as loginApi, logout as logoutApi, getToken } from '../lib/auth.js';
 
@@ -42,8 +42,16 @@ export function AuthProvider({ children }) {
     window.location.href = '/';
   };
 
+  // What this account may do, straight from the server. The UI uses it to
+  // hide things; it is NOT the guard - the server refuses regardless, and a
+  // hidden button is a courtesy, not a lock.
+  const can = useMemo(() => {
+    const caps = new Set(user?.capabilities || []);
+    return (capability) => caps.has(capability);
+  }, [user]);
+
   return (
-    <AuthContext.Provider value={{ user, login, logout, loading, loadUser }}>
+    <AuthContext.Provider value={{ user, login, logout, loading, loadUser, can }}>
       {children}
     </AuthContext.Provider>
   );

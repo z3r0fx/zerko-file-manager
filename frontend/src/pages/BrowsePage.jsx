@@ -5,18 +5,32 @@ import { DataContext } from '../context/DataContext';
 import { ThemeContext } from '../context/ThemeContext';
 import { apiCall } from '../lib/api';
 import { cn } from '../lib/utils';
-import { LayoutGrid, List, Sun, Moon, Play, Tag, Download, Trash2, Edit, Link, Plus, FolderOpen } from 'lucide-react';
+import { LayoutGrid, List, Sun, Moon, Play, Tag, Download, Trash2, Edit, Link, Plus, FolderOpen, ArrowUpDown, SlidersHorizontal, X, ChevronRight, Star, ImageDown } from 'lucide-react';
+import { Dropdown } from '../components/files/Dialogs';
 import MediaGrid from '../components/shared/MediaGrid';
+import FileList from '../components/shared/FileList';
 import VideoModal from '../components/shared/VideoModal';
 import PhotoLightbox from '../components/shared/PhotoLightbox';
+import PhotoProxyDialog from '../components/shared/PhotoProxyDialog';
 import { collectDroppedFiles, hasFiles } from '../lib/dropUpload';
 import ContextMenu from '../components/shared/ContextMenu';
 import ConfirmDialog from '../components/shared/ConfirmDialog';
 import BulkActionBar from '../components/shared/BulkActionBar';
 import { canTranscribe, nounFor, titleNoun } from '../lib/mediaLabel';
 import { useSearchParams } from 'react-router-dom';
+import { setBrowsingType } from '../lib/mediaTypeStore';
 
-export default function BrowsePage({ sortBy, sortOrder }) {
+// Anything that is not video, photo or audio is "a file": no rating, no
+// notes, no transcript. Grouped under one tab rather than one per extension.
+const NON_MEDIA = new Set(['document', 'project', 'other']);
+
+function matchesMediaType(v, mediaType) {
+  if (!mediaType || mediaType === 'all') return true;
+  if (mediaType === 'files') return NON_MEDIA.has(v.media_type);
+  return v.media_type === mediaType;
+}
+
+export default function BrowsePage({ sortBy, sortOrder, onSortByChange, onSortOrderChange }) {
   const dataContext = useContext(DataContext);
   const { videos, loading, loadVideos, updateVideoStatus, folders, createProject, moveVideoToFolder, loadFolders, renameVideo, tagTree, renameProject, deleteProject,
           selectedFolderId, setSelectedFolderId, includeSubfolders, folderDescendantIds, folderBreadcrumbs } = dataContext;
@@ -27,7 +41,10 @@ export default function BrowsePage({ sortBy, sortOrder }) {
   const projectFilter = selectedFolderId;
   const setProjectFilter = setSelectedFolderId;
   // const [sortOrder, setSortOrder] = useState('desc'); // Removed
-  const [viewMode, setViewMode] = useState('grid');
+  const [viewMode, setViewModeState] = useState(() => { try { return localStorage.getItem('zerko.library.view') === 'list' ? 'list' : 'grid'; } catch { return 'grid'; } });
+  const setViewMode = (v) => { setViewModeState(v); try { localStorage.setItem('zerko.library.view', v); } catch { /* private mode */ } };
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const filtersRef = useRef(null);
   const [gridSize, setGridSize] = useState('medium');
   const [selectedVideoId, setSelectedVideoId] = useState(null);
   const [contextMenu, setContextMenu] = useState(null);
@@ -44,6 +61,10 @@ export default function BrowsePage({ sortBy, sortOrder }) {
   const [createProjectOpen, setCreateProjectOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState(null);
   const [toast, setToast] = useState(null);
+  const [proxyOpen, setProxyOpen] = useState(false);
+  // tell the sidebar which tab is showing, so it lists only folders with that kind of media
+  useEffect(() => { setBrowsingType(filter.mediaType); }, [filter.mediaType]);
+  useEffect(() => () => setBrowsingType('all'), []);
   const [batchJob, setBatchJob] = useState(null);
   const [selectedVideoIds, setSelectedVideoIds] = useState(new Set());
   const [lastSelectedId, setLastSelectedId] = useState(null);
@@ -111,29 +132,34 @@ export default function BrowsePage({ sortBy, sortOrder }) {
   // you are currently looking at - the breadcrumb tells you exactly where.
   const currentFolderName = crumbs.length ? crumbs[crumbs.length - 1].name : 'All Media';
 
+  // window.confirm blocks the whole page and looks like a browser error. The
+  // in-app dialog says the same thing without stopping the world.
+  const [pendingDrop, setPendingDrop] = useState(null);
+
   const handleWindowFileDrop = async (e) => {
     if (!hasFiles(e.dataTransfer)) return;
     e.preventDefault();
     setFileDragOver(false);
     const entries = await collectDroppedFiles(e.dataTransfer);
     if (!entries.length) return;
-    const nested = entries.filter((x) => x.relativePath).length;
-    const ok = window.confirm(
-      `Upload ${entries.length} file${entries.length === 1 ? '' : 's'} into "${currentFolderName}"?` +
-      (nested ? `\n\n${nested} of them are inside folders — that structure will be recreated.` : '')
-    );
-    if (ok) dataContext.addToQueue(entries, projectFilter ?? null);
+    setPendingDrop({ entries, folderId: projectFilter ?? null, folderName: currentFolderName });
+  };
+
+  const confirmDrop = () => {
+    if (pendingDrop) dataContext.addToQueue(pendingDrop.entries, pendingDrop.folderId);
+    setPendingDrop(null);
   };
 
   const visibleVideos = filteredVideos.filter((v) => { 
-      const statusMatch = statusFilter === 'all' ? true : (v.status || 'raw') === statusFilter; 
+      const statusMatch = statusFilter === 'all' ? true : (v.status || 'raw') === statusFilter;
+      const typeMatch = matchesMediaType(v, filter.mediaType);
       const projectMatch = projectFilter === null ? true
           : (includeSubfolders ? folderScope.has(v.folder_id) : v.folder_id === projectFilter); 
       const ratingMatch = ratingFilter === null ? true : (v.rating || 0) >= ratingFilter;
       const tagMatch = activeTags.length === 0
         ? true
         : activeTags.every((tid) => (v.tags || []).some((t) => t.id === tid));
-      return statusMatch && projectMatch && ratingMatch && tagMatch; 
+      return statusMatch && typeMatch && projectMatch && ratingMatch && tagMatch;
   });
 
   // Drag-to-select logic
@@ -188,6 +214,11 @@ export default function BrowsePage({ sortBy, sortOrder }) {
   }, [dragState.start, visibleVideos, selectedVideoIds]);
 
   function handleMouseDown(e) {
+    // The rubber-band box is gone: it kept appearing when you grabbed the
+    // sidebar edge, and the dot on each tile (Shift, Ctrl, or a touch sweep)
+    // does the selecting.
+    return;
+    // eslint-disable-next-line no-unreachable
     // No rubber-band selection while a video is open, a dialog is up, or the
     // click started on a control - there is nothing to marquee-select over.
     if (selectedVideoId || tagSelectorTarget || deleteTarget || renameTarget || createProjectOpen) return;
@@ -214,7 +245,10 @@ export default function BrowsePage({ sortBy, sortOrder }) {
       loadVideos({ 
         sort_by: sortBy, 
         sort_order: sortOrder, 
-        media_type: filter.mediaType !== 'all' ? filter.mediaType : null
+        // 'files' is a grouping the interface invents - the server knows
+        // document/project/other, so it is filtered on this side.
+        media_type: (filter.mediaType && !['all', 'files'].includes(filter.mediaType))
+          ? filter.mediaType : null
       });
 
       // 2. If searching, also perform transcript search
@@ -250,8 +284,7 @@ export default function BrowsePage({ sortBy, sortOrder }) {
       const projectOk = projectFilter === null ? true
         : (includeSubfolders ? folderScope.has(v.folder_id) : v.folder_id === projectFilter);
       const ratingOk = ratingFilter === null ? true : (v.rating || 0) >= ratingFilter;
-      const typeOk = (!filter.mediaType || filter.mediaType === 'all')
-        ? true : v.media_type === filter.mediaType;
+      const typeOk = matchesMediaType(v, filter.mediaType);
       return statusOk && projectOk && ratingOk && typeOk;
     };
 
@@ -289,8 +322,27 @@ export default function BrowsePage({ sortBy, sortOrder }) {
     [displayVideos]
   );
 
+  // Downloading one file. The same signed-token dance the context menu does -
+  // the stream endpoint will not serve a file on a bare session cookie.
+  async function downloadFile(media) {
+    try {
+      const response = await apiCall(`/api/videos/${media.id}/download-token`);
+      const a = document.createElement('a');
+      a.href = `/api/video-file/${media.id}?token=${response.token}`;
+      a.download = media.filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => document.body.removeChild(a), 1000);
+      setToast('Download started…');
+    } catch (err) {
+      setToast('Could not download that file');
+    }
+  }
+
   async function handleItemClick(media) {
-    setSelectedVideoIds(new Set([media.id]));
+    // Opening a clip does not select it - selecting is the dot's job. The clip
+    // does become the anchor, so a later Shift-click ranges from here.
     setLastSelectedId(media.id);
 
     // Searching and this clip has a spoken match? Open on the first one.
@@ -342,15 +394,65 @@ export default function BrowsePage({ sortBy, sortOrder }) {
     setLastSelectedId(media.id);
   }
 
-  function handleRangeSelect(media) {
-    if (lastSelectedId === null) { handleToggleSelect(media); return; }
-    const videoIds = visibleVideos.map((v) => v.id);
-    const lastIdx = videoIds.indexOf(lastSelectedId);
-    const currIdx = videoIds.indexOf(media.id);
-    if (lastIdx === -1 || currIdx === -1) { handleToggleSelect(media); return; }
-    const [start, end] = [Math.min(lastIdx, currIdx), Math.max(lastIdx, currIdx)];
-    setSelectedVideoIds(new Set(videoIds.slice(start, end + 1)));
+  // Select one clip and make it the anchor for a later shift-click.
+  function handleSelectOnly(media) {
+    setSelectedVideoIds(new Set([media.id]));
+    setLastSelectedId(media.id);
   }
+
+  // Shift-click: everything between the anchor and this clip, in the order the
+  // grid is showing them (displayVideos - which follows search and sorting -
+  // not the unsorted list). The anchor stays put, so shift-clicking again
+  // re-targets the range from the same starting point. Ctrl+Shift adds the
+  // range to what is already selected instead of replacing it.
+  function handleRangeSelect(media, additive = false) {
+    const order = displayVideos.map((v) => v.id);
+    let anchor = lastSelectedId;
+    if (anchor === null || !order.includes(anchor)) {
+      // nothing to start from yet: use the first thing already selected, else this one
+      anchor = order.find((id) => selectedVideoIds.has(id)) ?? media.id;
+      setLastSelectedId(anchor);
+    }
+    const a = order.indexOf(anchor);
+    const b = order.indexOf(media.id);
+    if (a === -1 || b === -1) { handleSelectOnly(media); return; }
+    const range = order.slice(Math.min(a, b), Math.max(a, b) + 1);
+    setSelectedVideoIds(new Set(additive ? [...selectedVideoIds, ...range] : range));
+    window.getSelection?.()?.removeAllRanges?.();
+  }
+
+  // Touch sweep-select: press a tile's dot and drag over others. The first tile
+  // decides whether the sweep adds or removes; everything between it and the
+  // finger (in the order shown) gets that treatment.
+  const sweepRef = useRef({ base: new Set(), mode: 'add', from: null });
+  const selRef = useRef(selectedVideoIds);
+  selRef.current = selectedVideoIds;
+  const orderRef = useRef([]);
+  orderRef.current = displayVideos.map((v) => v.id);
+  useEffect(() => {
+    const onSweep = (e) => {
+      const { phase, id } = e.detail || {};
+      const sw = sweepRef.current;
+      const order = orderRef.current;
+      if (phase === 'start') {
+        sw.base = new Set(selRef.current);
+        sw.mode = sw.base.has(id) ? 'remove' : 'add';
+        sw.from = id;
+        setLastSelectedId(id);
+      } else if (sw.from === null) {
+        return;
+      }
+      const a = order.indexOf(sw.from);
+      const b = order.indexOf(id);
+      if (a === -1 || b === -1) return;
+      const range = order.slice(Math.min(a, b), Math.max(a, b) + 1);
+      const next = new Set(sw.base);
+      range.forEach((rid) => (sw.mode === 'add' ? next.add(rid) : next.delete(rid)));
+      setSelectedVideoIds(next);
+    };
+    window.addEventListener('zerko-sweep-select', onSweep);
+    return () => window.removeEventListener('zerko-sweep-select', onSweep);
+  }, []);
 
   function handleContextMenu(e, media) {
     e.preventDefault();
@@ -461,6 +563,44 @@ export default function BrowsePage({ sortBy, sortOrder }) {
     return () => clearInterval(interval);
   }, [batchJob, loadVideos]);
 
+  // Ctrl/Cmd+A selects everything shown, Esc clears, Enter opens a single selection.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (selectedVideoId || tagSelectorTarget || deleteTarget || renameTarget || createProjectOpen) return;
+      if (e.target.closest && e.target.closest('input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && filter.mediaType !== 'files') {
+        e.preventDefault();
+        setSelectedVideoIds(new Set(displayVideos.map((v) => v.id)));
+      } else if (e.key === 'Escape' && selectedVideoIds.size) {
+        setSelectedVideoIds(new Set());
+        setLastSelectedId(null);
+      } else if (e.key === 'Enter' && selectedVideoIds.size === 1 && filter.mediaType !== 'files') {
+        const m = displayVideos.find((v) => v.id === [...selectedVideoIds][0]);
+        if (m) handleItemClick(m);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  // Progress of a drag-to-folder move, broadcast by DataContext.moveVideosToFolder
+  useEffect(() => {
+    const prog = (e) => {
+      const { done, total } = e.detail || {};
+      if (total > 1) setToast(`Moving ${done} of ${total}...`);
+      else setToast('Moving...');
+    };
+    const fin = (e) => {
+      const { total, failed, error } = e.detail || {};
+      if (failed) setToast(`Moved ${total - failed} of ${total}. ${error || 'Some could not be moved.'}`);
+      else { setToast(`Moved ${total} ${total === 1 ? 'item' : 'items'}`); setSelectedVideoIds(new Set()); }
+      setTimeout(() => setToast(null), failed ? 6000 : 2500);
+    };
+    window.addEventListener('zerko-move-progress', prog);
+    window.addEventListener('zerko-move-done', fin);
+    return () => { window.removeEventListener('zerko-move-progress', prog); window.removeEventListener('zerko-move-done', fin); };
+  }, []);
+
   const handleMainClick = (e) => {
     if (isDragging || e.target.closest('[data-id]') || e.target.closest('.bulk-action-bar')) return;
     setSelectedVideoIds(new Set());
@@ -494,12 +634,25 @@ export default function BrowsePage({ sortBy, sortOrder }) {
       onDragLeave={(e) => { if (e.currentTarget === e.target) setFileDragOver(false); }}
       onDrop={handleWindowFileDrop}
     >
+      <ConfirmDialog
+        open={!!pendingDrop}
+        title="Upload these files?"
+        message={pendingDrop
+          ? `${pendingDrop.entries.length} file${pendingDrop.entries.length === 1 ? '' : 's'} into "${pendingDrop.folderName}".`
+            + (pendingDrop.entries.filter((x) => x.relativePath).length
+                ? ` ${pendingDrop.entries.filter((x) => x.relativePath).length} of them sit inside folders — that structure is recreated.`
+                : '')
+          : ''}
+        onConfirm={confirmDrop}
+        onCancel={() => setPendingDrop(null)}
+      />
+
       {fileDragOver && (
         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm">
-          <div className="border-2 border-dashed border-[#ff5c1f] rounded-2xl px-10 py-8 text-center bg-zinc-900/90">
+          <div className="border-2 border-dashed border-accent rounded-2xl px-10 py-8 text-center bg-zinc-900/90">
             <p className="text-lg font-semibold text-zinc-100 mb-1">Drop to upload</p>
             <p className="text-sm text-zinc-400">
-              into <span className="text-[#ff5c1f] font-medium">{currentFolderName}</span>
+              into <span className="text-accent font-medium">{currentFolderName}</span>
             </p>
             <p className="text-xs text-zinc-600 mt-2">Folders keep their structure</p>
           </div>
@@ -507,7 +660,7 @@ export default function BrowsePage({ sortBy, sortOrder }) {
       )}
         {/* Selection Rectangle */}
         {dragState.start && (
-            <div className="fixed border border-orange-500 bg-orange-500/15 rounded-md pointer-events-none z-[100]"
+            <div className="fixed border border-accent bg-accent/15 rounded-md pointer-events-none z-[100]"
                 style={{
                     left: Math.min(dragState.start.x, dragState.current.x),
                     top: Math.min(dragState.start.y, dragState.current.y),
@@ -517,16 +670,126 @@ export default function BrowsePage({ sortBy, sortOrder }) {
             />
         )}
 
-        {/* Media Types Filter */}
-        <div className="flex items-center justify-between px-6 pt-6 pb-2 border-b border-zinc-800">
-            <div className="flex items-center gap-4">
-                {['all', 'video', 'photo', 'audio', 'document'].map((type) => (
-                <button key={type} onClick={() => setMediaTypeFilter(type)} className={cn('capitalize text-sm font-medium transition', filter.mediaType === type ? 'text-red-400 border-b-2 border-red-500' : 'text-zinc-500 hover:text-zinc-300')}>{type}</button>
-                ))}
-            </div>
-            <button onClick={() => setCreateProjectOpen(true)} className="flex items-center gap-2 text-sm text-zinc-400 hover:text-white transition">
-                <Plus className="w-4 h-4" /> Create Project
+        {/* One toolbar: what kind of thing, how it is ordered, and any filters. */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-zinc-800 px-6 py-3">
+          <div className="flex items-center gap-0.5 rounded-xl bg-zinc-900 p-1" role="tablist" aria-label="Media type">
+            {[['all', 'All'], ['video', 'Videos'], ['photo', 'Photos'], ['audio', 'Audio']].map(([type, label]) => (
+              <button
+                key={type}
+                role="tab"
+                aria-selected={filter.mediaType === type}
+                onClick={() => setMediaTypeFilter(type)}
+                className={cn('rounded-[9px] px-3.5 py-1.5 text-sm font-medium transition',
+                  filter.mediaType === type ? 'bg-zinc-700 text-zinc-50 shadow-sm' : 'text-zinc-500 hover:text-zinc-200')}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {statusFilter !== 'all' && (
+            <button onClick={() => setStatusFilter('all')} className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs capitalize text-accent hover:bg-accent/20">
+              {statusFilter} <X className="h-3 w-3" />
             </button>
+          )}
+          {ratingFilter && (
+            <button onClick={() => setRatingFilter(null)} className="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 px-2.5 py-1 text-xs text-accent hover:bg-accent/20">
+              <Star className="h-3 w-3 fill-current" /> {ratingFilter}+ <X className="h-3 w-3" />
+            </button>
+          )}
+
+          <span className="ml-1 text-xs text-zinc-600">
+            {visibleVideos.length} {visibleVideos.length === 1 ? 'item' : 'items'}
+            {projectFilter !== null && includeSubfolders && folderScope.size > 1 && ` across ${folderScope.size} folders`}
+          </span>
+
+          <div className="ml-auto flex items-center gap-1.5">
+            {filter.mediaType === 'photo' && (
+              <button
+                onClick={() => setProxyOpen(true)}
+                className="inline-flex items-center gap-2 rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-sm font-medium text-accent transition hover:bg-accent/20 active:scale-95"
+                title="Make 16:9 copies of photos and download them as a ZIP"
+              >
+                <ImageDown className="h-4 w-4" /> Generate proxy
+              </button>
+            )}
+            <div className="relative" ref={filtersRef}>
+              <button
+                onClick={() => setFiltersOpen((o) => !o)}
+                aria-expanded={filtersOpen}
+                className={cn('inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition',
+                  filtersOpen ? 'border-zinc-600 bg-zinc-800 text-zinc-100' : 'border-zinc-800 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-100')}
+              >
+                <SlidersHorizontal className="h-4 w-4" /> Filters
+                {(statusFilter !== 'all' ? 1 : 0) + (ratingFilter ? 1 : 0) > 0 && (
+                  <span className="rounded-full bg-accent px-1.5 text-[10px] font-semibold leading-4 text-accent-foreground">
+                    {(statusFilter !== 'all' ? 1 : 0) + (ratingFilter ? 1 : 0)}
+                  </span>
+                )}
+              </button>
+              {filtersOpen && (
+                <>
+                  <div className="fixed inset-0 z-30" onClick={() => setFiltersOpen(false)} />
+                  <div className="absolute right-0 z-40 mt-2 w-72 rounded-xl border border-zinc-700/60 bg-zinc-900 p-4 shadow-2xl shadow-black/60">
+                    <p className="mb-2 text-[11px] font-medium uppercase tracking-wider text-zinc-500">Status</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {STATUS_TABS.map((status) => (
+                        <button key={status} onClick={() => setStatusFilter(status)}
+                                className={cn('rounded-md px-2.5 py-1 text-xs capitalize transition',
+                                  statusFilter === status ? 'bg-zinc-600 text-zinc-50' : 'bg-zinc-800 text-zinc-400 hover:text-zinc-200')}>
+                          {status}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mb-2 mt-4 text-[11px] font-medium uppercase tracking-wider text-zinc-500">Minimum rating</p>
+                    <div className="flex items-center gap-1">
+                      {[1, 2, 3, 4, 5].map((rating) => (
+                        <button key={rating} onClick={() => setRatingFilter(ratingFilter === rating ? null : rating)}
+                                aria-label={`${rating} star${rating === 1 ? '' : 's'} or more`}
+                                className={cn('text-xl transition', (ratingFilter || 0) >= rating ? 'text-yellow-500' : 'text-zinc-600 hover:text-zinc-400')}>★</button>
+                      ))}
+                    </div>
+                    {(statusFilter !== 'all' || ratingFilter) && (
+                      <button onClick={() => { setStatusFilter('all'); setRatingFilter(null); }} className="mt-4 text-xs text-zinc-400 hover:text-zinc-100">Reset filters</button>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <Dropdown
+              align="right"
+              trigger={
+                <button type="button" className="inline-flex items-center gap-2 rounded-lg border border-zinc-800 px-3 py-1.5 text-sm text-zinc-400 transition hover:bg-zinc-900 hover:text-zinc-100">
+                  <ArrowUpDown className="h-4 w-4" />
+                  <span className="capitalize">{sortBy}</span>
+                  <span className="text-zinc-600">{sortOrder === 'asc' ? '↑' : '↓'}</span>
+                </button>
+              }
+              items={[
+                ...[['date', 'Date added'], ['name', 'Name'], ['size', 'Size'], ['duration', 'Duration']].map(([k, label]) => ({
+                  label, active: sortBy === k, onClick: () => onSortByChange?.(k),
+                })),
+                { type: 'divider' },
+                { label: 'Newest / largest first', active: sortOrder === 'desc', onClick: () => onSortOrderChange?.('desc') },
+                { label: 'Oldest / smallest first', active: sortOrder === 'asc', onClick: () => onSortOrderChange?.('asc') },
+              ]}
+            />
+
+            <div className="flex rounded-lg border border-zinc-800 p-0.5">
+              {[['grid', LayoutGrid, 'Grid'], ['list', List, 'List']].map(([v, Ic, label]) => (
+                <button key={v} onClick={() => setViewMode(v)} title={`${label} view`} aria-label={`${label} view`} aria-pressed={viewMode === v}
+                        className={cn('rounded-md p-1.5 transition', viewMode === v ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-500 hover:text-zinc-200')}>
+                  <Ic className="h-4 w-4" />
+                </button>
+              ))}
+            </div>
+
+            <button onClick={() => setCreateProjectOpen(true)} title="Create a project (folder)" aria-label="Create a project"
+                    className="rounded-lg border border-zinc-800 p-2 text-zinc-400 transition hover:bg-zinc-900 hover:text-zinc-100">
+              <Plus className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         {/* Project Creation Dialog */}
@@ -546,54 +809,20 @@ export default function BrowsePage({ sortBy, sortOrder }) {
             </div>
         )}
         
-        {/* Project Filter Bar */}
-        <div className="flex flex-col gap-4 px-6 pt-4 pb-2 border-b border-zinc-800">
-            <div className="flex items-center gap-2 text-sm min-h-[34px]">
-                <button
-                  onClick={() => setProjectFilter(null)}
-                  className={cn('px-2 py-1 rounded transition', projectFilter === null ? 'text-red-400 font-medium' : 'text-zinc-500 hover:text-zinc-300')}
-                >
-                  All Media
+        {projectFilter !== null && (
+          <div className="flex items-center gap-1 border-b border-zinc-800/70 px-6 py-2 text-sm">
+            <button onClick={() => setProjectFilter(null)} className="rounded px-2 py-1 text-zinc-500 transition hover:text-zinc-200">All media</button>
+            {crumbs.map((c, i) => (
+              <span key={c.id} className="flex items-center gap-1">
+                <ChevronRight className="h-3.5 w-3.5 text-zinc-700" />
+                <button onClick={() => setProjectFilter(c.id)}
+                        className={cn('rounded px-2 py-1 transition', i === crumbs.length - 1 ? 'font-medium text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
+                  {c.name}
                 </button>
-
-                {crumbs.map((c, i) => (
-                  <span key={c.id} className="flex items-center gap-2">
-                    <span className="text-zinc-700">/</span>
-                    <button
-                      onClick={() => setProjectFilter(c.id)}
-                      className={cn('px-2 py-1 rounded transition',
-                        i === crumbs.length - 1 ? 'text-red-400 font-medium' : 'text-zinc-500 hover:text-zinc-300')}
-                    >
-                      {c.name}
-                    </button>
-                  </span>
-                ))}
-
-                <span className="ml-auto text-xs text-zinc-600">
-                  {visibleVideos.length} {visibleVideos.length === 1 ? 'item' : 'items'}
-                  {projectFilter !== null && includeSubfolders && folderScope.size > 1 &&
-                    ` across ${folderScope.size} folders`}
-                </span>
-            </div>
-
-            <div className="flex items-center gap-4 text-sm pb-2">
-                <div className="flex items-center gap-2">
-                    <span className="text-zinc-500 text-xs uppercase">Status:</span>
-                    {STATUS_TABS.map(status => (
-                        <button key={status} onClick={() => setStatusFilter(status)} className={cn('px-2 py-1 rounded text-xs transition capitalize', statusFilter === status ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300')}>{status}</button>
-                    ))}
-                </div>
-                <div className="flex items-center gap-2 border-l border-zinc-700 pl-4">
-                    <span className="text-zinc-500 text-xs uppercase">Min Rating:</span>
-                    <div className="flex gap-1">
-                        {[1, 2, 3, 4, 5].map(rating => (
-                            <button key={rating} onClick={() => setRatingFilter(ratingFilter === rating ? null : rating)} className={cn('text-lg transition', (ratingFilter || 0) >= rating ? 'text-yellow-500' : 'text-zinc-600') }>★</button>
-                        ))}
-                        {ratingFilter && <button onClick={() => setRatingFilter(null)} className="ml-2 text-xs text-zinc-500">Reset</button>}
-                    </div>
-                </div>
-            </div>
-        </div>
+              </span>
+            ))}
+          </div>
+        )}
 
         {selectedVideoIds.size > 0 && (
             <BulkActionBar 
@@ -647,13 +876,27 @@ export default function BrowsePage({ sortBy, sortOrder }) {
                     />
                 </div>
                 <div className="flex gap-x-4 mt-2">
-                    <span className="text-[10px] text-orange-500">Skipped: {batchJob.status.skipped}</span>
+                    <span className="text-[10px] text-accent">Skipped: {batchJob.status.skipped}</span>
                     <span className="text-[10px] text-red-500">Failed: {batchJob.status.failed}</span>
                 </div>
             </div>
         )}
         
         <div className="flex-1 overflow-y-auto p-6">
+            {filter.mediaType === 'files' ? (
+              <FileList
+                items={displayVideos}
+                loading={loading}
+                folders={folders}
+                selectedIds={selectedVideoIds}
+                onToggleSelect={handleToggleSelect}
+                onContextMenu={handleContextMenu}
+                onOpen={downloadFile}
+                onRename={(f) => setRenameTarget(f)}
+                onMove={(f) => { setSelectedVideoIds(new Set([f.id])); setToast('Drag it onto a folder in the sidebar to move it'); }}
+                onDelete={(f) => setDeleteTarget(f)}
+              />
+            ) : (
             <MediaGrid 
                 mediaItems={displayVideos} 
                 viewMode={viewMode} 
@@ -668,11 +911,23 @@ export default function BrowsePage({ sortBy, sortOrder }) {
                 selectedVideoIds={selectedVideoIds} 
                 onToggleSelect={handleToggleSelect} 
                 onRangeSelect={handleRangeSelect} 
+                onSelectOnly={handleSelectOnly}
                 totalSelectedCount={selectedVideoIds.size}
                 searchTerm={filter.search}
             />
+            )}
         </div>
         
+        {proxyOpen && (
+          <PhotoProxyDialog
+            onClose={() => setProxyOpen(false)}
+            selectedPhotos={photoSet.filter((v) => selectedVideoIds.has(v.id))}
+            viewPhotos={photoSet}
+            folderTree={dataContext.folderTree || []}
+            currentFolderId={selectedFolderId}
+          />
+        )}
+
         {selectedVideoId && (
             photoSet.length > 0 && photoSet.some(p => p.id === selectedVideoId) ? (
               <PhotoLightbox

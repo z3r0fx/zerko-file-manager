@@ -3,8 +3,10 @@ import { Play } from 'lucide-react';
 import StatusBadge from './StatusBadge';
 import { API_BASE } from '../../lib/api';
 import { cn } from '../../lib/utils';
+import { useAppearance } from '../../context/AppearanceContext';
+import { startMediaDrag } from '../../lib/mediaDrag';
 
-export default function VideoTable({ videos = [], loading, onVideoClick, onContextMenu, onStatusChange, selectedVideoIds = new Set(), onToggleSelect, onRangeSelect }) {
+export default function VideoTable({ videos = [], loading, onVideoClick, onContextMenu, onStatusChange, selectedVideoIds = new Set(), onToggleSelect, onRangeSelect, onSelectOnly }) {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16 text-zinc-500">
@@ -59,6 +61,8 @@ export default function VideoTable({ videos = [], loading, onVideoClick, onConte
               isSelected={selectedVideoIds.has(video.id)}
               onToggleSelect={onToggleSelect}
               onRangeSelect={onRangeSelect}
+              onSelectOnly={onSelectOnly}
+              selectedIds={selectedVideoIds}
             />
           ))}
         </tbody>
@@ -67,8 +71,9 @@ export default function VideoTable({ videos = [], loading, onVideoClick, onConte
   );
 }
 
-function VideoTableRow({ video, onClick, onContextMenu, onStatusChange, isSelected, onToggleSelect, onRangeSelect }) {
+function VideoTableRow({ video, onClick, onContextMenu, onStatusChange, isSelected, onToggleSelect, onRangeSelect, onSelectOnly, selectedIds }) {
   const [imageError, setImageError] = useState(false);
+  const { clickAction } = useAppearance();
 
   const thumbnailUrl = video.thumbnail_path
     ? video.thumbnail_path.startsWith('http')
@@ -91,13 +96,21 @@ function VideoTableRow({ video, onClick, onContextMenu, onStatusChange, isSelect
 
   const handleClick = (e) => {
     e.stopPropagation();
-    if (e.ctrlKey || e.metaKey) {
-      onToggleSelect?.(video);
-    } else if (e.shiftKey) {
-      onRangeSelect?.(video);
-    } else {
-      onClick?.(video);
-    }
+    if (e.shiftKey) { onRangeSelect?.(video, e.ctrlKey || e.metaKey); return; }
+    if (e.ctrlKey || e.metaKey) { onToggleSelect?.(video); return; }
+    const coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    if (clickAction === 'select' && !coarse && onSelectOnly) { onSelectOnly(video); return; }
+    onClick?.(video);
+  };
+
+  const handleDoubleClick = (e) => {
+    if (clickAction !== 'select' || e.shiftKey || e.ctrlKey || e.metaKey) return;
+    onClick?.(video);
+  };
+
+  const handleDragStart = (e) => {
+    const ids = isSelected && selectedIds && selectedIds.size > 1 ? [...selectedIds] : [video.id];
+    startMediaDrag(e, ids, video.id);
   };
 
   const handleContextMenu = (e) => {
@@ -109,10 +122,14 @@ function VideoTableRow({ video, onClick, onContextMenu, onStatusChange, isSelect
     <tr
       data-id={video.id}
       className={cn(
-        "border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/60 cursor-pointer transition",
-        isSelected && "bg-blue-900/20 border-blue-500/30"
+        "border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/60 cursor-pointer transition select-none",
+        isSelected && "bg-accent/15 border-accent/30"
       )}
+      draggable
+      onDragStart={handleDragStart}
+      onMouseDown={(e) => { if (e.shiftKey) e.preventDefault(); }}
       onClick={handleClick}
+      onDoubleClick={handleDoubleClick}
       onContextMenu={handleContextMenu}
     >
       {/* Thumbnail */}

@@ -34,7 +34,10 @@ export default function DashboardPage() {
   ];
 
   return (
-    <div className="p-6 space-y-6">
+    // h-full + overflow-y-auto: <main> is overflow-hidden, so a page that does
+    // not scroll itself simply gets cut off at the fold. It fit before the
+    // storage panel was added, which is why this only showed up now.
+    <div className="h-full overflow-y-auto p-6 space-y-6">
       <h1 className="text-2xl font-bold text-zinc-100">Dashboard</h1>
 
       <StoragePanel />

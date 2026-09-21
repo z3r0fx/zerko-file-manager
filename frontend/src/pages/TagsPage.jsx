@@ -94,7 +94,7 @@ export default function TagsPage() {
         <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
           <div>
             <h1 className="flex items-center gap-2 text-xl font-medium text-zinc-100">
-              <TagsIcon className="h-5 w-5 text-[#ff5c1f]" /> Auto-tagging
+              <TagsIcon className="h-5 w-5 text-accent" /> Auto-tagging
             </h1>
             <p className="mt-1 text-sm text-zinc-500">
               Tags are worked out from your folders, your cameras, and what you say on camera.
@@ -110,7 +110,7 @@ export default function TagsPage() {
         <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
           <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
             <span className="text-sm text-zinc-300">
-              <strong className="font-mono text-[#ff5c1f]">{data.files_tagged.toLocaleString()}</strong>
+              <strong className="font-mono text-accent">{data.files_tagged.toLocaleString()}</strong>
               {' '}of {data.files_total.toLocaleString()} files have tags
             </span>
             <span className="font-mono text-xs text-zinc-500">
@@ -118,7 +118,7 @@ export default function TagsPage() {
             </span>
           </div>
           <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
-            <div className="h-full rounded-full bg-[#ff5c1f] transition-all" style={{ width: `${coverage}%` }} />
+            <div className="h-full rounded-full bg-accent transition-all" style={{ width: `${coverage}%` }} />
           </div>
           {data.files_untagged > 0 && (
             <p className="mt-2 text-xs text-zinc-500">
@@ -133,7 +133,7 @@ export default function TagsPage() {
           <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
             {data.running ? (
               <div className="flex items-center gap-3">
-                <Loader2 className="h-5 w-5 animate-spin text-[#ff5c1f]" />
+                <Loader2 className="h-5 w-5 animate-spin text-accent" />
                 <div>
                   <p className="text-sm text-zinc-200">Tagging…</p>
                   <p className="font-mono text-xs text-zinc-500">{data.message}</p>
@@ -143,13 +143,13 @@ export default function TagsPage() {
               <>
                 <div className="flex flex-wrap items-center gap-3">
                   <button onClick={run} disabled={busy}
-                          className="flex items-center gap-2 rounded-lg bg-[#ff5c1f] px-4 py-2 text-sm font-medium text-black transition hover:bg-[#ff7a45] disabled:opacity-50">
+                          className="flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi disabled:opacity-50">
                     <Sparkles className="h-4 w-4" /> Run auto-tagging
                   </button>
                   <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-400">
                     <input type="checkbox" checked={useTranscripts}
                            onChange={(e) => setUseTranscripts(e.target.checked)}
-                           className="h-3.5 w-3.5 accent-[#ff5c1f]" />
+                           className="h-3.5 w-3.5 accent-accent" />
                     include what's said on camera
                     <span className="text-zinc-600">({data.files_with_transcript} transcribed)</span>
                   </label>
@@ -198,7 +198,7 @@ export default function TagsPage() {
           <div className="relative">
             <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Find a tag…"
-                   className="rounded-lg border border-zinc-700 bg-zinc-950 py-1.5 pl-7 pr-3 text-sm text-zinc-200 outline-none focus:border-[#ff5c1f]" />
+                   className="rounded-lg border border-zinc-700 bg-zinc-950 py-1.5 pl-7 pr-3 text-sm text-zinc-200 outline-none focus:border-accent" />
           </div>
           {['all', 'spoken', 'camera', 'folder', 'stage'].map((k) => (
             <button key={k} onClick={() => setSource(k)}

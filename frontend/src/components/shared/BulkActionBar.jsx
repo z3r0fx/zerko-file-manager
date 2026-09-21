@@ -219,7 +219,7 @@ export default function BulkActionBar({ selectedIds, onClear, videos, onBatchTra
               tagCounts={{}}
             />
             <div className="flex gap-2 mt-3">
-              <button onClick={handleTag} className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 text-white text-xs rounded-lg font-medium transition">Apply Tags</button>
+              <button onClick={handleTag} className="px-3 py-1.5 bg-accent-lo hover:bg-accent text-white text-xs rounded-lg font-medium transition">Apply Tags</button>
               <button onClick={handleUntag} className="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 text-zinc-200 text-xs rounded-lg font-medium transition">Remove Tags</button>
               <button onClick={() => setActive(null)} className="px-3 py-1.5 text-zinc-400 hover:text-zinc-200 text-xs transition">Cancel</button>
             </div>
@@ -244,7 +244,7 @@ export default function BulkActionBar({ selectedIds, onClear, videos, onBatchTra
               <button 
                 onClick={handleMove} 
                 disabled={selectedFolderId === 'mixed'}
-                className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded-lg font-medium transition"
+                className="px-3 py-1.5 bg-accent-lo hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded-lg font-medium transition"
               >
                 Move
               </button>
@@ -271,7 +271,7 @@ export default function BulkActionBar({ selectedIds, onClear, videos, onBatchTra
               <button 
                 onClick={handleStatus} 
                 disabled={statusValue === 'mixed'}
-                className="px-3 py-1.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded-lg font-medium transition"
+                className="px-3 py-1.5 bg-accent-lo hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded-lg font-medium transition"
               >
                 Set Status
               </button>

@@ -16,7 +16,7 @@ export default function UploadManager() {
       <div className="p-4 border-b border-zinc-800">
         <h3 className="font-medium text-zinc-100">Uploads ({uploadQueue.length})</h3>
         <div className="h-1.5 w-full bg-zinc-800 rounded-full mt-2 overflow-hidden">
-          <div className="h-full bg-orange-500 transition-all" style={{ width: `${totalProgress}%` }} />
+          <div className="h-full bg-accent transition-all" style={{ width: `${totalProgress}%` }} />
         </div>
       </div>
       <div className="max-h-64 overflow-y-auto p-2 space-y-2">
@@ -32,7 +32,7 @@ export default function UploadManager() {
               </div>
             </div>
             {task.status === 'error' && (
-              <button onClick={() => retryUpload(task.id)} className="text-zinc-400 hover:text-orange-500"><RotateCcw className="w-4 h-4" /></button>
+              <button onClick={() => retryUpload(task.id)} className="text-zinc-400 hover:text-accent"><RotateCcw className="w-4 h-4" /></button>
             )}
             <button onClick={() => removeFromQueue(task.id)} className="text-zinc-400 hover:text-red-500"><X className="w-4 h-4" /></button>
           </div>

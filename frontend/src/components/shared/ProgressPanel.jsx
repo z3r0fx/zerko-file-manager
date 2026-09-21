@@ -130,7 +130,7 @@ function ActiveUploadCard({ task }) {
       {/* A3: Gradient progress bar */}
       <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-1">
         <div
-          className="h-full bg-gradient-to-r from-red-500 to-orange-500 transition-all duration-300"
+          className="h-full bg-gradient-to-r from-red-500 to-accent transition-all duration-300"
           style={{ width: `${task.progress}%` }}
         />
       </div>

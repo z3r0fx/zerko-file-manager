@@ -17,6 +17,7 @@ export function DataProvider({ children }) {
   const [uploadQueue, setUploadQueue] = useState([]);
   const [backgroundJobs, setBackgroundJobs] = useState({});
   const lastParams = useRef({});
+  const videosReq = useRef(0);
   const reloadTimer = useRef(null);
 
   const loadVideos = useCallback(async (params = null) => {
@@ -26,8 +27,12 @@ export function DataProvider({ children }) {
       Object.entries(finalParams).filter(([_, v]) => v !== null && v !== undefined && v !== 'null')
     );
     const qs = new URLSearchParams(cleanParams).toString();
+    // Latest request wins. Switching tabs quickly fires several loads; a slow
+    // one for the tab you just left (all your videos) used to land last and
+    // wipe out the photos you were now looking at.
+    const mine = ++videosReq.current;
     const data = await apiCall(`/api/videos${qs ? '?' + qs : ''}`);
-    setVideos(data);
+    if (mine === videosReq.current) setVideos(data);
     return data;
   }, []);
 
@@ -178,6 +183,32 @@ export function DataProvider({ children }) {
     await loadFolders();
     await loadFolderTree();
     return result;
+  };
+
+  // Move several clips at once. The server moves the files one by one (it is a
+  // real move on disk), but the grid, folder counts and tree are reloaded ONCE
+  // at the end - not three times per clip - and progress is broadcast so the
+  // page can show "Moving 3 of 12".
+  const moveVideosToFolder = async (ids, folderId) => {
+    const list = [...new Set((ids || []).map(Number).filter(Boolean))];
+    if (!list.length) return { moved: 0, failed: [] };
+    const failed = [];
+    const say = (name, detail) => window.dispatchEvent(new CustomEvent(name, { detail }));
+    say('zerko-move-progress', { done: 0, total: list.length });
+    for (let i = 0; i < list.length; i += 1) {
+      try {
+        await apiCall(`/api/videos/${list[i]}/folder`, {
+          method: 'POST',
+          body: JSON.stringify({ folder_id: folderId }),
+        });
+      } catch (e) {
+        failed.push(String(e?.message || e));
+      }
+      say('zerko-move-progress', { done: i + 1, total: list.length });
+    }
+    await Promise.all([loadVideos(), loadFolders(), loadFolderTree()]);
+    say('zerko-move-done', { total: list.length, failed: failed.length, error: failed[0] || null, ids: list });
+    return { moved: list.length - failed.length, failed };
   };
 
   const addNote = async (videoId, content) => {
@@ -399,7 +430,7 @@ export function DataProvider({ children }) {
         loadVideos, loadTags, loadTagTree, loadFolders, loadStats,
         deleteVideo, transcribeVideo, updateVideoTags, removeVideoTag, reloadVideo,
         createTag, deleteTag, createProject, renameProject, deleteProject,
-        moveVideoToFolder, updateVideoStatus, updateVideoMetadata, renameVideo,
+        moveVideoToFolder, moveVideosToFolder, updateVideoStatus, updateVideoMetadata, renameVideo,
         addNote, deleteNote, bulkAction, uploadQueue, backgroundJobs,
         addToQueue, retryUpload, removeFromQueue,
   }), [videos, tags, folders, folderTree, selectedFolderId, includeSubfolders,

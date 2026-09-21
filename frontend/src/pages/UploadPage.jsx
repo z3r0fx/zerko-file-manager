@@ -99,8 +99,8 @@ export default function UploadPage() {
               <div className="h-px bg-zinc-800 flex-1" />
             </div>
 
-            <label className="inline-flex items-center gap-2.5 px-5 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-[#ff5c1f]/60 cursor-pointer transition">
-              <FolderUp className="w-5 h-5 text-[#ff5c1f]" />
+            <label className="inline-flex items-center gap-2.5 px-5 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-accent/60 cursor-pointer transition">
+              <FolderUp className="w-5 h-5 text-accent" />
               <span className="text-sm font-medium text-zinc-200">Upload a whole folder</span>
               <input
                 type="file"

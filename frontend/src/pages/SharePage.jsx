@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
+import PhoneUpload from '../components/shared/PhoneUpload';
 import { Heart, Download, Lock, X, ChevronLeft, ChevronRight, Check, Clock, MessageSquare, CheckSquare, Square, Package } from 'lucide-react';
 
 /**
@@ -35,6 +36,17 @@ export default function SharePage() {
   const [lastClicked, setLastClicked] = useState(null);
   const [marquee, setMarquee] = useState(null);   // drag-rectangle state
   const gridRef = useRef(null);
+
+  // Most of these links are opened on a phone, from WhatsApp. A drag-rectangle
+  // is meaningless there - worse, starting one swallows the scroll - so touch
+  // gets a tap-to-select mode with the checkboxes always visible instead.
+  const [touch] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia
+      ? window.matchMedia('(pointer: coarse)').matches
+      : 'ontouchstart' in window;
+  });
+  const [selectMode, setSelectMode] = useState(false);
 
   const qs = password ? `?password=${encodeURIComponent(password)}` : '';
 
@@ -135,6 +147,7 @@ export default function SharePage() {
   // Drag a box across the grid to select. Pointer events rather than mouse
   // events so a trackpad or touchscreen behaves the same.
   const onGridPointerDown = (e) => {
+    if (touch || e.pointerType === 'touch' || e.pointerType === 'pen') return;
     if (e.button !== 0) return;
     if (e.target.closest('button, a, input, textarea, figure')) return;  // let controls work
     const rect = gridRef.current?.getBoundingClientRect();
@@ -173,6 +186,10 @@ export default function SharePage() {
     };
   }, [marquee, selected]);
 
+  const fileUrl = (id) =>
+    `/api/public/share/${token}/stream/${id}?download=true`
+    + (password ? `&password=${encodeURIComponent(password)}` : '');
+
   const downloadZip = (onlySelected) => {
     const params = new URLSearchParams();
     if (onlySelected && selected.size) params.set('ids', [...selected].join(','));
@@ -190,7 +207,7 @@ export default function SharePage() {
       <Shell>
         <div className="w-full max-w-sm">
           <div className="mb-6 flex items-center gap-3 text-zinc-300">
-            <Lock className="h-5 w-5 text-[#ff5c1f]" />
+            <Lock className="h-5 w-5 text-accent" />
             <h1 className="text-lg font-medium">This link is password protected</h1>
           </div>
           <form onSubmit={(e) => { e.preventDefault(); load(password); }}>
@@ -200,9 +217,9 @@ export default function SharePage() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               placeholder="Password"
-              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-zinc-100 outline-none focus:border-[#ff5c1f]"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-zinc-100 outline-none focus:border-accent"
             />
-            <button type="submit" className="mt-3 w-full rounded-lg bg-[#ff5c1f] px-4 py-2 font-medium text-black transition hover:bg-[#ff7a45]">
+            <button type="submit" className="mt-3 w-full rounded-lg bg-accent px-4 py-2 font-medium text-accent-foreground transition hover:bg-accent-hi">
               Open
             </button>
           </form>
@@ -230,7 +247,7 @@ export default function SharePage() {
           <div className="flex items-center gap-4 font-mono text-xs text-zinc-500">
             <span>{data?.count} {data?.count === 1 ? 'clip' : 'clips'}</span>
             {data?.allow_selects && pickedCount > 0 && (
-              <span className="text-[#ff5c1f]">{pickedCount} picked</span>
+              <span className="text-accent">{pickedCount} picked</span>
             )}
             {data?.expires_at && (
               <span className="flex items-center gap-1">
@@ -253,17 +270,28 @@ export default function SharePage() {
                 try { localStorage.setItem('share_viewer_name', e.target.value); } catch { /* private mode */ }
               }}
               placeholder="optional"
-              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-200 outline-none focus:border-[#ff5c1f]"
+              className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-200 outline-none focus:border-accent"
             />
           </div>
         </div>
       )}
 
-      <main className="mx-auto max-w-7xl px-6 py-6">
+      <main className="mx-auto max-w-7xl px-3 py-4 sm:px-6 sm:py-6">
+        {data?.allow_upload && (
+          <div className="mb-5 sm:max-w-md">
+            <PhoneUpload
+              token={token}
+              password={password}
+              folderName={data.upload_folder}
+              onDone={() => load(password)}
+            />
+          </div>
+        )}
+
         <div
           ref={gridRef}
           onPointerDown={onGridPointerDown}
-          className="grid grid-cols-2 gap-4 select-none sm:grid-cols-3 lg:grid-cols-4"
+          className="grid grid-cols-2 gap-2.5 select-none sm:grid-cols-3 sm:gap-4 lg:grid-cols-4"
         >
           {videos.map((v, i) => (
             <figure
@@ -278,7 +306,10 @@ export default function SharePage() {
             >
               <button
                 type="button"
-                onClick={() => setOpenIndex(i)}
+                onClick={(e) => {
+                  if (selectMode && data?.allow_download) { toggleSelect(v.id, i, e); return; }
+                  setOpenIndex(i);
+                }}
                 className="block aspect-video w-full"
                 title={v.filename}
               >
@@ -296,10 +327,12 @@ export default function SharePage() {
                   type="button"
                   onClick={(e) => { e.stopPropagation(); toggleSelect(v.id, i, e); }}
                   className={
-                    'absolute left-2 top-2 z-10 rounded p-1.5 transition ' +
+                    'absolute left-1.5 top-1.5 z-10 rounded p-2 transition sm:left-2 sm:top-2 sm:p-1.5 ' +
                     (selected.has(v.id)
                       ? 'bg-sky-500 text-white'
-                      : 'bg-black/60 text-white/60 opacity-0 group-hover:opacity-100 hover:text-white')
+                      : selectMode
+                        ? 'bg-black/60 text-white/80'
+                        : 'bg-black/60 text-white/60 opacity-0 group-hover:opacity-100 hover:text-white')
                   }
                   title={selected.has(v.id) ? 'Selected' : 'Select (shift-click for a range)'}
                 >
@@ -309,13 +342,25 @@ export default function SharePage() {
                 </button>
               )}
 
+              {data?.allow_download && (
+                <a
+                  href={fileUrl(v.id)}
+                  download={v.filename}
+                  onClick={(e) => e.stopPropagation()}
+                  title={`Save ${v.filename}`}
+                  className="absolute bottom-1.5 left-1.5 z-10 rounded bg-black/60 p-2 text-white/70 transition hover:bg-black/80 hover:text-white sm:opacity-0 sm:group-hover:opacity-100"
+                >
+                  <Download className="h-4 w-4" />
+                </a>
+              )}
+
               {data?.allow_selects && (
                 <button
                   type="button"
                   onClick={() => togglePick(v, !picks[v.id])}
                   className={
                     'absolute right-2 top-2 rounded-full p-2 transition ' +
-                    (picks[v.id] ? 'bg-[#ff5c1f] text-black' : 'bg-black/60 text-white/70 hover:text-white')
+                    (picks[v.id] ? 'bg-accent text-accent-foreground' : 'bg-black/60 text-white/70 hover:text-white')
                   }
                   title={picks[v.id] ? 'Picked' : 'Pick this one'}
                 >
@@ -340,7 +385,7 @@ export default function SharePage() {
                       className={
                         'mt-1.5 flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] transition ' +
                         (notes[v.id]
-                          ? 'text-[#ff5c1f] hover:bg-white/5'
+                          ? 'text-accent hover:bg-white/5'
                           : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300')
                       }
                     >
@@ -368,13 +413,13 @@ export default function SharePage() {
                             if (e.key === 'Escape') setNoteOpen(null);
                           }}
                           placeholder="What do you think of this one?"
-                          className="w-full resize-none rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-200 outline-none focus:border-[#ff5c1f]"
+                          className="w-full resize-none rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px] text-zinc-200 outline-none focus:border-accent"
                         />
                         <div className="mt-1 flex items-center gap-2">
                           <button
                             type="button"
                             onClick={() => { saveNote(v.id, noteDraft[v.id]); setNoteOpen(null); }}
-                            className="rounded bg-[#ff5c1f] px-2 py-0.5 text-[10px] font-medium text-black hover:bg-[#ff7a45]"
+                            className="rounded bg-accent px-2 py-0.5 text-[10px] font-medium text-accent-foreground hover:bg-accent-hi"
                           >
                             Save
                           </button>
@@ -414,55 +459,72 @@ export default function SharePage() {
       )}
 
       {data?.allow_download && (
-        <div className="sticky bottom-0 z-30 border-t border-white/10 bg-[#0B0B0D]/95 px-6 py-3 backdrop-blur">
-          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3">
+        <div className="sticky bottom-0 z-30 border-t border-white/10 bg-[#0B0B0D]/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur sm:px-6">
+          <div className="mx-auto flex max-w-7xl flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
             {selected.size > 0 ? (
-              <>
+              <div className="flex items-center gap-2 sm:gap-3">
                 <span className="font-mono text-xs text-sky-400">{selected.size} selected</span>
                 <button
                   onClick={() => downloadZip(true)}
-                  className="flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-black transition hover:bg-sky-400"
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-sky-500 px-4 py-2.5 text-sm font-medium text-black transition hover:bg-sky-400 sm:flex-none sm:py-2"
                 >
-                  <Package className="h-4 w-4" /> Download {selected.size} as ZIP
+                  <Package className="h-4 w-4" /> Download {selected.size}
                 </button>
-                <button onClick={clearSelection} className="text-xs text-zinc-500 hover:text-zinc-300">
+                <button onClick={clearSelection} className="px-2 py-2 text-xs text-zinc-500 hover:text-zinc-300">
                   Clear
                 </button>
-              </>
+              </div>
             ) : (
-              <span className="text-xs text-zinc-500">
+              <span className="hidden text-xs text-zinc-500 sm:inline">
                 Drag a box, or shift-click, to select several.
               </span>
             )}
 
-            <div className="ml-auto flex items-center gap-3">
-              <button onClick={selectAll} className="text-xs text-zinc-400 hover:text-zinc-100">
+            <div className="flex items-center gap-2 sm:ml-auto sm:gap-3">
+              {touch && (
+                <button
+                  onClick={() => { setSelectMode((s) => !s); if (selectMode) clearSelection(); }}
+                  className={
+                    'rounded-lg px-3 py-2.5 text-sm transition ' +
+                    (selectMode ? 'bg-sky-500 text-black' : 'border border-zinc-700 text-zinc-200')
+                  }
+                >
+                  {selectMode ? 'Done' : 'Select'}
+                </button>
+              )}
+              <button onClick={selectAll} className="px-2 py-2 text-xs text-zinc-400 hover:text-zinc-100">
                 Select all
               </button>
               <button
                 onClick={() => downloadZip(false)}
-                className="flex items-center gap-2 rounded-lg border border-zinc-700 px-4 py-2 text-sm text-zinc-200 transition hover:bg-zinc-800"
+                className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-zinc-700 px-4 py-2.5 text-sm text-zinc-200 transition hover:bg-zinc-800 sm:flex-none sm:py-2"
               >
-                <Package className="h-4 w-4" /> Download all ({videos.length})
+                <Package className="h-4 w-4" /> All ({videos.length})
               </button>
             </div>
           </div>
+          {touch && (
+            <p className="mx-auto mt-2 max-w-7xl text-[11px] leading-snug text-zinc-600">
+              Tap a clip to save it to your phone. A whole-folder download arrives as a
+              zip file in Files, not your photo library.
+            </p>
+          )}
         </div>
       )}
 
       {open && (
         <div className="fixed inset-0 z-50 flex flex-col bg-black/95">
-          <div className="flex shrink-0 items-center justify-between px-4 py-3">
-            <span className="truncate font-mono text-xs text-zinc-400">
+          <div className="flex shrink-0 items-center justify-between gap-2 px-3 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] sm:px-4">
+            <span className="min-w-0 truncate font-mono text-[11px] text-zinc-400 sm:text-xs">
               {open.filename} · {openIndex + 1} of {videos.length}
             </span>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
               {data?.allow_selects && (
                 <button
                   onClick={() => togglePick(open, !picks[open.id])}
                   className={
                     'flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs transition ' +
-                    (picks[open.id] ? 'bg-[#ff5c1f] text-black' : 'bg-white/10 text-white/80 hover:bg-white/20')
+                    (picks[open.id] ? 'bg-accent text-accent-foreground' : 'bg-white/10 text-white/80 hover:bg-white/20')
                   }
                 >
                   <Heart className="h-4 w-4" fill={picks[open.id] ? 'currentColor' : 'none'} />
@@ -475,7 +537,7 @@ export default function SharePage() {
                   download={open.filename}
                   className="flex items-center gap-2 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-white/80 transition hover:bg-white/20"
                 >
-                  <Download className="h-4 w-4" /> Download
+                  <Download className="h-4 w-4" /> <span className="hidden sm:inline">Download</span>
                 </a>
               )}
               <button onClick={() => setOpenIndex(null)} className="rounded-lg bg-white/10 p-2 text-white/80 hover:bg-white/20">
@@ -484,12 +546,13 @@ export default function SharePage() {
             </div>
           </div>
 
-          <div className="relative flex min-h-0 flex-1 items-center justify-center px-14">
+          <div className="relative flex min-h-0 flex-1 items-center justify-center px-2 sm:px-14">
             <button
+              aria-label="Previous"
               onClick={() => setOpenIndex((i) => (i > 0 ? i - 1 : videos.length - 1))}
-              className="absolute left-2 rounded-full bg-black/50 p-2 text-white/60 hover:text-white"
+              className="absolute left-1 z-10 rounded-full bg-black/60 p-2.5 text-white/70 hover:text-white sm:left-2 sm:p-2"
             >
-              <ChevronLeft className="h-7 w-7" />
+              <ChevronLeft className="h-6 w-6 sm:h-7 sm:w-7" />
             </button>
 
             {open.media_type === 'photo' ? (
@@ -509,10 +572,11 @@ export default function SharePage() {
             )}
 
             <button
+              aria-label="Next"
               onClick={() => setOpenIndex((i) => (i < videos.length - 1 ? i + 1 : 0))}
-              className="absolute right-2 rounded-full bg-black/50 p-2 text-white/60 hover:text-white"
+              className="absolute right-1 z-10 rounded-full bg-black/60 p-2.5 text-white/70 hover:text-white sm:right-2 sm:p-2"
             >
-              <ChevronRight className="h-7 w-7" />
+              <ChevronRight className="h-6 w-6 sm:h-7 sm:w-7" />
             </button>
           </div>
 
@@ -524,7 +588,7 @@ export default function SharePage() {
                   onChange={(e) => setComment(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') sendComment(open); }}
                   placeholder={notes[open.id] ? `Note: ${notes[open.id]}` : 'Leave a note on this clip…'}
-                  className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-[#ff5c1f]"
+                  className="flex-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-accent"
                 />
                 <button
                   onClick={() => sendComment(open)}

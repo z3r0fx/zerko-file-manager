@@ -1,53 +1,206 @@
-import { useState, useRef, useEffect } from 'react';
-import { Play, Pause, Repeat, Repeat1 } from 'lucide-react';
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Play, Pause, Repeat, Repeat1, Volume2, VolumeX } from 'lucide-react';
 import { cn } from '../../lib/utils';
+
+/**
+ * The audio tile: a live equaliser with a scrub bar, drawn to fill the 16:9
+ * frame of a library tile (the filename and details sit underneath, so they
+ * are not repeated here).
+ *
+ *  - While it plays the bars really do move: they read the sound through a Web
+ *    Audio analyser. If the browser will not give us one, they fall back to a
+ *    gentle simulated bounce so the tile still feels alive.
+ *  - Bars left of the playhead are coloured, so the equaliser is also the
+ *    progress display. Click or drag anywhere across it to seek.
+ *  - Heights are written straight to the DOM inside an animation frame, never
+ *    through React state, so a grid full of audio tiles stays light.
+ *  - Only one plays at a time: starting a clip stops the previous one.
+ */
+
+const BARS = 28;
+let current = null;              // { pause } of whichever tile is playing
+
+const fmt = (s) => {
+  if (!Number.isFinite(s) || s < 0) return '0:00';
+  const m = Math.floor(s / 60);
+  return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+};
+
+/** Stable pseudo-random resting shape per clip (Math.random() here re-drew it on every render). */
+function restingShape(id) {
+  let x = (Number(id) || 1) * 2654435761 % 4294967296;
+  return Array.from({ length: BARS }, () => {
+    x = (x * 1664525 + 1013904223) % 4294967296;
+    const base = 0.22 + (x / 4294967296) * 0.5;
+    return base;
+  });
+}
+
 export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [playing, setPlaying] = useState(false);
   const [loop, setLoop] = useState(false);
-  const audioRef = useRef(new Audio(`/api/video-file/${audio.id}?token=${localStorage.getItem('token')}`));
+  const [muted, setMuted] = useState(false);
+  const [time, setTime] = useState({ t: 0, d: 0 });
 
-  useEffect(() => {
-    audioRef.current.volume = volume;
-    audioRef.current.loop = loop;
-  }, [volume, loop]);
+  const elRef = useRef(null);
+  const ctxRef = useRef(null);
+  const anaRef = useRef(null);
+  const dataRef = useRef(null);
+  const barRefs = useRef([]);
+  const rafRef = useRef(0);
+  const progressRef = useRef(0);
+  const playingRef = useRef(false);
+  const rest = useRef(restingShape(audio.id));
+  const scrubbing = useRef(false);
 
-  useEffect(() => {
-    const audioEl = audioRef.current;
-    const updateProgress = () => setProgress((audioEl.currentTime / audioEl.duration) * 100);
-    audioEl.addEventListener('timeupdate', updateProgress);
-    audioEl.addEventListener('ended', () => { if (!loop) setIsPlaying(false); });
+  const ensure = useCallback(() => {
+    if (elRef.current) return elRef.current;
+    const el = new Audio(`/api/video-file/${audio.id}?token=${localStorage.getItem('token')}`);
+    el.preload = 'metadata';
+    el.volume = volume;
+    el.addEventListener('timeupdate', () => {
+      const d = el.duration || 0;
+      progressRef.current = d ? el.currentTime / d : 0;
+      if (!scrubbing.current) setTime({ t: el.currentTime, d });
+    });
+    el.addEventListener('loadedmetadata', () => setTime((x) => ({ ...x, d: el.duration || 0 })));
+    el.addEventListener('ended', () => { playingRef.current = false; setPlaying(false); });
+    el.addEventListener('pause', () => { playingRef.current = false; setPlaying(false); });
+    el.addEventListener('play', () => { playingRef.current = true; setPlaying(true); });
+    elRef.current = el;
+    return el;
+  }, [audio.id, volume]);
 
-    if (onTogglePlay) onTogglePlay(togglePlay);
-
-    return () => {
-      audioEl.removeEventListener('timeupdate', updateProgress);
-      audioEl.pause();
-    };
-  }, [loop]);
-
-  const togglePlay = () => {
-    if (isPlaying) audioRef.current.pause();
-    else audioRef.current.play();
-    setIsPlaying(!isPlaying);
+  const hookAnalyser = () => {
+    if (ctxRef.current || !elRef.current) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const src = ctx.createMediaElementSource(elRef.current);
+      const ana = ctx.createAnalyser();
+      ana.fftSize = 128;
+      ana.smoothingTimeConstant = 0.78;
+      src.connect(ana);
+      ana.connect(ctx.destination);
+      ctxRef.current = ctx; anaRef.current = ana;
+      dataRef.current = new Uint8Array(ana.frequencyBinCount);
+    } catch { /* simulated bars instead */ }
   };
 
+  const pause = useCallback(() => { elRef.current?.pause(); }, []);
+
+  const toggle = useCallback(() => {
+    const el = ensure();
+    if (!el.paused) { el.pause(); return; }
+    if (current && current.pause !== pause) current.pause();
+    current = { pause };
+    hookAnalyser();
+    ctxRef.current?.resume?.();
+    el.play().catch(() => { playingRef.current = false; setPlaying(false); });
+  }, [ensure, pause]);
+
+  // hand the tile a way to toggle playback when it is clicked
+  useEffect(() => { if (onTogglePlay) onTogglePlay(toggle); }, [toggle, onTogglePlay]);
+
+  useEffect(() => { if (elRef.current) { elRef.current.loop = loop; } }, [loop]);
+  useEffect(() => { if (elRef.current) { elRef.current.volume = volume; elRef.current.muted = muted; } }, [volume, muted]);
+
+  // the equaliser
+  useEffect(() => {
+    let t0 = performance.now();
+    const draw = (now) => {
+      const p = progressRef.current;
+      const live = playingRef.current;
+      const ana = anaRef.current;
+      if (live && ana && dataRef.current) ana.getByteFrequencyData(dataRef.current);
+      const bins = dataRef.current ? dataRef.current.length : 0;
+      const sec = (now - t0) / 1000;
+      for (let i = 0; i < BARS; i += 1) {
+        const bar = barRefs.current[i];
+        if (!bar) continue;
+        let h = rest.current[i];
+        if (live) {
+          if (ana && bins) {
+            // spread the lower ~70% of the spectrum (where music lives) across the bars
+            const v = dataRef.current[Math.min(bins - 1, Math.floor((i / BARS) * bins * 0.7))] / 255;
+            h = 0.12 + v * 0.88;
+          } else {
+            h = 0.25 + 0.55 * Math.abs(Math.sin(sec * 3.1 + i * 0.7) * Math.cos(sec * 1.7 + i * 0.35));
+          }
+        }
+        bar.style.transform = `scaleY(${h.toFixed(3)})`;
+        const passed = (i + 0.5) / BARS <= p;
+        bar.style.opacity = passed ? '1' : (live ? '0.55' : '0.45');
+        bar.style.backgroundColor = passed ? 'rgb(var(--accent-rgb))' : 'rgb(var(--z-500))';
+      }
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    rafRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  useEffect(() => () => {
+    const el = elRef.current;
+    if (el) { el.pause(); el.removeAttribute('src'); }
+    if (current && current.pause === pause) current = null;
+    try { ctxRef.current?.close?.(); } catch { /* already closed */ }
+  }, [pause]);
+
+  // click / drag across the equaliser to seek
+  const seekFrom = (e) => {
+    const el = ensure();
+    const box = e.currentTarget.getBoundingClientRect();
+    const f = Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
+    const d = el.duration || time.d || audio.duration || 0;
+    if (!d) return;
+    el.currentTime = f * d;
+    progressRef.current = f;
+    setTime({ t: f * d, d });
+  };
+  const stop = (e) => e.stopPropagation();
+
+  const total = time.d || audio.duration || 0;
+  const shown = playing || time.t > 0 ? fmt(time.t) : '0:00';
+
   return (
-    <div className="flex flex-col gap-2 p-3 bg-zinc-800 rounded-lg">
-      <div className="flex items-center gap-2">
-        <button onClick={(e) => { e.stopPropagation(); togglePlay(); }} className="p-2 bg-red-600 text-white rounded-full">
-            {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-        </button>
-        <button onClick={(e) => { e.stopPropagation(); setLoop(!loop); }} className={cn("p-2 rounded-full", loop ? "text-red-500" : "text-zinc-400")}>
-            {loop ? <Repeat1 className="w-4 h-4" /> : <Repeat className="w-4 h-4" />}
-        </button>
-        <span className="text-xs text-zinc-100 flex-1 truncate">{audio.filename}</span>
-        <span className="text-xs text-zinc-300">{audio.duration_formatted}</span>
-      </div>
-      <div className="flex gap-0.5 h-8 items-end">
-        {[...Array(20)].map((_, i) => (
-            <div key={i} className="flex-1 bg-zinc-700" style={{ height: `${20 + Math.random() * 60}%` }} />
+    <div className="absolute inset-0 flex flex-col bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 pb-2 pt-3"
+         onClick={stop} onDoubleClick={stop} draggable={false}>
+      {/* equaliser / scrub bar */}
+      <div
+        className="group/eq relative flex min-h-0 flex-1 cursor-pointer touch-none items-end gap-[3px]"
+        role="slider" aria-label="Seek" aria-valuemin={0} aria-valuemax={100}
+        aria-valuenow={Math.round(progressRef.current * 100)}
+        onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+        onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+        onPointerDown={(e) => { e.stopPropagation(); scrubbing.current = true; e.currentTarget.setPointerCapture?.(e.pointerId); seekFrom(e); }}
+        onPointerMove={(e) => { if (scrubbing.current) seekFrom(e); }}
+        onPointerUp={(e) => { scrubbing.current = false; e.currentTarget.releasePointerCapture?.(e.pointerId); }}
+      >
+        {Array.from({ length: BARS }, (_, i) => (
+          <span key={i} className="h-full flex-1 origin-bottom rounded-full"
+                ref={(n) => { barRefs.current[i] = n; }}
+                style={{ transform: `scaleY(${rest.current[i]})`, backgroundColor: 'rgb(var(--z-500))', opacity: 0.45 }} />
         ))}
+      </div>
+
+      {/* transport */}
+      <div className="mt-2 flex shrink-0 items-center gap-2">
+        <button type="button" aria-label={playing ? 'Pause' : 'Play'}
+                onClick={(e) => { e.stopPropagation(); toggle(); }}
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-accent text-accent-foreground shadow-lg shadow-accent/25 transition hover:scale-110 active:scale-90">
+          {playing ? <Pause className="h-4 w-4" fill="currentColor" /> : <Play className="ml-0.5 h-4 w-4" fill="currentColor" />}
+        </button>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px] tabular-nums text-zinc-300">
+          {shown}<span className="text-zinc-600"> / {total ? fmt(total) : (audio.duration_formatted || '--:--')}</span>
+        </span>
+        <button type="button" aria-label="Loop" onClick={(e) => { e.stopPropagation(); setLoop((l) => !l); }}
+                className={cn('rounded-md p-1 transition hover:bg-zinc-800', loop ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
+          {loop ? <Repeat1 className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5" />}
+        </button>
+        <button type="button" aria-label={muted ? 'Unmute' : 'Mute'} onClick={(e) => { e.stopPropagation(); setMuted((m) => !m); }}
+                className={cn('rounded-md p-1 transition hover:bg-zinc-800', muted ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
+          {muted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+        </button>
       </div>
     </div>
   );

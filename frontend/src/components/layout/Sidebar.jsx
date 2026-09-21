@@ -1,4 +1,4 @@
-import { useState, useContext, useEffect } from 'react';
+import { useState, useContext, useEffect, useRef, useMemo } from 'react';
 import TagTree from '../shared/TagTree';
 import FolderTree from '../shared/FolderTree';
 import JobsPanel from '../shared/JobsPanel';
@@ -10,22 +10,49 @@ import ShareDialog from '../shared/ShareDialog';
 import { apiCall } from '../../lib/api';
 import { collectDroppedFiles } from '../../lib/dropUpload';
 import { cn } from '../../lib/utils';
+import { CAP } from '../../lib/capabilities';
+import { useAppearance, DEFAULTS, SIDEBAR_MIN, SIDEBAR_MAX } from '../../context/AppearanceContext';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Home, LayoutDashboard, Upload, Settings, LogOut, ChevronDown, ChevronRight, HardDrive, ListFilter, FolderTree as FolderTreeIcon, Activity, Edit, Trash2, Link2, Copy, Tags as TagsIcon } from 'lucide-react';
+import { X, Library, LayoutDashboard, Upload, LogOut, ChevronDown, ChevronRight, FolderOpen, FolderTree as FolderTreeIcon, Activity, Edit, Trash2, Link2, Copy, Tags as TagsIcon, SlidersHorizontal, KeyRound, Users } from 'lucide-react';
 import { AuthContext } from '../../context/AuthContext';
 import { DataContext } from '../../context/DataContext';
 import { useVideos } from '../../hooks/useVideos';
+import { setSidebarSlot } from '../../lib/sidebarSlot';
+import { useBrowsingType } from '../../lib/mediaTypeStore';
 
-export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrderChange }) {
+export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrderChange,
+                                  mobileOpen = false, onMobileClose = () => {} }) {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user, logout } = useContext(AuthContext);
+  const { user, logout, can } = useContext(AuthContext);
   const dataContext = useContext(DataContext);
   const { filter } = useVideos();
   
   const videos = dataContext?.videos || [];
-  const folderTree = dataContext?.folderTree || [];
+  const fullTree = dataContext?.folderTree || [];
   const selectedFolderId = dataContext?.selectedFolderId ?? null;
+
+  // Photos / Videos / Audio tab: show only the folders that hold that kind of
+  // media (plus the folder you are standing in, and the way down to it, so the
+  // tree never pulls the floor out from under you). Counts follow the tab too.
+  const mediaTab = useBrowsingType();
+  const typedTree = useMemo(() => {
+    if (!['video', 'photo', 'audio'].includes(mediaTab)) return null;
+    const keepSelected = (node) => {
+      if (node.id === selectedFolderId) return true;
+      return (node.children || []).some(keepSelected);
+    };
+    const prune = (nodes) => (nodes || []).flatMap((n) => {
+      if (!n.total_by_type) return [n];            // older backend: leave the tree alone
+      const sub = n.total_by_type[mediaTab] || 0;
+      if (sub <= 0 && !keepSelected(n)) return [];
+      return [{ ...n, total_count: sub, video_count: (n.by_type || {})[mediaTab] || 0, children: prune(n.children) }];
+    });
+    return prune(fullTree);
+  }, [fullTree, mediaTab, selectedFolderId]);
+  const folderTree = typedTree || fullTree;
+  const typedRootTotal = typedTree && fullTree.every((n) => n.total_by_type)
+    ? typedTree.reduce((a, n) => a + (n.total_count || 0), 0) : null;
   const setSelectedFolderId = dataContext?.setSelectedFolderId;
   const includeSubfolders = dataContext?.includeSubfolders ?? true;
   const setIncludeSubfolders = dataContext?.setIncludeSubfolders;
@@ -42,8 +69,17 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
     ((bucket && bucket.queued) || 0) + ((bucket && bucket.processing) || 0);
   const jobsRunning = outstanding(jobBuckets.transcription) + outstanding(jobBuckets.proxy);
 
-  const [tagsExpanded, setTagsExpanded] = useState(true);
-  const [foldersExpanded, setFoldersExpanded] = useState(true);
+  // One panel at a time: Folders or Tags. They used to be stacked, which is
+  // what made the sidebar feel crowded.
+  const [panel, setPanel] = useState(() => { try { return localStorage.getItem('zerko.sidebar.panel') === 'tags' ? 'tags' : 'folders'; } catch { return 'folders'; } });
+  const choosePanel = (p) => { setPanel(p); try { localStorage.setItem('zerko.sidebar.panel', p); } catch { /* private mode */ } };
+  useEffect(() => {
+    const show = () => setPanel('folders');
+    window.addEventListener('zerko-drag-start', show);
+    return () => window.removeEventListener('zerko-drag-start', show);
+  }, []);
+  const [manageOpen, setManageOpen] = useState(() => { try { return localStorage.getItem('zerko.sidebar.manage') === '1'; } catch { return false; } });
+  const toggleManage = () => setManageOpen((o) => { try { localStorage.setItem('zerko.sidebar.manage', o ? '0' : '1'); } catch { /* ignore */ } return !o; });
   const [jobsOpen, setJobsOpen] = useState(false);
   const [folderMenu, setFolderMenu] = useState(null);
   const [renameFolder, setRenameFolder] = useState(null);
@@ -92,8 +128,7 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
       if (marked.has(n.id)) markedNames.push(n.name);
       collect(n.children);
     });
-  })(folderTree);
-  const [adminExpanded, setAdminExpanded] = useState(false);
+  })(fullTree);
   // Multiple tags at once: "drone" AND "sea view" is the query that actually
   // gets asked, not one tag at a time.
   const [activeTags, setActiveTags] = useState([]);
@@ -120,7 +155,7 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
                  || (a.name || '').localeCompare(b.name || ''));
   const currentView = location.pathname.split('/')[1] || 'browse';
 
-  const handleNav = (path) => navigate(path);
+  const handleNav = (path) => { navigate(path); onMobileClose(); };
 
   const emitTags = (ids) => {
     setActiveTags(ids);
@@ -139,183 +174,155 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
   const handleLogout = () => logout();
 
   return (
-    <aside className="w-64 h-screen bg-zinc-950 border-r border-zinc-800 flex flex-col flex-shrink-0">
-      <div className="p-6 pb-4">
+    <aside
+      style={{ width: 'var(--sidebar-w)' }}
+      className={cn(
+        // Below md this is a drawer sliding over the content; from md up it is
+        // an ordinary column again and the transform is dropped entirely.
+        "fixed inset-y-0 left-0 z-50 flex h-[100dvh] max-w-[85vw] flex-col",
+        "border-r border-zinc-800 bg-zinc-950 transition-transform duration-200",
+        // transform-none matters: ANY transform makes this a containing block for
+        // position:fixed descendants, which would trap the jobs panel inside the
+        // sidebar's stacking context and let the page paint over it.
+        "md:relative md:z-auto md:max-w-none md:flex-shrink-0 md:transform-none md:transition-none",
+        mobileOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full",
+      )}
+    >
+      <button
+        onClick={onMobileClose}
+        aria-label="Close menu"
+        className="absolute right-2 top-2 z-10 rounded-md p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 md:hidden"
+      >
+        <X className="h-5 w-5" />
+      </button>
+      <SidebarResizer />
+      <div className="px-5 pb-3 pt-5">
         <h1 className="flex items-center gap-2.5 select-none">
           <span
             aria-hidden="true"
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-gradient-to-br from-[#ff7a45] to-[#e03e00] shadow-lg shadow-[#ff5c1f]/20"
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-accent shadow-lg shadow-accent/20"
           >
-            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="#0b0b0d" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="rgb(var(--accent-ink))" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
               <rect x="2" y="5" width="14" height="14" rx="2" />
               <path d="M16 10l6-3v10l-6-3" />
             </svg>
           </span>
           <span className="flex flex-col leading-none">
-            <span className="text-[17px] font-bold tracking-tight bg-gradient-to-r from-[#ff7a45] to-[#ff5c1f] bg-clip-text text-transparent">
+            <span className="text-[17px] font-bold tracking-tight text-accent">
               ZERKO
             </span>
-            <span className="text-[10px] font-medium uppercase tracking-[0.22em] text-zinc-400 mt-0.5">
+            <span className="text-[10px] font-medium uppercase tracking-[0.22em] text-zinc-300 mt-0.5">
               File Manager
             </span>
           </span>
         </h1>
       </div>
 
-      <div className="p-3 mx-3 mb-2 bg-zinc-800 rounded-lg border border-zinc-700/50">
-        <div className="flex items-center gap-2 mb-1.5">
-          <HardDrive className="w-3.5 h-3.5 text-zinc-500" />
-          <span className="text-xs text-zinc-400">Storage</span>
+      {can(CAP.UPLOAD) && currentView !== 'files' && (
+        <div className="px-4 pb-3">
+          <button
+            onClick={() => handleNav('/upload')}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-accent py-2 text-sm font-semibold text-accent-foreground shadow-md shadow-black/30 transition hover:bg-accent-hi"
+          >
+            <Upload className="h-4 w-4" /> Upload
+          </button>
         </div>
-        <div className="flex items-baseline justify-between mb-2">
-          <span className="text-xs text-zinc-300">{stats?.total_storage_formatted ?? '0 B'}</span>
-          <span className="text-xs text-zinc-500">{videos?.length ?? 0} files</span>
-        </div>
-      </div>
+      )}
 
-      <nav className="px-3 space-y-1">
-        <button onClick={() => handleNav('/browse')} className={cn("w-full flex items-center gap-3 px-4 py-2.5 rounded-lg transition", currentView === 'browse' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}>
-          <Home className="w-5 h-5" />
-          <span className="font-medium">Browse</span>
-        </button>
-
-        {user?.role === 'admin' && (
-          <div className="mt-2">
-            <button onClick={() => setAdminExpanded(!adminExpanded)} className="w-full flex items-center justify-between px-4 py-2.5 text-zinc-400 hover:text-zinc-100 transition">
-              <div className="flex items-center gap-3"><Settings className="w-5 h-5" /><span className="font-medium">Admin</span></div>
-              {adminExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-            </button>
-            {adminExpanded && (
-              <div className="pl-6 space-y-1">
-                  <button onClick={() => handleNav('/dashboard')} className={cn("w-full flex items-center gap-3 px-4 py-2 rounded-lg transition text-sm", currentView === 'dashboard' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}>
-                      <LayoutDashboard className="w-4 h-4" /> Dashboard
-                  </button>
-                  <button onClick={() => handleNav('/admin')} className={cn("w-full flex items-center gap-3 px-4 py-2 rounded-lg transition text-sm", currentView === 'admin' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}>
-                      <Settings className="w-4 h-4" /> User Management
-                  </button>
-              </div>
-            )}
-          </div>
+      <nav className="space-y-0.5 px-3 pt-0.5">
+        <NavItem icon={Library} label="Library" active={currentView === 'browse'} onClick={() => handleNav('/browse')} />
+        <NavItem icon={FolderOpen} label="Files" active={currentView === 'files'} onClick={() => handleNav('/files')} />
+        {can(CAP.SHARES) && (
+          <NavItem icon={Link2} label="Portals" active={currentView === 'shares'} onClick={() => handleNav('/shares')} />
         )}
 
-        <button
-          type="button"
-          onClick={() => setJobsOpen((v) => !v)}
-          aria-expanded={jobsOpen}
-          className={cn(
-            'w-full flex items-center justify-between px-4 py-2.5 rounded-lg border transition mt-1',
-            'hover:bg-zinc-800/50',
-            jobsOpen && 'bg-zinc-800 text-zinc-100',
-            jobsRunning > 0
-              ? 'job-pulse border-zinc-700 text-zinc-100'
-              : 'border-transparent text-zinc-500 hover:text-zinc-200'
-          )}
-          title={jobsRunning > 0 ? `${jobsRunning} job${jobsRunning === 1 ? '' : 's'} in progress` : 'No jobs running — click to view'}
-        >
-          <div className="flex items-center gap-3">
-            <span className="relative flex items-center justify-center w-5 h-5">
-              <Activity className="w-4 h-4" />
-              {jobsRunning > 0 && (
-                <span className="job-dot-pulse absolute -right-0.5 -top-0.5 w-2 h-2 rounded-full bg-[#ff5c1f]" />
+        {/* Everything that is not part of the day-to-day lives in one place. */}
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={toggleManage}
+            aria-expanded={manageOpen}
+            className={cn(
+              'flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-sm transition',
+              jobsRunning > 0 ? 'job-pulse border-zinc-700 text-zinc-100' : 'border-transparent text-zinc-500 hover:bg-zinc-800/50 hover:text-zinc-200',
+            )}
+          >
+            <span className="relative grid h-5 w-5 place-items-center">
+              <SlidersHorizontal className="h-[18px] w-[18px]" />
+              {jobsRunning > 0 && <span className="job-dot-pulse absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-accent" />}
+            </span>
+            <span className="flex-1 text-left font-medium">Manage</span>
+            {jobsRunning > 0 && !manageOpen && (
+              <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[11px] text-zinc-200">{jobsRunning}</span>
+            )}
+            {manageOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          </button>
+
+          {manageOpen && (
+            <div className="ml-4 mt-0.5 space-y-0.5 border-l border-zinc-800 pl-2">
+              <button
+                type="button"
+                onClick={() => setJobsOpen((v) => !v)}
+                aria-expanded={jobsOpen}
+                title={jobsRunning > 0 ? `${jobsRunning} job${jobsRunning === 1 ? '' : 's'} in progress` : 'No jobs running - click to view'}
+                className={cn('flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition',
+                  jobsOpen ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}
+              >
+                <span className="relative grid h-4 w-4 place-items-center">
+                  <Activity className="h-4 w-4" />
+                  {jobsRunning > 0 && <span className="job-dot-pulse absolute -right-1 -top-1 h-2 w-2 rounded-full bg-accent" />}
+                </span>
+                <span className="flex-1 text-left">Jobs</span>
+                {jobsRunning > 0 && <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[11px] text-zinc-200">{jobsRunning}</span>}
+              </button>
+              {can(CAP.TRASH) && <SubItem icon={Trash2} label="Trash" onClick={() => setTrashOpen(true)} />}
+              {can(CAP.ADMIN) && <SubItem icon={Copy} label="Duplicates" active={currentView === 'duplicates'} onClick={() => handleNav('/duplicates')} />}
+              {can(CAP.ADMIN) && <SubItem icon={TagsIcon} label="Auto-tagging" active={currentView === 'tags'} onClick={() => handleNav('/tags')} />}
+              {can(CAP.ADMIN) && <SubItem icon={LayoutDashboard} label="Dashboard" active={currentView === 'dashboard'} onClick={() => handleNav('/dashboard')} />}
+              {(can(CAP.ADMIN) || can(CAP.CREATE_CLIENTS)) && (
+                <SubItem icon={Users} label={can(CAP.ADMIN) ? 'Users' : 'Client accounts'} active={currentView === 'admin'} onClick={() => handleNav('/admin')} />
               )}
-            </span>
-            <span className="font-medium text-sm">Jobs</span>
-          </div>
-          {jobsRunning > 0 && (
-            <span className="text-[11px] font-mono bg-zinc-800 text-zinc-200 px-2 py-0.5 rounded">
-              {jobsRunning}
-            </span>
+            </div>
           )}
-        </button>
-
+        </div>
         <JobsPanel open={jobsOpen} onClose={() => setJobsOpen(false)} />
-
-        <button
-          type="button"
-          onClick={() => setTrashOpen(true)}
-          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50 transition"
-        >
-          <Trash2 className="w-5 h-5" />
-          <span className="font-medium text-sm">Trash</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => navigate('/tags')}
-          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50 transition"
-        >
-          <TagsIcon className="w-5 h-5" />
-          <span className="font-medium text-sm">Auto-tagging</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => navigate('/duplicates')}
-          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50 transition"
-        >
-          <Copy className="w-5 h-5" />
-          <span className="font-medium text-sm">Duplicates</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => navigate('/shares')}
-          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/50 transition"
-        >
-          <Link2 className="w-5 h-5" />
-          <span className="font-medium text-sm">Client links</span>
-        </button>
-
-        <button onClick={() => navigate('/upload')} className="w-full flex items-center gap-3 px-4 py-2.5 bg-zinc-100 hover:bg-white text-zinc-950 rounded-lg font-semibold transition mt-2">
-          <Upload className="w-5 h-5" />
-          <span>Upload</span>
-        </button>
       </nav>
 
-      <div className="flex-1 overflow-hidden flex flex-col mt-4 px-3">
-        {/* Sorting Section - Always visible in Browse view */}
-        {location.pathname === '/browse' && (
-          <div className="px-4 py-2 border-b border-zinc-800 mb-2">
-            <p className="text-xs text-zinc-500 uppercase font-medium mb-2">Sort By</p>
-            <div className="flex items-center gap-1.5 flex-wrap">
-                {['date', 'size', 'duration', 'name'].map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => onSortByChange?.(s)}
-                    className={cn(
-                      'px-2 py-1 rounded text-xs transition',
-                      sortBy === s
-                        ? 'bg-zinc-700 text-zinc-100'
-                        : 'text-zinc-500 hover:text-zinc-300'
-                    )}
-                  >
-                    {s.charAt(0).toUpperCase() + s.slice(1)}
-                  </button>
-                ))}
-                <button
-                  onClick={() => onSortOrderChange?.(sortOrder === 'asc' ? 'desc' : 'asc')}
-                  className="ml-1 w-7 h-7 flex items-center justify-center rounded-full bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition text-xs"
-                >
-                  {sortOrder === 'asc' ? '↑' : '↓'}
-                </button>
-            </div>
-          </div>
-        )}
+      {/* Other pages (Files) put their own navigation here. */}
+      <div ref={currentView === 'files' ? setSidebarSlot : undefined} className={cn('min-h-0 flex-1 flex-col', currentView === 'files' ? 'mt-3 flex' : 'hidden')} />
 
-        {/* Folders - mirrors the media drive */}
+      <div className={cn('mt-3 min-h-0 flex-1 flex-col px-3', currentView === 'files' ? 'hidden' : 'flex')}>
+        {/* Folders and Tags only mean something in the Library. */}
         {location.pathname === '/browse' && (
           <>
-            <button onClick={() => setFoldersExpanded(!foldersExpanded)} className="flex items-center justify-between px-4 py-2 text-zinc-500 hover:text-zinc-300 transition">
-              <div className="flex items-center gap-2">
-                <FolderTreeIcon className="w-4 h-4" />
-                <span className="text-sm font-medium uppercase tracking-wider">Folders</span>
-              </div>
-              {foldersExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-            </button>
+            <div className="mb-2 flex rounded-lg border border-zinc-800 bg-zinc-900/60 p-0.5 text-xs" role="tablist">
+              {[['folders', 'Folders', FolderTreeIcon, 0], ['tags', 'Tags', TagsIcon, activeTags.length]].map(([id, label, Icon, n]) => (
+                <button
+                  key={id}
+                  role="tab"
+                  aria-selected={panel === id}
+                  onClick={() => choosePanel(id)}
+                  className={cn('flex flex-1 items-center justify-center gap-1.5 rounded-md py-1.5 font-medium transition',
+                    panel === id ? 'bg-zinc-700 text-zinc-50' : 'text-zinc-500 hover:text-zinc-300')}
+                >
+                  <Icon className="h-3.5 w-3.5" /> {label}
+                  {n > 0 && <span className="rounded-full bg-accent px-1.5 text-[10px] font-semibold leading-4 text-accent-foreground">{n}</span>}
+                </button>
+              ))}
+            </div>
 
-            {foldersExpanded && (
+            {panel === 'folders' && (
               <>
-                <label className="flex items-center gap-2 px-4 pb-2 text-xs text-zinc-500 cursor-pointer hover:text-zinc-400">
+                {activeTags.length > 0 && (
+                  <button
+                    onClick={() => handleTagSelect(null)}
+                    className="mb-2 flex w-full items-center justify-between rounded-md bg-accent/15 px-2.5 py-1.5 text-xs text-accent hover:bg-accent/25"
+                  >
+                    <span>Filtering by {activeTags.length} tag{activeTags.length === 1 ? '' : 's'}</span>
+                    <span className="text-[11px] opacity-80">Clear</span>
+                  </button>
+                )}
+                <label className="flex cursor-pointer items-center gap-2 px-2 pb-2 text-xs text-zinc-500 hover:text-zinc-400">
                   <input
                     type="checkbox"
                     checked={includeSubfolders}
@@ -324,11 +331,11 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
                   />
                   Include subfolders
                 </label>
-                <div className="flex-1 overflow-y-auto pb-2 pr-1">
+                <div className="min-h-0 flex-1 overflow-y-auto pb-2 pr-1">
                   <FolderTree
                     tree={folderTree}
                     selectedId={selectedFolderId}
-                    totalCount={stats?.total_videos ?? videos.length}
+                    totalCount={typedRootTotal ?? stats?.total_videos ?? videos.length}
                     marked={marked}
                     onSelect={(id, e) => {
                       // Ctrl / Cmd click marks folders for merging
@@ -340,81 +347,62 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
                       setMarked(new Set());
                       setSelectedFolderId?.(id);
                     }}
-                    onDropMedia={(folderId, mediaId) => moveVideoToFolder?.(Number(mediaId), folderId)}
+                    onDropMedia={(folderId, mediaId, mediaIds) => {
+                      // the whole selection travels with the drag, not just the clip you grabbed
+                      const ids = (mediaIds && mediaIds.length ? mediaIds : [mediaId]).map(Number).filter(Boolean);
+                      dataContext?.moveVideosToFolder?.(ids, folderId);
+                    }}
                     onContextMenu={(e, node) => setFolderMenu({ x: e.clientX, y: e.clientY, node })}
                     onDropFiles={handleDropFiles}
                   />
                 </div>
               </>
             )}
-          </>
-        )}
 
-        {/* Tags Section - Only visible in project view */}
-        {/* Tags belong to the Browse view, like Folders and Sort.
-            They used to be hidden behind a FOLDER selection, which made the
-            whole auto-tagging pass invisible from the default view; fixing
-            that dropped the guard entirely, so they then showed up on Admin
-            and Dashboard where there is nothing to filter. */}
-        {location.pathname === '/browse' && (
-        <>
-        <button onClick={() => setTagsExpanded(!tagsExpanded)} className="flex items-center justify-between px-4 py-2 text-zinc-500 hover:text-zinc-300 transition">
-          <span className="text-sm font-medium uppercase tracking-wider">
-            Tags {activeTags.length > 0 && <span className="text-[#ff5c1f]">({activeTags.length})</span>}
-          </span>
-          {tagsExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-        </button>
-
-        {tagsExpanded && (
-          <div className="mt-1 flex-1 overflow-y-auto">
-            <div className="px-3 pb-2">
-              <input
-                value={tagQuery}
-                onChange={(e) => setTagQuery(e.target.value)}
-                placeholder="Filter tags…"
-                className="w-full rounded bg-zinc-900 border border-zinc-800 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-[#ff5c1f]"
-              />
-            </div>
-
-            {activeTags.length > 0 && (
-              <button
-                onClick={() => handleTagSelect(null)}
-                className="mx-3 mb-2 w-[calc(100%-1.5rem)] rounded bg-[#ff5c1f]/15 px-2 py-1 text-xs text-[#ff5c1f] hover:bg-[#ff5c1f]/25"
-              >
-                Clear {activeTags.length} tag{activeTags.length === 1 ? '' : 's'}
-              </button>
+            {panel === 'tags' && (
+              <div className="flex min-h-0 flex-1 flex-col">
+                <input
+                  value={tagQuery}
+                  onChange={(e) => setTagQuery(e.target.value)}
+                  placeholder="Filter tags..."
+                  className="mb-2 w-full rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-200 outline-none focus:border-accent"
+                />
+                {activeTags.length > 0 && (
+                  <button
+                    onClick={() => handleTagSelect(null)}
+                    className="mb-2 w-full rounded-md bg-accent/15 px-2 py-1.5 text-xs text-accent hover:bg-accent/25"
+                  >
+                    Clear {activeTags.length} tag{activeTags.length === 1 ? '' : 's'}
+                  </button>
+                )}
+                <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-3">
+                  {allTags
+                    .filter((t) => !tagQuery || (t.name || '').toLowerCase().includes(tagQuery.toLowerCase()))
+                    .map((t) => {
+                      const on = activeTags.includes(t.id);
+                      return (
+                        <button
+                          key={t.id}
+                          onClick={() => handleTagSelect(t.id)}
+                          className={cn(
+                            'flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left transition',
+                            on ? 'bg-accent/20 text-accent' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100',
+                          )}
+                        >
+                          <span className="truncate text-sm">{t.name}</span>
+                          <span className={cn('shrink-0 font-mono text-[10px]', on ? 'text-accent' : 'text-zinc-600')}>
+                            {tagCounts[t.id] || 0}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  {allTags.length === 0 && (
+                    <p className="px-2 py-3 text-xs text-zinc-600">No tags yet - open Auto-tagging and run it.</p>
+                  )}
+                </div>
+              </div>
             )}
-
-            <div className="space-y-0.5 px-2 pb-4">
-              {allTags
-                .filter((t) => !tagQuery || (t.name || '').toLowerCase().includes(tagQuery.toLowerCase()))
-                .map((t) => {
-                  const on = activeTags.includes(t.id);
-                  return (
-                    <button
-                      key={t.id}
-                      onClick={() => handleTagSelect(t.id)}
-                      className={cn(
-                        "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-left transition",
-                        on ? 'bg-[#ff5c1f]/20 text-[#ff5c1f]' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100'
-                      )}
-                    >
-                      <span className="truncate text-sm">{t.name}</span>
-                      <span className={cn("shrink-0 font-mono text-[10px]", on ? 'text-[#ff5c1f]' : 'text-zinc-600')}>
-                        {tagCounts[t.id] || 0}
-                      </span>
-                    </button>
-                  );
-                })}
-              {allTags.length === 0 && (
-                <p className="px-2 py-3 text-xs text-zinc-600">
-                  No tags yet — open Auto-tagging and run it.
-                </p>
-              )}
-            </div>
-          </div>
-        )}
-        </>
+          </>
         )}
       </div>
 
@@ -424,7 +412,7 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
           y={folderMenu.y}
           onClose={() => setFolderMenu(null)}
           items={[
-            { label: 'Share with a client', icon: Link2,
+            { label: 'Create a portal', icon: Link2,
               onClick: () => { setShareFolder(folderMenu.node); setFolderMenu(null); } },
             { label: 'Rename folder', icon: Edit,
               onClick: () => { setRenameFolder(folderMenu.node); setFolderMenu(null); } },
@@ -475,8 +463,8 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
       )}
 
       {marked.size > 0 && (
-        <div className="mx-3 mb-2 p-2.5 rounded-lg bg-[#ff5c1f]/10 border border-[#ff5c1f]/40">
-          <div className="text-[11px] text-orange-200 mb-2">
+        <div className="mx-3 mb-2 p-2.5 rounded-lg bg-accent/10 border border-accent/40">
+          <div className="text-[11px] text-accent-hi mb-2">
             {marked.size} folder{marked.size === 1 ? '' : 's'} marked
             <button type="button" onClick={() => setMarked(new Set())}
                     className="float-right text-zinc-400 hover:text-zinc-200">clear</button>
@@ -485,7 +473,7 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
             type="button"
             disabled={marked.size < 2}
             onClick={() => setMergeOpen(true)}
-            className="w-full py-1.5 rounded bg-[#ff5c1f] hover:bg-[#ff7a45] disabled:opacity-40 disabled:hover:bg-[#ff5c1f] text-zinc-950 text-xs font-semibold transition"
+            className="w-full py-1.5 rounded bg-accent hover:bg-accent-hi disabled:opacity-40 disabled:hover:bg-accent text-zinc-950 text-xs font-semibold transition"
           >
             Merge into one folder
           </button>
@@ -563,12 +551,12 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
             <input
               type="password" placeholder="Current password" value={pwCurrent}
               onChange={(e) => setPwCurrent(e.target.value)}
-              className="w-full mb-2 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-sm text-zinc-100 outline-none focus:border-[#ff5c1f]"
+              className="w-full mb-2 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-sm text-zinc-100 outline-none focus:border-accent"
             />
             <input
               type="password" placeholder="New password" value={pwNew}
               onChange={(e) => setPwNew(e.target.value)}
-              className="w-full mb-3 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-sm text-zinc-100 outline-none focus:border-[#ff5c1f]"
+              className="w-full mb-3 px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-sm text-zinc-100 outline-none focus:border-accent"
             />
             {pwMsg && <p className="text-xs mb-3 text-amber-400">{pwMsg}</p>}
             <div className="flex justify-end gap-2">
@@ -589,7 +577,7 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
                     setPwMsg(String(err.message || err).replace(/^.*?:\s*/, ''));
                   }
                 }}
-                className="px-3 py-1.5 rounded bg-[#ff5c1f] hover:bg-[#ff7a45] text-zinc-950 text-sm font-semibold"
+                className="px-3 py-1.5 rounded bg-accent hover:bg-accent-hi text-zinc-950 text-sm font-semibold"
               >
                 Change
               </button>
@@ -598,20 +586,150 @@ export default function Sidebar({ sortBy, sortOrder, onSortByChange, onSortOrder
         </div>
       )}
 
-      <div className="p-4 border-t border-zinc-800">
-        <button
-          type="button"
-          onClick={() => setPwOpen(true)}
-          className="w-full flex items-center gap-3 px-4 py-2 mb-1 text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 rounded-lg transition"
-        >
-          <Settings className="w-4 h-4" />
-          <span className="text-sm">Change password</span>
-        </button>
-        <button onClick={handleLogout} className="w-full flex items-center gap-3 px-4 py-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition">
-          <LogOut className="w-4 h-4" />
-          <span className="text-sm">Sign Out</span>
-        </button>
+      <div className="border-t border-zinc-800 px-4 py-3">
+        <div className={cn('mb-2.5 items-baseline justify-between text-[11px]', currentView === 'files' ? 'hidden' : 'flex')}>
+          <span className="text-zinc-500">Library</span>
+          <span className="text-zinc-400">
+            {stats?.total_storage_formatted ?? '0 B'} <span className="text-zinc-600">- {(stats?.total_videos ?? videos.length ?? 0).toLocaleString()} files</span>
+          </span>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="min-w-0 flex-1 truncate px-1 text-sm text-zinc-300" title={user?.username}>{user?.username}</span>
+          <button
+            type="button"
+            onClick={() => setPwOpen(true)}
+            title="Change password"
+            aria-label="Change password"
+            className="rounded-lg p-2 text-zinc-500 transition hover:bg-zinc-800 hover:text-zinc-200"
+          >
+            <KeyRound className="h-4 w-4" />
+          </button>
+          <button
+            onClick={handleLogout}
+            title="Sign out"
+            aria-label="Sign out"
+            className="rounded-lg p-2 text-zinc-500 transition hover:bg-zinc-800 hover:text-zinc-200"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
+        </div>
       </div>
     </aside>
+  );
+}
+
+function NavItem({ icon: Icon, label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+      className={cn('flex w-full items-center gap-3 rounded-lg px-3 py-2 text-[15px] transition',
+        active ? 'bg-zinc-800 text-zinc-50' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}
+    >
+      <Icon className={cn('h-5 w-5', active && 'text-accent')} />
+      <span className="font-medium">{label}</span>
+    </button>
+  );
+}
+
+function SubItem({ icon: Icon, label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn('flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm transition',
+        active ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-100')}
+    >
+      <Icon className="h-4 w-4" />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+
+/**
+ * The draggable edge of the sidebar.
+ *
+ * Grab the line between the sidebar and the page and drag. The width goes
+ * straight onto the document root while you drag and is saved on release -
+ * dragging through app-wide state re-renders the whole tree on every mouse
+ * move, which stutters badly on a folder tree this size. It snaps to the
+ * default width when you are near it, double-click resets, and the arrow keys
+ * nudge it when the edge has focus.
+ */
+function SidebarResizer() {
+  const { sidebarWidth, set } = useAppearance();
+  const [drag, setDrag] = useState(null);          // { w, y } while dragging
+  const live = useRef(null);
+
+  const clampW = (w) => Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, w));
+  const snap = (w) => (Math.abs(w - DEFAULTS.sidebarWidth) <= 8 ? DEFAULTS.sidebarWidth : w);
+  const apply = (w) => document.documentElement.style.setProperty('--sidebar-w', `${w}px`);
+
+  const onPointerDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    live.current = sidebarWidth;
+    document.body.classList.add('select-none');
+    document.body.style.cursor = 'col-resize';
+    setDrag({ w: sidebarWidth, y: e.clientY });
+  };
+  const onPointerMove = (e) => {
+    if (live.current == null) return;
+    const left = e.currentTarget.parentElement.getBoundingClientRect().left;
+    const w = snap(clampW(Math.round(e.clientX - left)));
+    live.current = w;
+    apply(w);
+    setDrag({ w, y: e.clientY });
+  };
+  const finish = () => {
+    if (live.current == null) return;
+    const w = live.current;
+    live.current = null;
+    document.body.classList.remove('select-none');
+    document.body.style.cursor = '';
+    setDrag(null);
+    if (w !== sidebarWidth) set({ sidebarWidth: w });
+  };
+  const onKeyDown = (e) => {
+    const step = e.shiftKey ? 48 : 16;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); set({ sidebarWidth: clampW(sidebarWidth - step) }); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); set({ sidebarWidth: clampW(sidebarWidth + step) }); }
+    else if (e.key === 'Home' || e.key === 'Enter') { e.preventDefault(); set({ sidebarWidth: DEFAULTS.sidebarWidth }); }
+  };
+
+  return (
+    <>
+      <div
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={SIDEBAR_MIN}
+        aria-valuemax={SIDEBAR_MAX}
+        aria-valuenow={sidebarWidth}
+        tabIndex={0}
+        title="Drag to resize - double-click to reset"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={finish}
+        onPointerCancel={finish}
+        onLostPointerCapture={finish}
+        onKeyDown={onKeyDown}
+        onDoubleClick={() => set({ sidebarWidth: DEFAULTS.sidebarWidth })}
+        className="group absolute right-0 top-0 z-30 h-full w-3 translate-x-1/2 cursor-col-resize touch-none outline-none max-md:hidden"
+        data-cursor="hot"
+      >
+        <div className={cn('absolute left-1/2 top-0 h-full -translate-x-1/2 transition-all duration-150',
+          drag ? 'w-0.5 bg-accent' : 'w-px bg-transparent group-hover:w-0.5 group-hover:bg-accent/60 group-focus-visible:w-0.5 group-focus-visible:bg-accent/60')} />
+        <div className={cn('absolute left-1/2 top-1/2 h-12 w-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full transition-all duration-150',
+          drag ? 'bg-accent opacity-100' : 'bg-zinc-500 opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100')} />
+      </div>
+      {drag && (
+        <div className="pointer-events-none fixed z-[9999] rounded-full bg-zinc-100 px-2.5 py-1 font-mono text-[11px] font-medium text-zinc-900 shadow-lg"
+             style={{ left: drag.w + 18, top: Math.max(12, drag.y - 14) }}>
+          {drag.w}px{drag.w === DEFAULTS.sidebarWidth ? ' - default' : ''}
+        </div>
+      )}
+    </>
   );
 }

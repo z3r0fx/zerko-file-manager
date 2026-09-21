@@ -51,7 +51,7 @@ export default function JobsPanel({ open, onClose }) {
           <span className="text-xs text-zinc-200 truncate flex-1" title={job.filename || job.job_id}>
             {job.filename || job.job_id}
           </span>
-          {running && <Loader2 className="w-3.5 h-3.5 text-[#ff5c1f] animate-spin shrink-0" />}
+          {running && <Loader2 className="w-3.5 h-3.5 text-accent animate-spin shrink-0" />}
           {job.status === 'completed' && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500 shrink-0" />}
           {failed && <AlertCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />}
         </div>
@@ -62,7 +62,7 @@ export default function JobsPanel({ open, onClose }) {
           <div className="h-1 flex-1 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className={cn('h-full rounded-full transition-all duration-500',
-                failed ? 'bg-red-500' : job.status === 'completed' ? 'bg-emerald-500' : 'bg-[#ff5c1f]')}
+                failed ? 'bg-red-500' : job.status === 'completed' ? 'bg-emerald-500' : 'bg-accent')}
               style={{ width: `${failed ? 100 : (job.progress || (job.status === 'completed' ? 100 : 4))}%` }}
             />
           </div>
@@ -83,12 +83,15 @@ export default function JobsPanel({ open, onClose }) {
   };
 
   return (
-    <div className="fixed bottom-4 left-[17rem] z-[9998] w-[360px] bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl animate-pop-in overflow-hidden">
+    <div
+      style={{ left: 'max(1rem, calc(var(--sidebar-w) + 1rem))' }}
+      className="fixed bottom-4 right-4 z-[9998] bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl animate-pop-in overflow-hidden sm:right-auto sm:w-[360px]"
+    >
       <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 bg-zinc-900/95">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold text-zinc-100">Background jobs</h3>
           {active.length > 0 && (
-            <span className="text-[10px] font-mono bg-[#ff5c1f] text-zinc-950 px-1.5 py-0.5 rounded font-bold">
+            <span className="text-[10px] font-mono bg-accent text-zinc-950 px-1.5 py-0.5 rounded font-bold">
               {active.length}
             </span>
           )}

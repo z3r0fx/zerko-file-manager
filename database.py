@@ -183,6 +183,13 @@ class Share(Base):
     expires_at = Column(DateTime, nullable=True)
     allow_download = Column(Boolean, default=False)
     allow_selects = Column(Boolean, default=True)    # client can pick favourites
+    # An upload link: the same token machinery, pointed the other way. Used
+    # for "send this to my phone and shoot straight into the job folder", and
+    # for letting an agent send footage in without an account.
+    allow_upload = Column(Boolean, default=False)
+    upload_count = Column(Integer, default=0)
+    # Where files sent through this link are held until someone files them.
+    intake_folder_id = Column(Integer, ForeignKey("indexed_folders.id"), nullable=True)
 
     created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -249,6 +256,16 @@ def init_db():
             if col not in existing_cols:
                 logging.info(f"Adding column {col} to videos table")
                 conn.execute(text(f"ALTER TABLE videos ADD COLUMN {col} {col_type}"))
+
+        # Share links gained an upload direction.
+        res = conn.execute(text("PRAGMA table_info(shares)"))
+        existing_share_cols = [row[1] for row in res]
+        for col, col_type in {"allow_upload": "BOOLEAN DEFAULT 0",
+                              "upload_count": "INTEGER DEFAULT 0",
+                              "intake_folder_id": "INTEGER"}.items():
+            if col not in existing_share_cols:
+                logging.info(f"Adding column {col} to shares table")
+                conn.execute(text(f"ALTER TABLE shares ADD COLUMN {col} {col_type}"))
 
         # Check for tags columns
         res = conn.execute(text("PRAGMA table_info(tags)"))
