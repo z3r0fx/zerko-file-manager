@@ -10,7 +10,7 @@ echo "Installation check..."
 
 # Check if we're in the right directory
 if [ ! -f "main.py" ]; then
-    echo "Error: main.py not found. Please run this script from the mediamanager directory."
+    echo "Error: main.py not found. Please run this script from the Zerko folder."
     exit 1
 fi
 
@@ -35,16 +35,19 @@ fi
 if [ ! -f "venv/bin/pip" ]; then
     echo "Installing pip into venv..."
     # Download get-pip.py once and cache it in /tmp
-    GET_PIP="/tmp/get-pip.py"
-    if [ ! -f "$GET_PIP" ]; then
-        curl -sS https://bootstrap.pypa.io/get-pip.py -o "$GET_PIP"
-        if [ $? -ne 0 ]; then
-            echo "Error: Failed to download get-pip.py. Check internet connection."
-            exit 1
-        fi
+    # A fresh private file each time: a fixed path in /tmp is one another
+    # process could have written first, and this file gets executed.
+    GET_PIP="$(mktemp)"
+    curl -sS https://bootstrap.pypa.io/get-pip.py -o "$GET_PIP"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to download get-pip.py. Check internet connection."
+        rm -f "$GET_PIP"
+        exit 1
     fi
     venv/bin/python "$GET_PIP"
-    if [ $? -ne 0 ]; then
+    PIP_RC=$?
+    rm -f "$GET_PIP"
+    if [ $PIP_RC -ne 0 ]; then
         echo "Error: Failed to install pip into venv."
         exit 1
     fi
@@ -67,9 +70,8 @@ if [ "$NEED_INSTALL" = "1" ]; then
     fi
 fi
 
-# Load secrets (SECRET_KEY etc). Without this the app falls back to the
-# placeholder key baked into auth.py, which is public in the Odysseus repo -
-# anyone who knows it can forge an admin token without a password.
+# Load secrets (SECRET_KEY etc). Every install gets its own random key; the app
+# refuses to sign logins with a shared or placeholder one.
 if [ ! -f .env ]; then
     echo "SECRET_KEY=$(venv/bin/python -c 'import secrets;print(secrets.token_hex(32))')" > .env
     chmod 600 .env
@@ -132,7 +134,7 @@ fi
 echo ""
 echo "   Media folder    :  $MEDIA_ROOT"
 echo ""
-echo "   Login           :  admin (change this under Change password)"
+echo "   Login           :  the account you created in the setup wizard"
 echo ""
 echo "   Press Ctrl+C in this window to stop the server."
 echo "  ============================================"

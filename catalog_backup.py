@@ -39,9 +39,7 @@ def backup_dir() -> Path:
     if override:
         d = Path(override)
     else:
-        media_root = os.environ.get("MEDIA_ROOT") or (
-            r"E:\Shared" if os.name == "nt" else "/mnt/e/Shared"
-        )
+        media_root = os.environ.get("MEDIA_ROOT") or str(Path.home() / "Videos")
         d = Path(media_root) / "_catalog-backups"
     d.mkdir(parents=True, exist_ok=True)
     return d

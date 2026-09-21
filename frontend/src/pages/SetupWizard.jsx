@@ -17,6 +17,11 @@ import {
 export default function SetupWizard({ onComplete }) {
   const [step, setStep] = useState(1);
 
+  // Asked for only when the wizard is opened from another device. The code
+  // is printed in the Zerko window on the machine itself.
+  const [codeRequired, setCodeRequired] = useState(false);
+  const [code, setCode] = useState('');
+
   // step 1
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -35,17 +40,29 @@ export default function SetupWizard({ onComplete }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
+  useEffect(() => {
+    fetch('/api/setup/status')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d) setCodeRequired(!!d.code_required); })
+      .catch(() => {});
+  }, []);
+
+  const authHeaders = useCallback(
+    () => (code.trim() ? { 'X-Setup-Code': code.trim() } : {}),
+    [code],
+  );
+
   const go = useCallback(async (path) => {
     setError(null);
     try {
       const url = path ? `/api/setup/browse?path=${encodeURIComponent(path)}` : '/api/setup/browse';
-      const res = await fetch(url);
+      const res = await fetch(url, { headers: authHeaders() });
       if (!res.ok) throw new Error((await res.json()).detail || 'Could not read that folder');
       setBrowse(await res.json());
     } catch (e) {
       setError(e.message);
     }
-  }, []);
+  }, [authHeaders]);
 
   useEffect(() => { if (step === 2 && !browse) go(''); }, [step, browse, go]);
 
@@ -54,7 +71,8 @@ export default function SetupWizard({ onComplete }) {
     setPreview(null);
     setScanning(true);
     try {
-      const res = await fetch(`/api/setup/scan-preview?path=${encodeURIComponent(path)}`);
+      const res = await fetch(`/api/setup/scan-preview?path=${encodeURIComponent(path)}`,
+                              { headers: authHeaders() });
       if (res.ok) setPreview(await res.json());
     } catch { /* preview is a nicety, not a gate */ }
     setScanning(false);
@@ -66,7 +84,7 @@ export default function SetupWizard({ onComplete }) {
     try {
       const res = await fetch('/api/setup/complete', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           username, password, media_root: chosen,
           generate_proxies: proxies, transcribe, index_now: true,
@@ -82,7 +100,8 @@ export default function SetupWizard({ onComplete }) {
     }
   };
 
-  const step1Valid = username.trim().length >= 2 && password.length >= 10 && password === confirm;
+  const step1Valid = username.trim().length >= 2 && password.length >= 10 && password === confirm
+    && (!codeRequired || code.trim().length > 0);
 
   return (
     <div className="min-h-screen bg-[#0B0B0D] text-zinc-100">
@@ -101,9 +120,16 @@ export default function SetupWizard({ onComplete }) {
             <>
               <StepHead icon={UserIcon} title="Create your account"
                         hint="This is the only account, and it's the admin. Nothing is sent anywhere — it lives on this machine." />
+              {codeRequired && (
+                <Field label="Setup code"
+                       hint="You're opening this from another device. The code is shown in the Zerko window on the PC that runs it.">
+                  <input value={code} onChange={(e) => setCode(e.target.value)}
+                         autoFocus className={input} placeholder="from the Zerko window" />
+                </Field>
+              )}
               <Field label="Username">
                 <input value={username} onChange={(e) => setUsername(e.target.value)}
-                       autoFocus className={input} placeholder="your name" />
+                       autoFocus={!codeRequired} className={input} placeholder="your name" />
               </Field>
               <Field label="Password" hint="At least 10 characters. Three unrelated words works well.">
                 <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}

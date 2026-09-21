@@ -81,7 +81,7 @@ export function DataProvider({ children }) {
   };
 
   const deleteVideo = async (id, deleteFile = true, permanent = false) => {
-    // Default: move the file into D:\Media\_Trash and keep the record, so it
+    // Default: move the file into your media folder's _Trash folder and keep the record, so it
     // can be restored. permanent=true destroys it and frees the space now.
     const qs = permanent ? '?permanent=true' : (deleteFile ? '?delete_file=true' : '');
     await apiCall(`/api/videos/${id}${qs}`, { method: 'DELETE' });
@@ -281,7 +281,11 @@ export function DataProvider({ children }) {
   // Events can be missed (tab opened late, stream reconnect, burst overflow);
   // the stats endpoint is authoritative and survives a server restart.
   useEffect(() => {
-    const id = setInterval(() => { loadStats().catch(() => {}); }, 5000);
+    // Nobody is looking at a hidden tab, so do not ask the server about it.
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      loadStats().catch(() => {});
+    }, 5000);
     return () => clearInterval(id);
   }, []);
 

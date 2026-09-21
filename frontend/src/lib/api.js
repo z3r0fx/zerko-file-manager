@@ -2,12 +2,19 @@ import { generateId } from './utils';
 
 const API_BASE = '';
 
+// Request logging is off unless you ask for it: the dashboard polls every few
+// seconds, and two console lines per call buried real errors. To turn it on,
+// run  localStorage.setItem('zerko_debug', '1')  in the browser console.
+const debugLog = (...args) => {
+  try { if (localStorage.getItem('zerko_debug') === '1') console.log(...args); } catch { /* storage blocked */ }
+};
+
 async function apiCall(path, options = {}) {
   const rawToken = localStorage.getItem('token');
   // Sanitize: ensure token is not the literal string "null" or "undefined"
   const token = (rawToken && rawToken !== 'null' && rawToken !== 'undefined') ? rawToken : null;
   
-  console.log('[API] Calling:', path, 'Token present:', !!token);
+  debugLog('[API] Calling:', path, 'Token present:', !!token);
 
   const headers = { ...options.headers };
 
@@ -52,7 +59,7 @@ async function apiCall(path, options = {}) {
   }
 
   const data = await response.json();
-  console.log('[API] Success:', path, 'Data count:', Array.isArray(data) ? data.length : 'object');
+  debugLog('[API] Success:', path, 'Data count:', Array.isArray(data) ? data.length : 'object');
   return data;
 }
 

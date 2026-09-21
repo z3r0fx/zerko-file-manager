@@ -7,6 +7,7 @@ where it already lives.
 import os
 import hashlib
 import subprocess
+import previews
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,7 @@ EXCLUDED_DIRS = {"thumbnails", "proxies", "transcriptions", "_catalog-backup", "
 
 
 def media_root() -> Path:
-    default = r"E:\Shared" if os.name == "nt" else "/mnt/e/Shared"
+    default = str(Path.home() / "Videos")
     return Path(os.environ.get("MEDIA_ROOT") or os.environ.get("MEDIA_UPLOAD_DIR") or default)
 
 
@@ -37,27 +38,17 @@ def thumb_name(filepath: str) -> str:
 
 
 def make_thumbnail(filepath: str, out_path: str, media_type: str) -> bool:
-    if os.path.exists(out_path):
-        return True
+    """Draw a thumbnail. An empty file left by an earlier failure does not
+    count as one, and the reason for a failure is printed rather than lost."""
     try:
-        if media_type == "video":
-            cmd = ['ffmpeg', '-y', '-ss', '1', '-i', filepath, '-frames:v', '1',
-                   '-vf', 'scale=640:-2', '-q:v', '4', out_path]
-        else:
-            cmd = ['ffmpeg', '-y', '-i', filepath, '-frames:v', '1',
-                   '-vf', 'scale=640:-2', '-q:v', '4', out_path]
-        r = subprocess.run(cmd, capture_output=True, timeout=120)
-        if r.returncode == 0 and os.path.exists(out_path):
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             return True
-        # retry from the first frame - very short clips have nothing at 1s
-        if media_type == "video":
-            cmd = ['ffmpeg', '-y', '-i', filepath, '-frames:v', '1',
-                   '-vf', 'scale=640:-2', '-q:v', '4', out_path]
-            r = subprocess.run(cmd, capture_output=True, timeout=120)
-            return r.returncode == 0 and os.path.exists(out_path)
-    except Exception as e:
-        print(f"    thumbnail failed: {os.path.basename(filepath)}: {e}")
-    return False
+    except OSError:
+        pass
+    ok, why = previews.make_thumbnail(filepath, out_path, media_type)
+    if not ok:
+        print(f"    thumbnail failed: {os.path.basename(filepath)}: {why}")
+    return ok
 
 
 def index_tree(root=None, queue_proxies=False, progress=None, db=None):

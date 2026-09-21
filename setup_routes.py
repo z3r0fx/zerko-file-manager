@@ -16,13 +16,14 @@ is fine for the person installing it and nobody else.
 
 import json
 import os
+import secrets
 import shutil
 import string
 import threading
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, User
@@ -62,12 +63,49 @@ def setup_needed() -> bool:
         db.close()
 
 
-def _guard():
+# Until the first account exists, whoever reaches this page first becomes the
+# admin - and can browse the server's folders on the way. On the machine itself
+# that is fine. From anywhere else on the network it is not, so a one-off code
+# is printed in the Zerko window (which only the person at the machine can see)
+# and required from any other address. Regenerated on every start.
+_SETUP_CODE = secrets.token_urlsafe(6)
+_code_failures = 0
+_MAX_CODE_FAILURES = 20
+
+
+def setup_code() -> str:
+    return _SETUP_CODE
+
+
+def _is_local(request: Request) -> bool:
+    """A direct connection from this machine, not relayed by a proxy."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1"):
+        return False
+    return not any(h in request.headers
+                   for h in ("x-forwarded-for", "forwarded", "x-real-ip"))
+
+
+def _guard(request: Request):
+    global _code_failures
     if not setup_needed():
         raise HTTPException(
             status_code=403,
             detail="Setup has already been completed on this installation.",
         )
+    if _is_local(request):
+        return
+    if _code_failures >= _MAX_CODE_FAILURES:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many wrong setup codes. Restart Zerko to try again.")
+    supplied = request.headers.get("x-setup-code", "")
+    if not secrets.compare_digest(supplied.encode(), _SETUP_CODE.encode()):
+        if supplied:
+            _code_failures += 1
+        raise HTTPException(
+            status_code=401,
+            detail="Enter the setup code shown in the Zerko window.")
 
 
 def load_config() -> dict:
@@ -82,11 +120,14 @@ def save_config(cfg: dict):
 
 
 @router.get("/status")
-def status():
+def status(request: Request):
     """Polled by the frontend before it decides to show login or the wizard."""
     cfg = load_config()
+    needs = setup_needed()
     return {
-        "needs_setup": setup_needed(),
+        "needs_setup": needs,
+        # Tells the wizard whether to ask for the code shown in the console.
+        "code_required": bool(needs and not _is_local(request)),
         "media_root": cfg.get("media_root"),
         "platform": "windows" if os.name == "nt" else "linux",
         "app_name": cfg.get("app_name", "Zerko File Manager"),
@@ -94,9 +135,9 @@ def status():
 
 
 @router.get("/drives")
-def drives():
+def drives(request: Request):
     """Every drive with its free space, so the choice is informed."""
-    _guard()
+    _guard(request)
     out = []
     if os.name == "nt":
         candidates = [f"{d}:\\" for d in string.ascii_uppercase]
@@ -126,15 +167,15 @@ def drives():
 
 
 @router.get("/browse")
-def browse(path: str = ""):
+def browse(request: Request, path: str = ""):
     """Subfolders of `path`, plus a count of media sitting directly inside.
 
     The count is what tells someone they have picked the right folder before
     committing to indexing it, so it is worth the extra listdir.
     """
-    _guard()
+    _guard(request)
     if not path:
-        return drives()
+        return drives(request)
 
     target = Path(path)
     if not target.is_dir():
@@ -169,12 +210,12 @@ def browse(path: str = ""):
 
 
 @router.get("/scan-preview")
-def scan_preview(path: str, max_files: int = 40000):
+def scan_preview(request: Request, path: str, max_files: int = 40000):
     """Walk the tree and report what indexing would actually find.
 
     Capped, because pointing this at C:\\ should not hang the wizard.
     """
-    _guard()
+    _guard(request)
     root = Path(path)
     if not root.is_dir():
         raise HTTPException(status_code=404, detail="That folder does not exist")
@@ -222,9 +263,9 @@ def scan_preview(path: str, max_files: int = 40000):
 
 
 @router.post("/complete")
-def complete(payload: dict = Body(...)):
+def complete(request: Request, payload: dict = Body(...)):
     """Create the first account, save the config, kick off the first index."""
-    _guard()
+    _guard(request)
 
     username = (payload.get("username") or "").strip()
     password = payload.get("password") or ""
@@ -257,6 +298,7 @@ def complete(payload: dict = Body(...)):
     finally:
         db.close()
 
+    print(f"  [setup] admin account '{username}' created", flush=True)
     cfg = load_config()
     cfg.update({
         "media_root": media_root,
@@ -269,6 +311,9 @@ def complete(payload: dict = Body(...)):
     # MEDIA_ROOT is read at import time by the app, so this run already has the
     # right value only if the launcher supplied it. Set it anyway so the first
     # index works before the restart.
+    # Compare BEFORE assigning: the app read MEDIA_ROOT once, at import, so a
+    # different value here means the running process is still using the old one.
+    restart_required = (os.environ.get("MEDIA_ROOT") or "") != media_root
     os.environ["MEDIA_ROOT"] = media_root
 
     started = {"indexing": False}
@@ -313,7 +358,7 @@ def complete(payload: dict = Body(...)):
         "status": "ok",
         "username": username,
         "media_root": media_root,
-        "restart_required": os.environ.get("MEDIA_ROOT") != media_root,
+        "restart_required": restart_required,
         **started,
     }
 

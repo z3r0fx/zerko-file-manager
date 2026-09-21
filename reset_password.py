@@ -13,7 +13,7 @@ import getpass
 import sys
 
 from database import SessionLocal, User
-from auth import get_password_hash
+from auth import get_password_hash, revoke_sessions
 
 MIN_LEN = 10
 TOO_COMMON = {"admin123", "password", "123456789", "changeme", "zerko1234",
@@ -25,7 +25,7 @@ def main():
     try:
         users = db.query(User).order_by(User.id).all()
         if not users:
-            print("  No accounts exist. Delete mediamanager.db and start fresh.")
+            print("  No accounts exist yet - open Zerko in your browser and run the setup wizard.")
             return 1
 
         print("\n  Accounts on this server:\n")
@@ -58,11 +58,14 @@ def main():
         user.hashed_password = get_password_hash(pw)
         # Drop any existing sessions: if someone else was signed in as this
         # account, a password reset should end that too.
-        user.session_token = None
+        revoke_sessions(user)
+        user.is_active = True
         db.commit()
 
         print(f"\n  Done. Sign in as '{user.username}' with the new password.")
-        print("  Any existing sessions for that account have been signed out.\n")
+        print("  Any existing sessions for that account have been signed out.")
+        print("  If sign-in was being refused as 'too many attempts', restart Zerko")
+        print("  (close its window and start it again) to clear that too.\n")
         return 0
     finally:
         db.close()

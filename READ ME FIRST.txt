@@ -105,7 +105,7 @@ Thumbnails are blank
     The server is fine - Windows just is not forwarding localhost into WSL.
     Two options:
       a) use the address the server window prints next to "On your network",
-         e.g. http://172.29.70.27:9600 - this always works
+         e.g. http://172.x.x.x:9600 - this always works
       b) double-click  Fix Localhost Access.bat  to make localhost work
          properly (switches WSL to mirrored networking, restarts WSL)
 
@@ -113,9 +113,16 @@ Port 9600 already in use
     Something else is using it. Open start.sh in Notepad and change
     PORT="${PORT:-9600}" to another number, e.g. 9601.
 
-You forgot the password
-    Run:  wsl -- bash -lc "cd /mnt/c/Zerko && ./venv/bin/python reset_password.py"
-    (adjust the path to wherever you put the folder)
+You cannot sign in / you forgot the password
+    Passwords are stored scrambled, so nobody (including you) can look one up
+    - but it can always be reset. Pick whichever is easier:
+      a) On the login page click "Forgot password?" and enter the Recovery
+         code printed in the black Zerko window, next to your account name.
+      b) Double-click  Reset Password.bat  and follow the prompts.
+    If the page says "too many attempts", wait 15 minutes, or close the Zerko
+    window and start it again.
+    Keep the black window open while you use Zerko - closing it stops the
+    server.
 
 It is slow over the network
     Generate proxies - Dashboard, then the Proxies panel. They are small

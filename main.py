@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import uuid
 import hashlib
 import shutil
@@ -26,9 +27,10 @@ from database import init_db, get_db, SessionLocal, User, IndexedFolder, Video, 
 from auth import (
     get_password_hash, verify_password, create_access_token,
     get_current_user, get_admin_user, get_user_from_token,
-    ACCESS_TOKEN_EXPIRE_MINUTES
+    ACCESS_TOKEN_EXPIRE_MINUTES, revoke_sessions
 )
 from video_processor import scan_folder, format_file_size, format_duration, generate_thumbnail, get_video_duration, get_duration_fast, get_technical_metadata, VIDEO_EXTENSIONS, MEDIA_EXTENSIONS
+import previews
 from media_type_utils import get_media_type
 from job_manager import job_manager
 
@@ -36,7 +38,7 @@ from job_manager import job_manager
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
 # Media root is configurable so the same code runs under WSL and natively on
-# Windows. Set MEDIA_ROOT to override (e.g. MEDIA_ROOT=E:\\Shared on Windows).
+# Windows. Set MEDIA_ROOT to override (e.g. MEDIA_ROOT=D:\\Footage on Windows).
 # Set by the setup wizard on first run; no sensible default exists
 # before someone tells us where their footage lives.
 _DEFAULT_MEDIA_ROOT = os.environ.get("MEDIA_ROOT") or str(Path.home() / "Videos")
@@ -51,12 +53,12 @@ def _build_root_markers():
     """Path prefixes that mean "this was the media root at the time".
 
     Rows hold absolute paths from whenever they were indexed. When the library
-    moves - a new drive letter, E:\\Shared to D:\\Media, WSL to native Windows -
+    moves - a new drive letter, one folder to another, WSL to native Windows -
     those stored paths stop resolving, and every clip 404s until someone
     reindexes.
 
-    This list used to be hardcoded to the original E:\\Shared, so it silently
-    stopped covering the current root after the move to D:\\Media. Deriving it
+    This list used to be hardcoded to one fixed folder, so it silently
+    stopped covering the current root after a move. Deriving it
     from MEDIA_ROOT means it keeps working through the next move too.
     """
     markers = []
@@ -64,7 +66,7 @@ def _build_root_markers():
     if cur:
         markers.append(cur.lower() + "/")
         # The same folder seen from the other side of the WSL boundary:
-        # /mnt/x/Media <-> X:/Media (any drive letter)
+        # /mnt/x/Footage <-> X:/Footage (any drive letter)
         m = re.match(r"^/mnt/([a-z])/(.*)$", cur, re.I)
         if m:
             markers.append(f"{m.group(1).lower()}:/{m.group(2).lower()}/")
@@ -214,7 +216,7 @@ def trash_root() -> Path:
 
 
 def move_to_trash(real_path: str) -> str:
-    """Move a file into D:\\Media\\_Trash, keeping its folder structure.
+    """Move a file into the media root's _Trash folder, keeping its structure.
 
     Space is not reclaimed until the trash is emptied - that is the point. It
     makes pruning safe to do quickly, and the freed total is shown before you
@@ -240,7 +242,7 @@ def move_to_trash(real_path: str) -> str:
 def resolve_media_path(stored_path):
     """Map a path stored in the DB onto wherever the media root is now.
 
-    Existing rows hold WSL-style paths like /mnt/e/Shared/clip.mp4. If the
+    Existing rows hold WSL-style paths like /mnt/e/Footage/clip.mp4. If the
     server is later run natively on Windows those stop resolving, so re-root
     them onto UPLOAD_ROOT instead of 404-ing.
     """
@@ -349,10 +351,59 @@ download_tokens = {}
 # Background media-scan state
 _rescan_state = {"running": False, "message": "idle", "stats": None}
 
+# --- photo previews ----------------------------------------------------------
+# Browsers cannot draw camera RAW (DNG, ARW, CR2, NEF...), HEIC or most TIFFs,
+# so opening one in the viewer showed a broken image. This returns a JPEG the
+# browser can show, made once and kept. The original is never touched and is
+# still what "download" delivers.
+_preview_lock = threading.Lock()
+
+
+@app.get("/api/photo-preview/{video_id}")
+def photo_preview(request: Request, video_id: int, token: Optional[str] = None,
+                  w: int = 2400, db: Session = Depends(get_db)):
+    if token:
+        get_user_from_token(token, db)
+    else:
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+        get_user_from_token(auth_header[7:], db)
+
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    path = resolve_media_path(video.filepath)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="The photo file is not on disk")
+
+    if Path(path).suffix.lower() in previews.BROWSER_IMAGE_EXT:
+        return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+
+    w = max(400, min(int(w), 4000))
+    st = os.stat(path)
+    out = UPLOAD_ROOT / ".previews" / f"{video.id}_{int(st.st_mtime)}_{st.st_size}_{w}.jpg"
+    if not out.exists() or out.stat().st_size == 0:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with _preview_lock:
+            if not out.exists():
+                ok, why = previews.make_image_jpeg(path, str(out), w)
+                if not ok:
+                    raise HTTPException(
+                        status_code=415,
+                        detail=f"Could not make a viewable copy of this photo: {why}")
+    return FileResponse(str(out), media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
 @app.get("/api/videos/{video_id}/download-token")
 def get_download_token(video_id: int, current_user: User = Depends(get_current_user)):
+    now = datetime.utcnow()
+    # Tokens are removed when used; ones that never were would pile up forever.
+    for stale in [k for k, v in download_tokens.items() if v["expires"] <= now]:
+        download_tokens.pop(stale, None)
     token = secrets.token_urlsafe(32)
-    download_tokens[token] = {"video_id": video_id, "expires": datetime.utcnow() + timedelta(seconds=60)}
+    download_tokens[token] = {"video_id": video_id, "expires": now + timedelta(seconds=60)}
     return {"token": token}
 
 @app.get("/api/video-file/{video_id}")
@@ -449,11 +500,39 @@ _LOGIN_WINDOW = 900           # 15 minutes
 _LOGIN_MAX_FAILS = 8
 
 
+# X-Forwarded-For is a header the CLIENT writes. Believing it from anyone lets an
+# attacker send a new made-up address with every guess and never reach the
+# limit. It is only trusted when the connection really comes from a proxy we
+# run - Caddy on this machine by default (see deploy/). Add other proxy
+# addresses, comma-separated, in the TRUSTED_PROXIES environment variable.
+_TRUSTED_PROXIES = {"127.0.0.1", "::1"} | {
+    p.strip() for p in os.environ.get("TRUSTED_PROXIES", "").split(",") if p.strip()
+}
+
+
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    peer = request.client.host if request.client else "unknown"
+    if peer in _TRUSTED_PROXIES:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            # The proxy appends the address it saw, so the real client is the
+            # right-most entry that is not itself one of our proxies.
+            for hop in reversed([h.strip() for h in fwd.split(",") if h.strip()]):
+                if hop not in _TRUSTED_PROXIES:
+                    return hop
+    return peer
+
+
+# The share endpoints do not take a Request, so the caller's address is
+# remembered per request here for their password limiter to read.
+import contextvars
+_request_ip = contextvars.ContextVar("request_ip", default="unknown")
+
+
+@app.middleware("http")
+async def _remember_client_ip(request: Request, call_next):
+    _request_ip.set(_client_ip(request))
+    return await call_next(request)
 
 
 def _check_rate_limit(ip: str):
@@ -480,7 +559,8 @@ def login(request: LoginRequest, http_request: Request, db: Session = Depends(ge
     _check_rate_limit(ip)
 
     user = db.query(User).filter(User.username == request.username).first()
-    if not user or not verify_password(request.password, user.hashed_password):
+    if (not user or not verify_password(request.password, user.hashed_password)
+            or user.is_active is False):
         _record_failure(ip)
         remaining = _LOGIN_MAX_FAILS - len(_login_attempts.get(ip, []))
         print(f"[auth] failed sign-in for '{request.username}' from {ip} "
@@ -490,6 +570,60 @@ def login(request: LoginRequest, http_request: Request, db: Session = Depends(ge
     _login_attempts.pop(ip, None)
     token_data = create_access_token({"sub": user.username})
     return {"token": token_data["token"], "user": {"id": user.id, "username": user.username, "role": user.role}}
+
+
+# --- password recovery -------------------------------------------------------
+# Being at the machine is the proof of ownership: a one-off code is printed in
+# the Zerko window, and anyone who can read it can set a new password from the
+# login page. Passwords themselves are stored only as one-way hashes, so they
+# can never be shown - a reset is the only way back in.
+#
+# The code changes every time the server starts and after every successful
+# use. Guessing it is capped for everyone at once, so it cannot be brute-forced
+# over the network; restarting Zerko lifts the cap.
+_RECOVERY_CODE = secrets.token_urlsafe(6)
+_recovery_fails = []
+_RECOVERY_MAX_FAILS = 10
+_WEAK_PASSWORDS = {"admin123", "password", "123456789", "changeme", "zerko1234",
+                   "password123", "qwerty123", "zerko12345"}
+
+
+@app.post("/api/recover")
+def recover_password(payload: dict = Body(...), db: Session = Depends(get_db)):
+    global _RECOVERY_CODE
+    now = datetime.utcnow().timestamp()
+    _recovery_fails[:] = [t for t in _recovery_fails if now - t < _LOGIN_WINDOW]
+    if len(_recovery_fails) >= _RECOVERY_MAX_FAILS:
+        raise HTTPException(status_code=429, detail=(
+            "Too many wrong recovery codes. Restart Zerko and try again."))
+
+    supplied = str((payload or {}).get("code") or "").strip()
+    if not secrets.compare_digest(supplied.encode(), _RECOVERY_CODE.encode()):
+        _recovery_fails.append(now)
+        raise HTTPException(status_code=401, detail=(
+            "That recovery code is not right. It is printed in the Zerko window."))
+
+    username = str((payload or {}).get("username") or "").strip()
+    new = str((payload or {}).get("new_password") or "")
+    if len(new) < 10:
+        raise HTTPException(status_code=400, detail="Use at least 10 characters.")
+    if new.lower() in _WEAK_PASSWORDS:
+        raise HTTPException(status_code=400, detail="That password is far too common.")
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="There is no account with that username.")
+
+    user.hashed_password = get_password_hash(new)
+    user.is_active = True
+    revoke_sessions(user)
+    db.commit()
+
+    # Single use: whoever saw the old code cannot reuse it.
+    _RECOVERY_CODE = secrets.token_urlsafe(6)
+    _login_attempts.clear()                     # lift any sign-in lockout too
+    print(f"[auth] password reset for '{user.username}' using the recovery code. "
+          f"New recovery code: {_RECOVERY_CODE}", flush=True)
+    return {"message": "Password changed. Sign in with the new one."}
 
 
 @app.post("/api/me/password")
@@ -504,7 +638,7 @@ def change_my_password(payload: dict = Body(...), db: Session = Depends(get_db),
     if new.lower() in ("admin123", "password", "123456789", "changeme"):
         raise HTTPException(status_code=400, detail="That password is far too common")
     current_user.hashed_password = get_password_hash(new)
-    current_user.session_token = None          # force a fresh sign-in everywhere
+    revoke_sessions(current_user)              # force a fresh sign-in everywhere
     db.commit()
     return {"message": "Password changed. Sign in again."}
 
@@ -519,7 +653,7 @@ def admin_set_password(user_id: int, payload: dict = Body(...), db: Session = De
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     target.hashed_password = get_password_hash(new)
-    target.session_token = None
+    revoke_sessions(target)
     db.commit()
     return {"message": f"Password reset for {target.username}"}
 
@@ -570,13 +704,10 @@ def upload_file(
     # unsupported file used to kill this thread with a raw traceback.
     def generate_thumb_bg():
         try:
-            if media_type == 'video':
-                generate_thumbnail(str(file_path), str(thumb_path))
-            elif media_type == 'photo':
-                from PIL import Image
-                img = Image.open(file_path)
-                img.thumbnail((640, 360))
-                img.convert('RGB').save(thumb_path, 'JPEG')
+            if media_type in ('video', 'photo'):
+                ok, why = previews.make_thumbnail(str(file_path), str(thumb_path), media_type)
+                if not ok:
+                    print(f"Thumbnail failed for {file_path}: {why}")
         except Exception as e:
             print(f"Thumbnail generation failed for {file_path}: {e}")
     
@@ -705,7 +836,13 @@ def get_video_access_token(current_user: User = Depends(get_current_user)):
 
 @app.get("/api/users")
 def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
-    return db.query(User).all()
+    # Explicit fields: returning the ORM rows sends the password hash and the
+    # session marker to the browser along with everything else.
+    return [{
+        "id": u.id, "username": u.username, "email": u.email, "role": u.role,
+        "created_at": u.created_at, "last_login": u.last_login,
+        "is_active": u.is_active,
+    } for u in db.query(User).all()]
 
 @app.post("/api/register")
 def register_user(user: UserCreate, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
@@ -728,7 +865,7 @@ def delete_user(user_id: int, db: Session = Depends(get_db), current_user: User 
 def force_logout(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
     user = db.query(User).filter(User.id == user_id).first()
     if not user: raise HTTPException(status_code=404, detail="User not found")
-    user.session_token = None
+    revoke_sessions(user)
     db.commit()
     return {"message": "User logged out"}
 
@@ -1782,6 +1919,9 @@ def server_stats(current_user: User = Depends(get_current_user)):
     return out
 
 
+_upload_locks = {}
+
+
 @app.post("/api/upload/chunk")
 def upload_chunk(
     upload_id: str = Form(...),
@@ -1802,13 +1942,30 @@ def upload_chunk(
     tmp_dir = UPLOAD_ROOT / ".uploads_tmp" / safe_id
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    part = tmp_dir / f"{int(chunk_index):06d}.part"
-    with open(part, "wb") as out:
-        shutil.copyfileobj(file.file, out, COPY_BUFFER)
+    if not (0 < int(total_chunks) <= 200000 and 0 <= int(chunk_index) < int(total_chunks)):
+        raise HTTPException(status_code=400, detail="Bad chunk numbers")
 
-    received = len(list(tmp_dir.glob("*.part")))
-    if received < total_chunks:
-        return {"status": "chunk_received", "received": received, "total": total_chunks}
+    # Write under a temporary name and rename, so a chunk that is still
+    # arriving can never be counted - or read - as if it were complete. Counting
+    # part files as they appear made the LAST request to finish assemble the
+    # file while other chunks were still being written, and delete the folder
+    # under them: the result was a video cut short at a chunk boundary.
+    part = tmp_dir / f"{int(chunk_index):06d}.part"
+    incoming = tmp_dir / f"{int(chunk_index):06d}.incoming-{uuid.uuid4().hex[:8]}"
+    with open(incoming, "wb") as out:
+        shutil.copyfileobj(file.file, out, COPY_BUFFER)
+    os.replace(incoming, part)
+
+    # Exactly one request may assemble, and only when every chunk is present.
+    lock = _upload_locks.setdefault(safe_id, threading.Lock())
+    with lock:
+        have = {p.name for p in tmp_dir.glob("*.part")}
+        complete = all(f"{i:06d}.part" in have for i in range(int(total_chunks)))
+        claimed = (tmp_dir / ".assembling").exists()
+        if not complete or claimed:
+            return {"status": "chunk_received", "received": len(have), "total": total_chunks}
+        (tmp_dir / ".assembling").touch()
+    received = len(have)
 
     # last chunk in - assemble
     dest_dir = upload_destination_dir(db, folder_id)
@@ -1822,12 +1979,17 @@ def upload_chunk(
             folder_id = row.id
     final_path = unique_destination(dest_dir, file.filename)
     try:
+        expected = sum(p.stat().st_size for p in tmp_dir.glob("*.part"))
         with open(final_path, "wb") as out:
             for chunk_file in sorted(tmp_dir.glob("*.part")):
                 with open(chunk_file, "rb") as src:
                     shutil.copyfileobj(src, out, COPY_BUFFER)
+        if os.path.getsize(final_path) != expected:
+            os.remove(final_path)
+            raise HTTPException(status_code=500, detail="Upload was assembled incorrectly - please try again")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        _upload_locks.pop(safe_id, None)
 
     media_type = get_media_type(final_path.name)
     thumbnail_filename = f"{uuid.uuid4()}.jpg"
@@ -1836,13 +1998,10 @@ def upload_chunk(
 
     def thumb_bg():
         try:
-            if media_type == 'video':
-                generate_thumbnail(str(final_path), str(thumb_path))
-            elif media_type == 'photo':
-                from PIL import Image
-                img = Image.open(final_path)
-                img.thumbnail((640, 360))
-                img.convert('RGB').save(thumb_path, 'JPEG')
+            if media_type in ('video', 'photo'):
+                ok, why = previews.make_thumbnail(str(final_path), str(thumb_path), media_type)
+                if not ok:
+                    print(f"Thumbnail failed for {final_path}: {why}")
         except Exception as e:
             print(f"Thumbnail generation failed for {final_path}: {e}")
 
@@ -2233,13 +2392,16 @@ def update_check(current_user: User = Depends(require_admin)):
 def update_settings(payload: dict = Body(...),
                     current_user: User = Depends(require_admin)):
     import updater
-    return updater.save_settings(
-        auto_check=payload.get("auto_check"),
-        auto_apply=payload.get("auto_apply"),
-        owner=(payload.get("owner") or "").strip() or None,
-        repo=(payload.get("repo") or "").strip() or None,
-        check_minutes=payload.get("check_minutes"),
-    )
+    try:
+        return updater.save_settings(
+            auto_check=payload.get("auto_check"),
+            auto_apply=payload.get("auto_apply"),
+            owner=(payload.get("owner") or "").strip() or None,
+            repo=(payload.get("repo") or "").strip() or None,
+            check_minutes=payload.get("check_minutes"),
+        )
+    except updater.SettingsRefused as e:
+        raise HTTPException(status_code=403, detail=str(e))
 
 
 @app.post("/api/updates/download")
@@ -2789,6 +2951,10 @@ def _share_videos(db: Session, share: Share):
     return []
 
 
+_share_fails = {}             # (ip, share token) -> [failure timestamps]
+_SHARE_MAX_FAILS = 10
+
+
 def _share_state(db: Session, token: str, password: Optional[str] = None) -> Share:
     """Resolve a token to a live share, or refuse with a reason."""
     share = db.query(Share).filter(Share.token == token).first()
@@ -2797,8 +2963,25 @@ def _share_state(db: Session, token: str, password: Optional[str] = None) -> Sha
     if share.expires_at and datetime.utcnow() > share.expires_at:
         raise HTTPException(status_code=410, detail="This link has expired")
     if share.password_hash:
-        if not password or not verify_password(password, share.password_hash):
+        if not password:
             raise HTTPException(status_code=401, detail="Password required")
+        # A wrong guess counts against this address on this link. Without a
+        # limit a short share password falls to a script in minutes.
+        key = (_request_ip.get(), token)
+        now = datetime.utcnow().timestamp()
+        fails = [t for t in _share_fails.get(key, []) if now - t < _LOGIN_WINDOW]
+        if len(fails) >= _SHARE_MAX_FAILS:
+            _share_fails[key] = fails
+            raise HTTPException(status_code=429,
+                                detail="Too many wrong passwords. Try again later.")
+        if not verify_password(password, share.password_hash):
+            fails.append(now)
+            _share_fails[key] = fails
+            if len(_share_fails) > 5000:
+                for k in [k for k, v in _share_fails.items() if not v or v[-1] < now - _LOGIN_WINDOW]:
+                    _share_fails.pop(k, None)
+            raise HTTPException(status_code=401, detail="Password required")
+        _share_fails.pop(key, None)
     return share
 
 
@@ -3308,11 +3491,12 @@ except Exception as _e:
     print(f"  [!] Could not initialise the database: {_e}")
 
 try:
-    from setup_routes import router as _setup_router, setup_needed
+    from setup_routes import router as _setup_router, setup_needed, setup_code
     app.include_router(_setup_router)
     if setup_needed():
         print("")
         print("  No account yet - open the app in your browser to set it up.")
+        print(f"  Setup code: {setup_code()}   (only asked for if you open it from another device)")
 except Exception as _e:
     print(f"  [!] Setup routes unavailable: {_e}")
 
@@ -3381,6 +3565,19 @@ if __name__ == "__main__":
     print("  ------------------")
     print(f"  Media root : {UPLOAD_ROOT}")
     print(f"  Listening  : http://{host}:{port}")
+    try:
+        _db = SessionLocal()
+        try:
+            _accounts = [f"{u.username} ({u.role})" for u in _db.query(User).order_by(User.id)]
+        finally:
+            _db.close()
+    except Exception:
+        _accounts = []
+    if _accounts:
+        print(f"  Accounts   : {', '.join(_accounts)}")
+        print("  Passwords are stored scrambled and cannot be shown - if one is")
+        print("  forgotten, use 'Forgot password?' on the login page with this code:")
+        print(f"  Recovery code : {_RECOVERY_CODE}")
     print("")
 
     # NOTE: stays at a single worker on purpose - job_manager runs in-process,

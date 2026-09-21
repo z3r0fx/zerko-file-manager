@@ -129,7 +129,7 @@ export default function PhotoLightbox({ photos, initialIndex, onClose, onUpdateS
           <div ref={fitRef} className="h-full w-full flex items-center justify-center">
             <img
               key={photo.id}
-              src={`/api/video-file/${photo.id}?token=${token}`}
+              src={`/api/photo-preview/${photo.id}?token=${token}`}
               alt={photo.filename}
               draggable={false}
               className="select-none transition-transform duration-200"

@@ -16,10 +16,13 @@ is watching never closes.
 If the new version fails to start, start.sh puts the backup back.
 """
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import ssl
+import stat
 import tempfile
 import urllib.request
 import zipfile
@@ -37,6 +40,16 @@ GITHUB_OWNER = os.environ.get("ZERKO_GH_OWNER", "z3r0fx")
 GITHUB_REPO = os.environ.get("ZERKO_GH_REPO", "zerko-file-manager")
 
 USER_AGENT = "ZerkoFileManager-Updater"
+
+# The built-in source. Changing it means running code from somewhere else, so
+# it is refused unless the person running the server opts in on the machine
+# itself (an environment variable), not through the web interface.
+DEFAULT_OWNER = GITHUB_OWNER
+DEFAULT_REPO = GITHUB_REPO
+ALLOW_CUSTOM_SOURCE = os.environ.get("ZERKO_ALLOW_CUSTOM_UPDATE_SOURCE") == "1"
+ALLOW_UNVERIFIED = os.environ.get("ZERKO_ALLOW_UNVERIFIED_UPDATES") == "1"
+MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 
 
 def current_version() -> str:
@@ -68,7 +81,23 @@ def settings() -> dict:
     }
 
 
+class SettingsRefused(Exception):
+    pass
+
+
 def save_settings(**kw):
+    for key, default in (("owner", DEFAULT_OWNER), ("repo", DEFAULT_REPO)):
+        val = kw.get(key)
+        if val is None or val == default:
+            continue
+        if not _NAME_RE.match(str(val)):
+            raise SettingsRefused(f"'{val}' is not a valid GitHub {key} name.")
+        if not ALLOW_CUSTOM_SOURCE:
+            raise SettingsRefused(
+                "Changing the update source is turned off. Updates install and "
+                "run code, so they only come from the built-in repository. To "
+                "use a fork, set ZERKO_ALLOW_CUSTOM_UPDATE_SOURCE=1 on the "
+                "machine running Zerko and restart it.")
     c = _cfg()
     for key, cfg_key in (("auto_check", "auto_check_updates"),
                          ("auto_apply", "auto_apply_updates"),
@@ -105,6 +134,40 @@ def _get_json(url: str, timeout=20):
         return json.loads(r.read().decode("utf-8"))
 
 
+def _get_text(url: str, timeout=20) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=ssl.create_default_context()) as r:
+        return r.read(1024 * 1024).decode("utf-8", "replace")
+
+
+def _expected_sha256(assets: list, zip_asset: dict):
+    """The SHA-256 the release says its zip should have, or None.
+
+    GitHub records a digest for every asset it stores. A ".sha256" file
+    attached beside the zip (or a SHA256SUMS file) is accepted too, for
+    releases that predate that.
+    """
+    digest = str(zip_asset.get("digest") or "")
+    if digest.lower().startswith("sha256:"):
+        return digest.split(":", 1)[1].strip().lower()
+    zip_name = str(zip_asset.get("name", ""))
+    for a in assets:
+        n = str(a.get("name", ""))
+        if n.lower() in (zip_name.lower() + ".sha256", "sha256sums", "sha256sums.txt"):
+            url = a.get("browser_download_url") or ""
+            if not url.startswith("https://github.com/"):
+                continue
+            try:
+                for line in _get_text(url).splitlines():
+                    m = re.match(r"^([A-Fa-f0-9]{64})(?:\s+\*?(.+))?$", line.strip())
+                    if m and (not m.group(2) or m.group(2).strip() == zip_name):
+                        return m.group(1).lower()
+            except Exception:
+                continue
+    return None
+
+
 def check() -> dict:
     """Ask GitHub for the newest release. Never downloads anything."""
     s = settings()
@@ -134,6 +197,7 @@ def check() -> dict:
         "notes": (data.get("body") or "").strip()[:4000],
         "published_at": data.get("published_at"),
         "download_url": (asset or {}).get("browser_download_url"),
+        "sha256": _expected_sha256(data.get("assets", []), asset) if asset else None,
         "size": (asset or {}).get("size"),
         "has_asset": asset is not None,
         "checked_at": datetime.utcnow().isoformat(),
@@ -161,6 +225,13 @@ def download(info: dict = None) -> dict:
     if not info.get("download_url"):
         return {"ok": False, "error": "That release has no .zip attached."}
 
+    expected = (info.get("sha256") or "").lower() or None
+    if not expected and not ALLOW_UNVERIFIED:
+        return {"ok": False, "error": (
+            "This release has no checksum to verify the download against, so "
+            "it was not installed. Attach a .sha256 file to the release, or "
+            "set ZERKO_ALLOW_UNVERIFIED_UPDATES=1 to accept it anyway.")}
+
     url = info["download_url"]
     # Only ever download from GitHub's own domains.
     if not url.startswith(("https://github.com/", "https://objects.githubusercontent.com/")):
@@ -173,18 +244,40 @@ def download(info: dict = None) -> dict:
         with urllib.request.urlopen(req, timeout=120,
                                     context=ssl.create_default_context()) as r, \
              open(zip_path, "wb") as f:
-            shutil.copyfileobj(r, f, 1024 * 1024)
+            got = 0
+            h = hashlib.sha256()
+            while True:
+                chunk = r.read(1024 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > MAX_DOWNLOAD_BYTES:
+                    return {"ok": False, "error": "The download is far larger than expected."}
+                h.update(chunk)
+                f.write(chunk)
+
+        if expected and h.hexdigest() != expected:
+            return {"ok": False, "error": (
+                "The download does not match the release's checksum, so it was "
+                "discarded. Try again; if it keeps happening, do not install it.")}
 
         if not zipfile.is_zipfile(zip_path):
             return {"ok": False, "error": "The downloaded file is not a zip."}
 
         unpacked = tmp / "unpacked"
         with zipfile.ZipFile(zip_path) as z:
-            # Reject path traversal before writing anything to disk.
-            for name in z.namelist():
+            # Reject anything that could land outside the folder, or that is a
+            # link (a symlink in an archive is how a later file gets written
+            # somewhere the archive was never allowed to reach).
+            root_resolved = unpacked.resolve()
+            for zi in z.infolist():
+                name = zi.filename
                 p = (unpacked / name).resolve()
-                if not str(p).startswith(str(unpacked.resolve())):
+                if (name.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", name)
+                        or not p.is_relative_to(root_resolved)):
                     return {"ok": False, "error": f"Unsafe path in archive: {name}"}
+                if stat.S_ISLNK(zi.external_attr >> 16):
+                    return {"ok": False, "error": f"Archive contains a link: {name}"}
             z.extractall(unpacked)
 
         # Releases usually wrap everything in one top-level folder.

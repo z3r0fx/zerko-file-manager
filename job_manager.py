@@ -254,7 +254,7 @@ class JobManager:
             # Proxy path
             # Keep this in step with main.py: MEDIA_ROOT is the one to set,
             # MEDIA_UPLOAD_DIR is kept for backwards compatibility.
-            _default_root = r"E:\Shared" if os.name == "nt" else "/mnt/e/Shared"
+            _default_root = str(Path.home() / "Videos")
             UPLOAD_ROOT = Path(
                 os.environ.get("MEDIA_ROOT")
                 or os.environ.get("MEDIA_UPLOAD_DIR")

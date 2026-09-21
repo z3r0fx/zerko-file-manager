@@ -20,3 +20,6 @@ transcriptions/
 __pycache__/
 *.pyc
 node_modules/
+
+# Maintainer helper: not part of what people download
+push-to-github.sh
