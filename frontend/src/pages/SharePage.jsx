@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import PhoneUpload from '../components/shared/PhoneUpload';
-import { Heart, Download, Lock, X, ChevronLeft, ChevronRight, Check, Clock, MessageSquare, CheckSquare, Square, Package } from 'lucide-react';
+import { Heart, Download, Lock, X, ChevronLeft, ChevronRight, Check, Clock, MessageSquare, CheckSquare, Square, Package, Send, Loader2 } from 'lucide-react';
 
 /**
  * The public face of the library - what a client or agent sees when you send
@@ -47,6 +47,12 @@ export default function SharePage() {
       : 'ontouchstart' in window;
   });
   const [selectMode, setSelectMode] = useState(false);
+  // Picks save as they are made, but nothing ever said so. This is the
+  // receipt - without it a client ticks a clip, types a note, and has no
+  // idea whether any of it reached anybody.
+  const [confirming, setConfirming] = useState(false);
+  const [receipt, setReceipt] = useState(null);
+  const [confirmError, setConfirmError] = useState(null);
 
   const qs = password ? `?password=${encodeURIComponent(password)}` : '';
 
@@ -185,6 +191,26 @@ export default function SharePage() {
       window.removeEventListener('pointerup', up);
     };
   }, [marquee, selected]);
+
+  const confirmReview = async () => {
+    setConfirming(true); setConfirmError(null);
+    try {
+      const res = await fetch(`/api/public/share/${token}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: password || undefined,
+                               viewer_name: viewerName || undefined }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j.detail || `Could not send (${res.status})`);
+      }
+      setReceipt(await res.json());
+    } catch (e) {
+      setConfirmError(e.message || 'Could not send');
+    }
+    setConfirming(false);
+  };
 
   const fileUrl = (id) =>
     `/api/public/share/${token}/stream/${id}?download=true`
@@ -458,18 +484,52 @@ export default function SharePage() {
         />
       )}
 
+      {data?.allow_selects && (
+        <div className="sticky bottom-0 z-30 border-t border-white/10 bg-[#0B0B0D]/95 px-4 py-3 backdrop-blur sm:px-6">
+          <div className="mx-auto flex max-w-7xl flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+            <p className="text-xs text-zinc-400">
+              {(() => {
+                const picked = Object.values(picks).filter(Boolean).length;
+                const noted = Object.values(notes).filter((n) => (n || '').trim()).length;
+                if (!picked && !noted) return 'Tap the heart on anything you like, and leave a note if you want to.';
+                return `${picked} picked${noted ? `, ${noted} with notes` : ''} — saved as you go.`;
+              })()}
+            </p>
+            <div className="flex items-center gap-3 sm:ml-auto">
+              {receipt ? (
+                <span className="flex items-center gap-2 text-sm text-emerald-400">
+                  <Check className="h-4 w-4" /> {receipt.message}
+                </span>
+              ) : (
+                <button
+                  onClick={confirmReview}
+                  disabled={confirming}
+                  className="flex items-center justify-center gap-2 rounded-lg bg-accent px-4 py-2.5 text-sm font-medium text-accent-foreground transition hover:bg-accent-hi disabled:opacity-50 sm:py-2"
+                >
+                  {confirming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                  {confirming ? 'Sending…' : "I'm done — send these"}
+                </button>
+              )}
+            </div>
+          </div>
+          {confirmError && <p className="mx-auto mt-2 max-w-7xl text-xs text-red-400">{confirmError}</p>}
+        </div>
+      )}
+
       {data?.allow_download && (
         <div className="sticky bottom-0 z-30 border-t border-white/10 bg-[#0B0B0D]/95 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur sm:px-6">
           <div className="mx-auto flex max-w-7xl flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
             {selected.size > 0 ? (
               <div className="flex items-center gap-2 sm:gap-3">
                 <span className="font-mono text-xs text-sky-400">{selected.size} selected</span>
+                {(data?.offer_zip ?? !touch) && (
                 <button
                   onClick={() => downloadZip(true)}
                   className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-sky-500 px-4 py-2.5 text-sm font-medium text-black transition hover:bg-sky-400 sm:flex-none sm:py-2"
                 >
                   <Package className="h-4 w-4" /> Download {selected.size}
                 </button>
+                )}
                 <button onClick={clearSelection} className="px-2 py-2 text-xs text-zinc-500 hover:text-zinc-300">
                   Clear
                 </button>
@@ -495,18 +555,22 @@ export default function SharePage() {
               <button onClick={selectAll} className="px-2 py-2 text-xs text-zinc-400 hover:text-zinc-100">
                 Select all
               </button>
-              <button
-                onClick={() => downloadZip(false)}
-                className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-zinc-700 px-4 py-2.5 text-sm text-zinc-200 transition hover:bg-zinc-800 sm:flex-none sm:py-2"
-              >
-                <Package className="h-4 w-4" /> All ({videos.length})
-              </button>
+              {/* A zip is the wrong offer on a phone: iOS drops it into Files,
+                  not the camera roll. The server says which this is. */}
+              {(data?.offer_zip ?? !touch) && (
+                <button
+                  onClick={() => downloadZip(false)}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-zinc-700 px-4 py-2.5 text-sm text-zinc-200 transition hover:bg-zinc-800 sm:flex-none sm:py-2"
+                >
+                  <Package className="h-4 w-4" /> All ({videos.length})
+                </button>
+              )}
             </div>
           </div>
           {touch && (
             <p className="mx-auto mt-2 max-w-7xl text-[11px] leading-snug text-zinc-600">
-              Tap a clip to save it to your phone. A whole-folder download arrives as a
-              zip file in Files, not your photo library.
+              Tap a clip to save it to your phone — it goes straight to your photos.
+              {(data?.offer_zip ?? false) ? ' A whole-folder download arrives as a zip in Files instead.' : ''}
             </p>
           )}
         </div>

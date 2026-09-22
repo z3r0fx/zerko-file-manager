@@ -99,6 +99,17 @@ export default function SharesPage() {
                             <Heart className="h-3 w-3" fill="currentColor" />{sh.selects} picked
                           </span>
                         )}
+                        {sh.kind === 'receive' && (
+                          <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-300">receiving</span>
+                        )}
+                        {sh.kind === 'send' && sh.allow_download && !sh.allow_zip && (
+                          <span className="text-zinc-500">single files only</span>
+                        )}
+                        {sh.confirmed_at && (
+                          <span className="text-emerald-400">
+                            client finished {new Date(sh.confirmed_at).toLocaleDateString()}
+                          </span>
+                        )}
                         {sh.allow_upload && (
                           <span className="flex items-center gap-1 text-emerald-400">
                             <Inbox className="h-3 w-3" />

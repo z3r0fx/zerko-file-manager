@@ -35,6 +35,11 @@ from video_processor import scan_folder, format_file_size, format_duration, gene
 import previews
 import files_api
 import photo_proxy
+import activity
+import library_check
+import hdr
+import photo_edit
+import projects
 from media_type_utils import get_media_type
 from job_manager import job_manager
 
@@ -42,7 +47,7 @@ from job_manager import job_manager
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
 # Media root is configurable so the same code runs under WSL and natively on
-# Windows. Set MEDIA_ROOT to override (e.g. MEDIA_ROOT=D:\\Footage on Windows).
+# Windows. Set MEDIA_ROOT to override (e.g. MEDIA_ROOT=E:\\Shared on Windows).
 # Set by the setup wizard on first run; no sensible default exists
 # before someone tells us where their footage lives.
 _DEFAULT_MEDIA_ROOT = os.environ.get("MEDIA_ROOT") or str(Path.home() / "Videos")
@@ -57,12 +62,12 @@ def _build_root_markers():
     """Path prefixes that mean "this was the media root at the time".
 
     Rows hold absolute paths from whenever they were indexed. When the library
-    moves - a new drive letter, one folder to another, WSL to native Windows -
+    moves - a new drive letter, E:\\Shared to D:\\Media, WSL to native Windows -
     those stored paths stop resolving, and every clip 404s until someone
     reindexes.
 
-    This list used to be hardcoded to one fixed folder, so it silently
-    stopped covering the current root after a move. Deriving it
+    This list used to be hardcoded to the original E:\\Shared, so it silently
+    stopped covering the current root after the move to D:\\Media. Deriving it
     from MEDIA_ROOT means it keeps working through the next move too.
     """
     markers = []
@@ -70,7 +75,7 @@ def _build_root_markers():
     if cur:
         markers.append(cur.lower() + "/")
         # The same folder seen from the other side of the WSL boundary:
-        # /mnt/x/Footage <-> X:/Footage (any drive letter)
+        # e.g. /mnt/d/Media <-> D:/Media
         m = re.match(r"^/mnt/([a-z])/(.*)$", cur, re.I)
         if m:
             markers.append(f"{m.group(1).lower()}:/{m.group(2).lower()}/")
@@ -220,7 +225,7 @@ def trash_root() -> Path:
 
 
 def move_to_trash(real_path: str) -> str:
-    """Move a file into the media root's _Trash folder, keeping its structure.
+    """Move a file into D:\\Media\\_Trash, keeping its folder structure.
 
     Space is not reclaimed until the trash is emptied - that is the point. It
     makes pruning safe to do quickly, and the freed total is shown before you
@@ -246,7 +251,7 @@ def move_to_trash(real_path: str) -> str:
 def resolve_media_path(stored_path):
     """Map a path stored in the DB onto wherever the media root is now.
 
-    Existing rows hold WSL-style paths like /mnt/e/Footage/clip.mp4. If the
+    Existing rows hold WSL-style paths like /mnt/e/Shared/clip.mp4. If the
     server is later run natively on Windows those stop resolving, so re-root
     them onto UPLOAD_ROOT instead of 404-ing.
     """
@@ -268,6 +273,15 @@ def resolve_media_path(stored_path):
     return stored_path
 
 app = FastAPI(title="Zerko File Manager")
+
+# Bring the database up to date on import, not only when main.py is run
+# directly. Starting the app any other way (uvicorn, gunicorn, a service
+# wrapper) used to skip the migrations entirely, and the first request that
+# touched a new column failed with "no such column". init_db() is idempotent.
+try:
+    init_db()
+except Exception as _e:          # a broken migration must not stop the app
+    print(f"init_db at import failed: {_e}", flush=True)
 
 # SSE events queue for listeners
 import asyncio
@@ -402,12 +416,8 @@ def photo_preview(request: Request, video_id: int, token: Optional[str] = None,
 
 @app.get("/api/videos/{video_id}/download-token")
 def get_download_token(video_id: int, current_user: User = Depends(get_current_user)):
-    now = datetime.utcnow()
-    # Tokens are removed when used; ones that never were would pile up forever.
-    for stale in [k for k, v in download_tokens.items() if v["expires"] <= now]:
-        download_tokens.pop(stale, None)
     token = secrets.token_urlsafe(32)
-    download_tokens[token] = {"video_id": video_id, "expires": now + timedelta(seconds=60)}
+    download_tokens[token] = {"video_id": video_id, "expires": datetime.utcnow() + timedelta(seconds=60)}
     return {"token": token}
 
 @app.get("/api/video-file/{video_id}")
@@ -596,60 +606,6 @@ def login(request: LoginRequest, http_request: Request, db: Session = Depends(ge
     _login_attempts.pop(ip, None)
     token_data = create_access_token({"sub": user.username})
     return {"token": token_data["token"], "user": {"id": user.id, "username": user.username, "role": user.role}}
-
-
-# --- password recovery -------------------------------------------------------
-# Being at the machine is the proof of ownership: a one-off code is printed in
-# the Zerko window, and anyone who can read it can set a new password from the
-# login page. Passwords themselves are stored only as one-way hashes, so they
-# can never be shown - a reset is the only way back in.
-#
-# The code changes every time the server starts and after every successful
-# use. Guessing it is capped for everyone at once, so it cannot be brute-forced
-# over the network; restarting Zerko lifts the cap.
-_RECOVERY_CODE = secrets.token_urlsafe(6)
-_recovery_fails = []
-_RECOVERY_MAX_FAILS = 10
-_WEAK_PASSWORDS = {"admin123", "password", "123456789", "changeme", "zerko1234",
-                   "password123", "qwerty123", "zerko12345"}
-
-
-@app.post("/api/recover")
-def recover_password(payload: dict = Body(...), db: Session = Depends(get_db)):
-    global _RECOVERY_CODE
-    now = datetime.utcnow().timestamp()
-    _recovery_fails[:] = [t for t in _recovery_fails if now - t < _LOGIN_WINDOW]
-    if len(_recovery_fails) >= _RECOVERY_MAX_FAILS:
-        raise HTTPException(status_code=429, detail=(
-            "Too many wrong recovery codes. Restart Zerko and try again."))
-
-    supplied = str((payload or {}).get("code") or "").strip()
-    if not secrets.compare_digest(supplied.encode(), _RECOVERY_CODE.encode()):
-        _recovery_fails.append(now)
-        raise HTTPException(status_code=401, detail=(
-            "That recovery code is not right. It is printed in the Zerko window."))
-
-    username = str((payload or {}).get("username") or "").strip()
-    new = str((payload or {}).get("new_password") or "")
-    if len(new) < 10:
-        raise HTTPException(status_code=400, detail="Use at least 10 characters.")
-    if new.lower() in _WEAK_PASSWORDS:
-        raise HTTPException(status_code=400, detail="That password is far too common.")
-    user = db.query(User).filter(User.username == username).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="There is no account with that username.")
-
-    user.hashed_password = get_password_hash(new)
-    user.is_active = True
-    revoke_sessions(user)
-    db.commit()
-
-    # Single use: whoever saw the old code cannot reuse it.
-    _RECOVERY_CODE = secrets.token_urlsafe(6)
-    _login_attempts.clear()                     # lift any sign-in lockout too
-    print(f"[auth] password reset for '{user.username}' using the recovery code. "
-          f"New recovery code: {_RECOVERY_CODE}", flush=True)
-    return {"message": "Password changed. Sign in with the new one."}
 
 
 @app.post("/api/me/password")
@@ -1031,6 +987,7 @@ def list_folders_tree(db: Session = Depends(get_db), current_user: User = Depend
             "total_count": own + sum(k["total_count"] for k in kids),
             "by_type": own_types,
             "total_by_type": total_types,
+            "created_in_app": bool(folder.created_in_app),
             "children": kids,
         }
 
@@ -1435,7 +1392,66 @@ def create_folder(payload: dict = Body(...), db: Session = Depends(get_db), curr
     row = ensure_folder_row(db, target)
     if not row:
         raise HTTPException(status_code=500, detail="Folder created on disk but could not be indexed")
-    return {"id": row.id, "name": row.name, "path": row.path}
+    # Remember that a person made this one, so the sidebar keeps showing it
+    # while it is still empty (see /api/folders/tree).
+    row.created_in_app = datetime.utcnow()
+    db.commit()
+    return {"id": row.id, "name": row.name, "path": row.path,
+            "parent_id": row.parent_id, "created_in_app": True}
+
+@app.post("/api/videos/copy")
+def copy_videos_to_folder(payload: dict = Body(...), db: Session = Depends(get_db),
+                          current_user: User = Depends(get_current_user)):
+    """Copy files into a folder - the paste half of copy and paste.
+
+    A real copy on disk, indexed as new entries, so the original stays where
+    it was. Moving is the other endpoint; this one exists because "put these
+    in the project as well" is a different intent from "put them there".
+    """
+    ids = [int(i) for i in (payload or {}).get("video_ids", [])][:2000]
+    folder_id = (payload or {}).get("folder_id")
+    if not ids:
+        raise HTTPException(status_code=400, detail="Nothing to copy")
+
+    folder = db.query(IndexedFolder).filter(IndexedFolder.id == folder_id).first() if folder_id else None
+    target = Path(resolve_media_path(folder.path)) if folder and folder.path else UPLOAD_ROOT
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail="That folder is not on disk")
+
+    made, failed = [], []
+    for vid in ids:
+        v = db.query(Video).filter(Video.id == vid).first()
+        if not v:
+            continue
+        src = resolve_media_path(v.filepath)
+        if not src or not os.path.exists(src):
+            failed.append(f"{v.filename}: not on disk")
+            continue
+        dest = target / os.path.basename(v.filename or os.path.basename(src))
+        stem, ext = os.path.splitext(dest.name)
+        n = 2
+        while dest.exists():
+            dest = target / f"{stem} ({n}){ext}"
+            n += 1
+        try:
+            shutil.copy2(src, dest)
+        except Exception as e:
+            failed.append(f"{v.filename}: {e}")
+            continue
+
+        now = datetime.utcnow()
+        row = Video(filename=dest.name, filepath=str(dest),
+                    file_size=os.path.getsize(dest), duration=v.duration or 0.0,
+                    thumbnail_path=v.thumbnail_path, folder_id=folder.id if folder else None,
+                    media_type=v.media_type, status=v.status or "raw",
+                    created_at=v.created_at or now, uploaded_at=now,
+                    shoot_date=v.shoot_date, uploaded_by="copy")
+        db.add(row)
+        db.commit()
+        made.append(row.id)
+
+    return {"copied": len(made), "ids": made, "failed": failed[:20]}
+
 
 @app.post("/api/videos/{video_id}/folder")
 def move_video_to_folder(video_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -3278,6 +3294,9 @@ def _share_payload(db: Session, share: Share):
         "allow_download": bool(share.allow_download),
         "allow_selects": bool(share.allow_selects),
         "allow_upload": bool(share.allow_upload),
+        "kind": share.kind or ("both" if share.allow_upload else "send"),
+        "confirmed_at": share.confirmed_at.isoformat() if share.confirmed_at else None,
+        "allow_zip": True if share.allow_zip is None else bool(share.allow_zip),
         "intake_folder_id": share.intake_folder_id,
         "upload_folder": _share_folder_name(db, share),
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
@@ -3303,14 +3322,32 @@ def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
 
     folder_id = payload.get("folder_id")
     video_ids = payload.get("video_ids") or []
-    # An upload-only link is legitimate with neither: it starts empty and
-    # fills up from a phone, so it needs no folder and no selection.
-    if folder_id is None and not video_ids and not payload.get("allow_upload"):
+    # A receiving portal is legitimate with neither: it starts empty and fills
+    # up from whoever you send it to, so it needs no folder and no selection.
+    receiving = (bool(payload.get("allow_upload"))
+                 or (payload.get("kind") or "").strip().lower() == "receive")
+    if folder_id is None and not video_ids and not receiving:
         raise HTTPException(status_code=400, detail="Share a folder or a selection")
     # An upload link gets a holding folder of its own rather than writing
     # straight into the library. Whatever a phone sends stays there until
     # someone at a desk looks at it and decides where it belongs - which is
     # the difference between an inbox and a mess.
+    # A portal is one of three things. Older callers only sent allow_upload /
+    # allow_download, so infer the kind when it is not stated.
+    kind = (payload.get("kind") or "").strip().lower()
+    if kind not in ("send", "receive", "both"):
+        if payload.get("allow_upload") and (folder_id is None and not video_ids):
+            kind = "receive"
+        elif payload.get("allow_upload"):
+            kind = "both"
+        else:
+            kind = "send"
+    # A receiving portal shows nothing of the library, whatever else was asked
+    # for - that is the whole point of it.
+    if kind == "receive":
+        payload = {**payload, "allow_upload": True,
+                   "allow_download": False, "allow_selects": False}
+
     intake_id = None
     if payload.get("allow_upload"):
         intake_id = _intake_folder(db, payload.get("title") or "Uploads")
@@ -3341,6 +3378,10 @@ def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
         allow_download=bool(payload.get("allow_download", False)),
         allow_selects=bool(payload.get("allow_selects", True)),
         allow_upload=bool(payload.get("allow_upload", False)),
+        kind=kind,
+        # Default on for a desktop audience; a portal meant for a phone is
+        # better without it, because a zip lands in Files, not the camera roll.
+        allow_zip=bool(payload.get("allow_zip", True)),
         intake_folder_id=intake_id,
         created_by=current_user.username,
     )
@@ -3374,6 +3415,10 @@ def list_shares(db: Session = Depends(get_db),
             "last_viewed_at": sh.last_viewed_at.isoformat() if sh.last_viewed_at else None,
             "selects": picked,
             "allow_upload": bool(sh.allow_upload),
+            "kind": sh.kind or ("both" if sh.allow_upload else "send"),
+            "confirmed_at": sh.confirmed_at.isoformat() if sh.confirmed_at else None,
+            "confirmed_by": sh.confirmed_by,
+            "allow_zip": True if sh.allow_zip is None else bool(sh.allow_zip),
             "uploads": sh.upload_count or 0,
             "intake_folder_id": sh.intake_folder_id,
             # How much is sitting in the inbox right now - uploads counts
@@ -3557,14 +3602,99 @@ def export_picks_csv(share_id: int, token: Optional[str] = None,
 
 # --- public endpoints (no account) -----------------------------------------
 
+@app.get("/api/upload/destinations")
+def upload_destinations(current_user: User = Depends(get_current_user)):
+    """Where an upload can go, so the Upload page can offer a choice.
+
+    Two stores, deliberately: the media drive is the catalogued library -
+    everything there is indexed, thumbnailed, tagged and transcribed. The file
+    drive is a plain shared store for documents, archives and anything that is
+    not footage, where none of that machinery would make sense.
+    """
+    out = [{
+        "id": "media",
+        "name": "Media drive",
+        "path": str(UPLOAD_ROOT),
+        "description": ("Indexed, thumbnailed, tagged and transcribed. "
+                        "Video, photos and audio belong here."),
+        "auto_processing": True,
+    }]
+    try:
+        import files_api
+        out.append({
+            "id": "files",
+            "name": "File drive",
+            "path": str(files_api.files_root()),
+            "description": ("A plain shared store. Documents, archives, "
+                            "anything that is not footage."),
+            "auto_processing": False,
+            "api": "/api/files",
+        })
+    except Exception as e:
+        print(f"[upload] file drive unavailable: {e}", flush=True)
+    return {"destinations": out, "default": "media"}
+
+
+def _process_new_upload(video_id: int, media_type: str, auto: bool = True):
+    """Everything a newly arrived file should have done to it, in the
+    background.
+
+    Without this a file that comes in through a portal sits untagged and
+    untranscribed until somebody happens to run a scan - which is exactly the
+    footage most likely to be forgotten, because nobody at a desk watched it
+    arrive.
+    """
+    if not auto:
+        return
+
+    def run():
+        try:
+            if media_type in ("video", "audio"):
+                job_manager.add_job(video_id, "transcribe")
+            if media_type == "video":
+                job_manager.add_job(video_id, "proxy")
+        except Exception as e:
+            print(f"[upload] could not queue jobs for {video_id}: {e}", flush=True)
+        try:
+            import enrich
+            enrich.run_tagging(progress=None, include_transcripts=False)
+        except Exception as e:
+            print(f"[upload] tagging after upload failed: {e}", flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _looks_like_a_phone(request: Request) -> bool:
+    """A phone and a desktop want different things from the same link.
+
+    On a desktop a zip of the whole folder is the sensible offer. On a phone
+    it is the wrong one: iOS drops a zip into Files, not the camera roll, so
+    the useful action there is saving clips one at a time. The page can only
+    make that choice if it knows, and the User-Agent is the only signal a
+    plain link carries.
+    """
+    ua = (request.headers.get("user-agent") or "").lower()
+    if "ipad" in ua or "tablet" in ua:
+        return False
+    return any(s in ua for s in
+               ("iphone", "ipod", "android", "mobile", "windows phone"))
+
+
 @app.get("/api/public/share/{token}")
-def public_share(token: str, password: Optional[str] = None,
+def public_share(token: str, request: Request, password: Optional[str] = None,
                  db: Session = Depends(get_db)):
     share = _share_state(db, token, password)
     share.view_count = (share.view_count or 0) + 1
     share.last_viewed_at = datetime.utcnow()
     db.commit()
-    return _share_payload(db, share)
+    payload = _share_payload(db, share)
+    phone = _looks_like_a_phone(request)
+    payload["on_phone"] = phone
+    # What the page should actually offer. A zip is pointless on a phone even
+    # when the portal allows one, so the answer is not simply allow_zip.
+    payload["offer_zip"] = bool(payload.get("allow_zip", True)) and not phone
+    payload["offer_single_files"] = bool(payload.get("allow_download"))
+    return payload
 
 
 @app.get("/api/public/share/{token}/thumb/{video_id}")
@@ -3631,6 +3761,121 @@ def public_stream(token: str, video_id: int, password: Optional[str] = None,
 
 
 
+def _zip_stream(entries, download_name: str):
+    """Stream a list of (path, name) out as one ZIP, a chunk at a time.
+
+    These are 250MB+ masters and a selection can be twenty of them: building
+    the archive in memory, or writing a temp file first, would mean gigabytes
+    and a browser sitting on nothing for minutes. This starts sending at once
+    and holds a single chunk.
+
+    ZIP_STORED because photos and video are already compressed - deflate would
+    burn CPU for roughly no saving, and stored entries stream cleanly.
+    """
+    import zipfile
+
+    class _Sink:
+        """Collects what ZipFile writes so the generator can hand it out."""
+        def __init__(self):
+            self.buf = bytearray()
+        def write(self, data):
+            self.buf.extend(data)
+            return len(data)
+        def flush(self):
+            pass
+        def take(self):
+            out = bytes(self.buf)
+            self.buf.clear()
+            return out
+
+    def stream():
+        sink = _Sink()
+        zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+        try:
+            for path, name in entries:
+                try:
+                    with zf.open(name, "w") as dest, open(path, "rb") as src:
+                        while True:
+                            chunk = src.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dest.write(chunk)
+                            data = sink.take()
+                            if data:
+                                yield data
+                except (OSError, ValueError) as e:
+                    print(f"  [zip] skipped {name}: {e}")
+                    continue
+                data = sink.take()
+                if data:
+                    yield data
+        finally:
+            zf.close()
+            tail = sink.take()
+            if tail:
+                yield tail
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", download_name or "files")[:60]
+    return StreamingResponse(
+        stream(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe}.zip"',
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _zip_entries(videos):
+    """(path, name) for each file that is really on disk, names made unique."""
+    entries, used = [], set()
+    for v in videos:
+        path = resolve_media_path(v.filepath)
+        if not path or not os.path.exists(path):
+            continue
+        name = os.path.basename(v.filename or f"clip_{v.id}")
+        base, ext = os.path.splitext(name)
+        n = 2
+        while name.lower() in used:
+            name = f"{base} ({n}){ext}"
+            n += 1
+        used.add(name.lower())
+        entries.append((path, name))
+    return entries
+
+
+@app.get("/api/download-zip")
+def download_selection_zip(request: Request, ids: str, token: Optional[str] = None,
+                           db: Session = Depends(get_db)):
+    """Several files as one ZIP - what a multi-item drag out of the library grabs.
+
+    The token rides in the query string because the thing fetching this is
+    Windows Explorer or Finder, not our own fetch(), and neither of them will
+    send an Authorization header.
+    """
+    if token:
+        get_user_from_token(token, db, check_session=False)
+    else:
+        auth = request.headers.get("Authorization")
+        if not auth or not auth.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+        get_user_from_token(auth[7:], db)
+
+    try:
+        wanted = [int(x) for x in ids.split(",") if x.strip()][:500]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad id list")
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Nothing to download")
+
+    found = {v.id: v for v in db.query(Video).filter(Video.id.in_(wanted)).all()}
+    videos = [found[i] for i in wanted if i in found]
+    entries = _zip_entries(videos)
+    if not entries:
+        raise HTTPException(status_code=404, detail="None of those files are on disk")
+    return _zip_stream(entries, f"zerko-{len(entries)}-files")
+
+
 @app.get("/api/public/share/{token}/download-zip")
 def public_download_zip(token: str, ids: Optional[str] = None,
                         password: Optional[str] = None,
@@ -3646,6 +3891,12 @@ def public_download_zip(token: str, ids: Optional[str] = None,
     ZIP_STORED (no compression) because video is already compressed: deflate
     would burn CPU for roughly zero saving, and stored entries stream cleanly.
     """
+    share_for_zip = _share_state(db, token, password)
+    if not (True if share_for_zip.allow_zip is None else share_for_zip.allow_zip):
+        raise HTTPException(
+            status_code=403,
+            detail="This portal hands out files one at a time, not as an archive.")
+
     import zipfile
 
     share = _share_state(db, token, password)
@@ -3828,6 +4079,30 @@ def file_intake(share_id: int, payload: dict = Body(...),
             "folder_id": folder.id, "failed": failed}
 
 
+@app.post("/api/public/share/{token}/confirm")
+def public_confirm(token: str, payload: dict = Body(None),
+                   db: Session = Depends(get_db)):
+    """The viewer saying they have finished.
+
+    Picks and notes were already saved the moment they were made - but nothing
+    ever told the viewer that, so they had no way of knowing whether a tick or
+    a typed note had reached anybody. This is the receipt: it records who
+    finished and when, and gives the page something definite to show.
+    """
+    share = _share_state(db, token, (payload or {}).get("password"))
+    who = ((payload or {}).get("viewer_name") or "").strip()[:60] or None
+    share.confirmed_at = datetime.utcnow()
+    share.confirmed_by = who
+    db.commit()
+
+    picks = sum(1 for s in share.selects if s.picked)
+    notes = sum(1 for s in share.selects if (s.comment or "").strip())
+    return {"status": "ok", "confirmed_at": share.confirmed_at.isoformat(),
+            "picks": picks, "notes": notes,
+            "message": f"{picks} pick{'' if picks == 1 else 's'}"
+                       f" and {notes} note{'' if notes == 1 else 's'} sent."}
+
+
 @app.post("/api/public/share/{token}/upload")
 def public_upload(token: str,
                   file: UploadFile = File(...),
@@ -3898,6 +4173,7 @@ def public_upload(token: str,
         db.rollback()
         raise HTTPException(status_code=409, detail="Could not save that file")
     db.refresh(video)
+    _process_new_upload(video.id, video.media_type)
     return {"status": "ok", "id": video.id, "filename": video.filename,
             "media_type": video.media_type, "size": video.file_size}
 
@@ -3975,6 +4251,11 @@ files_api.install(app, UPLOAD_ROOT)
 
 # Photo export: 16:9 copies of photos as a ZIP, plus saved per-photo framing.
 photo_proxy.install(app, UPLOAD_ROOT, resolve_media_path)
+activity.install(app)
+library_check.install(app, UPLOAD_ROOT, resolve_media_path)
+hdr.install(app, UPLOAD_ROOT, resolve_media_path)
+photo_edit.install(app, UPLOAD_ROOT, resolve_media_path)
+projects.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
 
 
 # --- first-run setup -------------------------------------------------------
@@ -3989,8 +4270,16 @@ except Exception as _e:
     print(f"  [!] Could not initialise the database: {_e}")
 
 try:
-    from setup_routes import router as _setup_router, setup_needed, setup_code
+    from setup_routes import (
+        router as _setup_router,
+        page_router as _setup_page_router,
+        install_setup_gate,
+        setup_needed,
+        setup_code,
+    )
     app.include_router(_setup_router)
+    app.include_router(_setup_page_router)
+    install_setup_gate(app)
     if setup_needed():
         print("")
         print("  No account yet - open the app in your browser to set it up.")
@@ -4072,19 +4361,6 @@ if __name__ == "__main__":
     print("  ------------------")
     print(f"  Media root : {UPLOAD_ROOT}")
     print(f"  Listening  : http://{host}:{port}")
-    try:
-        _db = SessionLocal()
-        try:
-            _accounts = [f"{u.username} ({u.role})" for u in _db.query(User).order_by(User.id)]
-        finally:
-            _db.close()
-    except Exception:
-        _accounts = []
-    if _accounts:
-        print(f"  Accounts   : {', '.join(_accounts)}")
-        print("  Passwords are stored scrambled and cannot be shown - if one is")
-        print("  forgotten, use 'Forgot password?' on the login page with this code:")
-        print(f"  Recovery code : {_RECOVERY_CODE}")
     print("")
 
     # NOTE: stays at a single worker on purpose - job_manager runs in-process,

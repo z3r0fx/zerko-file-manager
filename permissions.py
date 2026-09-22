@@ -87,22 +87,55 @@ RULES = [
     # sign in and out, change their own password, and mint the short-lived
     # tokens their browser needs to play back what they can already see.
     (ANY, r"^/api/(login|logout|me|me/password|video-access-token)$", None),
+    # Pasting a copy makes new files; pasting a move only reorganises.
+    (("POST",), r"^/api/videos/copy$", UPLOAD),
     (ANY, r"^/api/videos/\d+/download-token$", DOWNLOAD),
+    # Dragging a selection out of the library to the desktop.
+    (("GET",), r"^/api/download-zip$", DOWNLOAD),
     # Public share links carry their own token and are not user sessions.
     (ANY, r"^/api/public/", None),
 
     # Admin surface.
     (ANY, r"^/api/(admin|updates|duplicates)(/|$)", ADMIN),
     (ANY, r"^/api/(security-check|server-stats)$", ADMIN),
+    (ANY, r"^/api/library-check(/|$)", ADMIN),
     (ANY, r"^/api/tags/(rules|auto-generate)$", ADMIN),
     (ANY, r"^/api/videos/\d+/reveal$", ADMIN),
     (("POST",), r"^/api/thumbnails/repair$", ADMIN),
+    (("GET",), r"^/api/upload/destinations$", UPLOAD),
+    (("POST",), r"^/api/photo-match$", ANNOTATE),
     (ANY, r"^/api/videos/\d+/location$", ORGANISE),
 
     # Accounts. Creating one is checked again inside the endpoint, which is
     # what stops an editor minting an editor.
     (("POST",), r"^/api/register$", CREATE_CLIENTS),
     (ANY, r"^/api/users(/|$)", ADMIN),
+
+    # The bell: reading what happened, and marking it read.
+    (ANY, r"^/api/activity(/|$)", READ),
+
+    # The photo editor: reading a photo and its recipe is a read; saving a
+    # recipe annotates it; exporting writes a new file.
+    (("GET",), r"^/api/photo-edit/\d+(/base|/auto|/tile)?$", READ),
+    (("GET",), r"^/api/photo-edit-batch/[\w-]+$", READ),
+    (("POST",), r"^/api/photo-edit-batch(/|$)", UPLOAD),
+    (("POST", "DELETE"), r"^/api/photo-edit/\d+$", ANNOTATE),
+    (("POST",), r"^/api/photo-edit/\d+/(pick|stars)$", ANNOTATE),
+    (("POST",), r"^/api/photo-edit/\d+/export$", UPLOAD),
+    # Presets and copying settings onto other photos are annotations: they
+    # change no file on disk.
+    (("GET",), r"^/api/photo-presets$", READ),
+    (("POST", "DELETE"), r"^/api/photo-presets(/|$)", ANNOTATE),
+
+    # Projects: looking is a read, making or filling one reorganises files.
+    (("GET",), r"^/api/projects(/|$)", READ),
+    (("POST", "DELETE"), r"^/api/projects(/|$)", ORGANISE),
+
+    # Fusing brackets writes new photos into the library.
+    # Installing the RAW decoder is an admin job; asking whether it is
+    # there is not.
+    (("GET",), r"^/api/hdr/raw-support$", READ),
+    (ANY, r"^/api/hdr(/|$)", UPLOAD),
 
     # Machine time.
     (ANY, r"^/api/proxies(/|$)", PROXY),

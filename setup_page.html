@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Set up Zerko File Manager</title>
+<style>
+  :root{--bg:#0a0a0c;--card:#141417;--line:#2a2a30;--ink:#ececef;--dim:#8a8a92;
+        --accent:#ff5c1f;--ok:#34c759;--bad:#ff4d4d}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+       padding:max(16px,env(safe-area-inset-top)) 16px 32px}
+  .wrap{max-width:640px;margin:0 auto}
+  h1{font-size:20px;margin:24px 0 4px}
+  p.sub{color:var(--dim);margin:0 0 24px;font-size:13px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+        padding:18px;margin-bottom:14px}
+  .step{display:flex;gap:10px;align-items:center;margin-bottom:18px;font-size:12px;color:var(--dim)}
+  .dot{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;
+       border:1px solid var(--line);font-size:11px;flex:none}
+  .dot.on{background:var(--accent);border-color:var(--accent);color:#0b0b0d;font-weight:700}
+  .dot.done{border-color:var(--ok);color:var(--ok)}
+  label{display:block;font-size:12px;color:var(--dim);margin:12px 0 4px}
+  input[type=text],input[type=password]{width:100%;padding:11px 12px;border-radius:8px;
+        border:1px solid var(--line);background:#0e0e11;color:var(--ink);font-size:16px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);
+         background:#1b1b20;color:var(--ink);padding:11px 16px}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#0b0b0d;font-weight:600}
+  button:disabled{opacity:.45;cursor:default}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+  .list{border:1px solid var(--line);border-radius:8px;max-height:46vh;overflow:auto;margin-top:8px}
+  .item{display:flex;justify-content:space-between;gap:10px;padding:11px 12px;
+        border-bottom:1px solid var(--line);cursor:pointer;font-size:14px}
+  .item:last-child{border-bottom:0}
+  .item:hover{background:#1b1b20}
+  .item .meta{color:var(--dim);font-size:12px;white-space:nowrap}
+  .here{font-family:ui-monospace,monospace;font-size:12px;color:var(--dim);
+        word-break:break-all;margin-top:10px}
+  .err{color:var(--bad);font-size:13px;margin-top:10px}
+  .ok{color:var(--ok);font-size:13px;margin-top:10px}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">Set up Zerko File Manager</h1>
+  <p class="sub">Three things, once. Nothing leaves this machine.</p>
+
+  <div class="step">
+    <span class="dot on" id="d1">1</span><span id="l1">Your account</span>
+    <span class="dot" id="d2">2</span><span id="l2">Where the media lives</span>
+    <span class="dot" id="d3">3</span><span id="l3">Finish</span>
+  </div>
+
+  <!-- code, only when set up from another machine -->
+  <div class="card hide" id="codeCard">
+    <label>Setup code</label>
+    <p class="sub" style="margin:0 0 8px">
+      You are setting this up from another device, so Zerko printed a code in its
+      window on the machine itself. Type it here.
+    </p>
+    <input type="text" id="code" autocomplete="off" inputmode="numeric">
+  </div>
+
+  <!-- 1. account -->
+  <div class="card" id="s1">
+    <label>Username</label>
+    <input type="text" id="u" autocomplete="username">
+    <label>Password <span style="color:#5a5a62">(at least 10 characters)</span></label>
+    <input type="password" id="p" autocomplete="new-password">
+    <label>Confirm password</label>
+    <input type="password" id="p2" autocomplete="new-password">
+    <div class="err hide" id="e1"></div>
+    <div class="row"><button class="primary" id="n1">Continue</button></div>
+  </div>
+
+  <!-- 2. folder -->
+  <div class="card hide" id="s2">
+    <p class="sub" style="margin:0">
+      Pick the folder your footage already lives in. Zerko reads it - it never
+      moves or renames anything.
+    </p>
+    <div class="here" id="here"></div>
+    <div class="list" id="list"></div>
+    <div class="err hide" id="e2"></div>
+    <div class="row">
+      <button id="up">Up one level</button>
+      <button id="drives">Drives</button>
+      <button class="primary" id="n2">Use this folder</button>
+      <button id="b2">Back</button>
+    </div>
+  </div>
+
+  <!-- 3. done -->
+  <div class="card hide" id="s3">
+    <p id="summary" class="sub" style="margin:0"></p>
+    <div class="err hide" id="e3"></div>
+    <div class="ok hide" id="o3"></div>
+    <div class="row">
+      <button class="primary" id="go">Finish setup</button>
+      <button id="b3">Back</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Deliberately plain: no build step, no framework. This page has to work on a
+// fresh machine before anything else exists, so it cannot depend on the app's
+// compiled bundle - which is exactly how it used to break.
+var $ = function (id) { return document.getElementById(id); };
+var state = { path: "", user: "", pass: "" };
+
+function api(url, opts) {
+  opts = opts || {};
+  var code = ($("code") && $("code").value || "").trim();
+  opts.headers = Object.assign({ "Content-Type": "application/json" },
+                               opts.headers || {},
+                               code ? { "X-Setup-Code": code } : {});
+  return fetch(url, opts).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok) throw new Error(j.detail || ("Failed (" + r.status + ")"));
+      return j;
+    });
+  });
+}
+function show(n) {
+  ["s1","s2","s3"].forEach(function (id, i) {
+    $(id).classList.toggle("hide", i !== n - 1);
+    var d = $("d" + (i + 1));
+    d.className = "dot" + (i + 1 === n ? " on" : (i + 1 < n ? " done" : ""));
+  });
+  window.scrollTo(0, 0);
+}
+function fail(id, msg) { var e = $(id); e.textContent = msg; e.classList.remove("hide"); }
+function clear(id) { $(id).classList.add("hide"); }
+
+// --- step 1 ---------------------------------------------------------------
+$("n1").onclick = function () {
+  clear("e1");
+  var u = $("u").value.trim(), p = $("p").value, p2 = $("p2").value;
+  if (u.length < 2) return fail("e1", "Pick a username.");
+  if (p.length < 10) return fail("e1", "Use at least 10 characters.");
+  if (p !== p2) return fail("e1", "The two passwords do not match.");
+  state.user = u; state.pass = p;
+  show(2); loadDrives();
+};
+
+// --- step 2 ---------------------------------------------------------------
+function row(label, meta, onClick) {
+  var d = document.createElement("div");
+  d.className = "item";
+  var a = document.createElement("span"); a.textContent = label;
+  var b = document.createElement("span"); b.className = "meta"; b.textContent = meta || "";
+  d.appendChild(a); d.appendChild(b); d.onclick = onClick;
+  return d;
+}
+function loadDrives() {
+  clear("e2"); $("here").textContent = "";
+  api("/api/setup/drives").then(function (j) {
+    var list = $("list"); list.innerHTML = "";
+    (j.drives || []).forEach(function (dr) {
+      list.appendChild(row(dr.label,
+        dr.free_formatted + " free of " + dr.total_formatted,
+        function () { open_(dr.path); }));
+    });
+    if (!list.children.length) fail("e2", "No drives found.");
+  }).catch(function (e) { fail("e2", e.message); });
+}
+function open_(path) {
+  clear("e2");
+  api("/api/setup/browse?path=" + encodeURIComponent(path || "")).then(function (j) {
+    state.path = j.path;
+    $("here").textContent = j.path + (j.direct_media ? "   —   " + j.direct_media + " media files here" : "");
+    var list = $("list"); list.innerHTML = "";
+    (j.folders || []).forEach(function (f) {
+      var name = f.name || f.path || f;
+      var meta = (f.direct_media != null) ? (f.direct_media + " files") : "";
+      list.appendChild(row(name, meta, function () { open_(f.path || (j.path + "/" + name)); }));
+    });
+    if (!list.children.length) {
+      var d = document.createElement("div");
+      d.className = "item"; d.style.cursor = "default";
+      d.textContent = "No subfolders here.";
+      list.appendChild(d);
+    }
+  }).catch(function (e) { fail("e2", e.message); });
+}
+$("up").onclick = function () {
+  if (!state.path) return loadDrives();
+  api("/api/setup/browse?path=" + encodeURIComponent(state.path)).then(function (j) {
+    if (j.parent) open_(j.parent); else loadDrives();
+  }).catch(function (e) { fail("e2", e.message); });
+};
+$("drives").onclick = loadDrives;
+$("b2").onclick = function () { show(1); };
+$("n2").onclick = function () {
+  if (!state.path) return fail("e2", "Pick a folder first.");
+  $("summary").textContent =
+    "Account " + state.user + ", media in " + state.path +
+    ". Finishing will index what is already there - that runs in the background "
+    + "and you can use Zerko while it does.";
+  show(3);
+};
+
+// --- step 3 ---------------------------------------------------------------
+$("b3").onclick = function () { show(2); };
+$("go").onclick = function () {
+  clear("e3"); $("go").disabled = true; $("go").textContent = "Setting up…";
+  api("/api/setup/complete", {
+    method: "POST",
+    body: JSON.stringify({ username: state.user, password: state.pass, media_root: state.path })
+  }).then(function (j) {
+    $("o3").textContent = j.restart_required
+      ? "Done. Close this window and start Zerko again."
+      : "Done. Taking you to Zerko…";
+    $("o3").classList.remove("hide");
+    if (!j.restart_required) setTimeout(function () { location.href = "/"; }, 1400);
+  }).catch(function (e) {
+    fail("e3", e.message);
+    $("go").disabled = false; $("go").textContent = "Finish setup";
+  });
+};
+
+// --- start ----------------------------------------------------------------
+fetch("/api/setup/status").then(function (r) { return r.json(); }).then(function (j) {
+  if (!j.needs_setup) { location.href = "/"; return; }
+  if (j.app_name) { $("title").textContent = "Set up " + j.app_name; document.title = "Set up " + j.app_name; }
+  if (j.code_required) $("codeCard").classList.remove("hide");
+}).catch(function () { /* the page still works; the API will complain if it must */ });
+</script>
+</body>
+</html>

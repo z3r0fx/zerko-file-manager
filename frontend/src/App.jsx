@@ -9,7 +9,6 @@ import DashboardPage from './pages/DashboardPage';
 import UploadPage from './pages/UploadPage';
 import AdminPage from './pages/AdminPage';
 import LoginPage from './pages/LoginPage';
-import SetupWizard from './pages/SetupWizard';
 import SharePage from './pages/SharePage';
 import FilesPage from './pages/FilesPage';
 import FileSharePage from './pages/FileSharePage';
@@ -32,18 +31,6 @@ export default function App() {
 
 function AppContent() {
   const { user, loading } = useContext(AuthContext);
-  const [needsSetup, setNeedsSetup] = useState(false);
-  const [setupChecked, setSetupChecked] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch('/api/setup/status')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (!cancelled && d) setNeedsSetup(!!d.needs_setup); })
-      .catch(() => { /* older build without the wizard - carry on to login */ })
-      .finally(() => { if (!cancelled) setSetupChecked(true); });
-    return () => { cancelled = true; };
-  }, []);
   const { cursor } = useAppearance();
   const { can } = useContext(AuthContext);
   const [sortBy, setSortBy] = useState('date');
@@ -69,17 +56,12 @@ function AppContent() {
     return () => document.body.classList.remove('custom-cursor');
   }, [user, onSharePage, cursor]);
 
-  if (loading || !setupChecked) {
+  if (loading) {
     return (
       <div className="h-screen flex items-center justify-center bg-zinc-950 text-zinc-100">
         Loading...
       </div>
     );
-  }
-
-  // A database with no accounts means nobody has set this up yet.
-  if (needsSetup) {
-    return <SetupWizard onComplete={() => window.location.reload()} />;
   }
 
   if (!user) {

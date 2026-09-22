@@ -52,6 +52,10 @@ export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
   const playingRef = useRef(false);
   const rest = useRef(restingShape(audio.id));
   const scrubbing = useRef(false);
+  const rootRef = useRef(null);
+  const fillRef = useRef(null);
+  const knobRef = useRef(null);
+  const [compact, setCompact] = useState(false);
 
   const ensure = useCallback(() => {
     if (elRef.current) return elRef.current;
@@ -105,6 +109,15 @@ export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
   useEffect(() => { if (elRef.current) { elRef.current.loop = loop; } }, [loop]);
   useEffect(() => { if (elRef.current) { elRef.current.volume = volume; elRef.current.muted = muted; } }, [volume, muted]);
 
+  // narrow or short tiles: keep the times, drop the loop / mute buttons
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => setCompact(el.clientWidth < 250 || el.clientHeight < 128));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   // the equaliser
   useEffect(() => {
     let t0 = performance.now();
@@ -133,6 +146,9 @@ export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
         bar.style.opacity = passed ? '1' : (live ? '0.55' : '0.45');
         bar.style.backgroundColor = passed ? 'rgb(var(--accent-rgb))' : 'rgb(var(--z-500))';
       }
+      const pct = `${(Math.max(0, Math.min(1, p)) * 100).toFixed(2)}%`;
+      if (fillRef.current) fillRef.current.style.width = pct;
+      if (knobRef.current) knobRef.current.style.left = pct;
       rafRef.current = requestAnimationFrame(draw);
     };
     rafRef.current = requestAnimationFrame(draw);
@@ -163,7 +179,7 @@ export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
   const shown = playing || time.t > 0 ? fmt(time.t) : '0:00';
 
   return (
-    <div className="absolute inset-0 flex flex-col bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 pb-2 pt-3"
+    <div ref={rootRef} className="absolute inset-0 flex flex-col bg-gradient-to-b from-zinc-900 to-zinc-950 px-3 pb-2 pt-3"
          onClick={stop} onDoubleClick={stop} draggable={false}>
       {/* equaliser / scrub bar */}
       <div
@@ -183,24 +199,55 @@ export default function AudioPlayer({ audio, volume = 0.5, onTogglePlay }) {
         ))}
       </div>
 
-      {/* transport */}
-      <div className="mt-2 flex shrink-0 items-center gap-2">
+      {/* glowing progress bar - click or drag to seek */}
+      <div
+        className="group/bar mt-1.5 flex h-4 shrink-0 cursor-pointer touch-none items-center"
+        role="slider" aria-label="Position" aria-valuemin={0} aria-valuemax={100}
+        onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); }}
+        onDragStart={(e) => { e.preventDefault(); e.stopPropagation(); }}
+        onPointerDown={(e) => { e.stopPropagation(); scrubbing.current = true; e.currentTarget.setPointerCapture?.(e.pointerId); seekFrom(e); }}
+        onPointerMove={(e) => { if (scrubbing.current) seekFrom(e); }}
+        onPointerUp={(e) => { scrubbing.current = false; e.currentTarget.releasePointerCapture?.(e.pointerId); }}
+      >
+        <div className="relative h-1.5 w-full rounded-full bg-zinc-800/90">
+          <div ref={fillRef} className="absolute inset-y-0 left-0 rounded-full"
+               style={{
+                 width: '0%',
+                 background: 'linear-gradient(90deg, rgb(var(--accent-rgb) / 0.55), rgb(var(--accent-rgb)))',
+                 boxShadow: playing
+                   ? '0 0 12px 2px rgb(var(--accent-rgb) / 0.85), 0 0 3px rgb(var(--accent-rgb))'
+                   : '0 0 8px 1px rgb(var(--accent-rgb) / 0.5)',
+                 transition: 'box-shadow 300ms',
+               }} />
+          <div ref={knobRef}
+               className="absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 scale-90 rounded-full bg-white transition-transform group-hover/bar:scale-110"
+               style={{ left: '0%', boxShadow: '0 0 10px 3px rgb(var(--accent-rgb) / 0.8)' }} />
+        </div>
+      </div>
+
+      {/* transport: play, the two times (never cut off), and - when there is room - loop and mute */}
+      <div className="mt-1 flex shrink-0 items-center gap-2">
         <button type="button" aria-label={playing ? 'Pause' : 'Play'}
                 onClick={(e) => { e.stopPropagation(); toggle(); }}
-                className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-accent text-accent-foreground shadow-lg shadow-accent/25 transition hover:scale-110 active:scale-90">
+                className={cn('grid shrink-0 place-items-center rounded-full bg-accent text-accent-foreground shadow-lg shadow-accent/25 transition hover:scale-110 active:scale-90',
+                              compact ? 'h-7 w-7' : 'h-8 w-8')}>
           {playing ? <Pause className="h-4 w-4" fill="currentColor" /> : <Play className="ml-0.5 h-4 w-4" fill="currentColor" />}
         </button>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] tabular-nums text-zinc-300">
-          {shown}<span className="text-zinc-600"> / {total ? fmt(total) : (audio.duration_formatted || '--:--')}</span>
-        </span>
-        <button type="button" aria-label="Loop" onClick={(e) => { e.stopPropagation(); setLoop((l) => !l); }}
-                className={cn('rounded-md p-1 transition hover:bg-zinc-800', loop ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
-          {loop ? <Repeat1 className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5" />}
-        </button>
-        <button type="button" aria-label={muted ? 'Unmute' : 'Mute'} onClick={(e) => { e.stopPropagation(); setMuted((m) => !m); }}
-                className={cn('rounded-md p-1 transition hover:bg-zinc-800', muted ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
-          {muted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
-        </button>
+        <span className="shrink-0 whitespace-nowrap font-mono text-[11px] tabular-nums text-zinc-200">{shown}</span>
+        <span className="min-w-0 flex-1" />
+        <span className="shrink-0 whitespace-nowrap font-mono text-[11px] tabular-nums text-zinc-400">{total ? fmt(total) : (audio.duration_formatted || '--:--')}</span>
+        {!compact && (
+          <>
+            <button type="button" aria-label="Loop" onClick={(e) => { e.stopPropagation(); setLoop((l) => !l); }}
+                    className={cn('shrink-0 rounded-md p-1 transition hover:bg-zinc-800', loop ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
+              {loop ? <Repeat1 className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5" />}
+            </button>
+            <button type="button" aria-label={muted ? 'Unmute' : 'Mute'} onClick={(e) => { e.stopPropagation(); setMuted((m) => !m); }}
+                    className={cn('shrink-0 rounded-md p-1 transition hover:bg-zinc-800', muted ? 'text-accent' : 'text-zinc-500 hover:text-zinc-200')}>
+              {muted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

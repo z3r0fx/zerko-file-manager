@@ -1,0 +1,30 @@
+/* Mobile fixes applied on top of the compiled bundle.
+   Kept in a separate stylesheet because the app's CSS is built by Tailwind
+   from source that isn't on this machine - only classes that existed at build
+   time are in the compiled file, so new utility classes would do nothing. */
+
+/* The photo editor's toolbar: undo, redo, zoom, crop, stars, split, clipping,
+   before, WB, auto, copy, paste, reset, save, export. On a phone that runs
+   off the side of the screen and everything past Auto is simply unreachable.
+   Let it scroll sideways instead. */
+[data-zerko="edittools"] {
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex-wrap: nowrap;
+  min-width: 0;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  scroll-padding-inline: 0.5rem;
+}
+[data-zerko="edittools"]::-webkit-scrollbar { display: none; }
+/* Flex children shrink by default; these must keep their size and queue up. */
+[data-zerko="edittools"] > * { flex: 0 0 auto; }
+
+/* The title must be allowed to give up space, or the toolbar never gets any. */
+[data-zerko="edittitle"] { min-width: 0; flex-shrink: 1; }
+
+@media (max-width: 1024px) {
+  /* The filename alone can eat the whole bar on a narrow screen. */
+  [data-zerko="edittitle"] { max-width: 38vw; }
+  [data-zerko="editbar"] { padding-left: 0.5rem; padding-right: 0.5rem; }
+}

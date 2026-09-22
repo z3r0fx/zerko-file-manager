@@ -107,6 +107,19 @@ case "${1:-status}" in
     echo "  Everything is off. Nothing will restart it on its own."
     ;;
 
+  restart)
+    # Just the library, not HTTPS. Caddy is a separate process that proxies to
+    # us; bouncing it drops every open connection and, on this machine, wants a
+    # sudo password. Nothing in a code update touches it, so leave it alone.
+    touch "$FLAG"          # a deliberate restart means "should be running"
+    echo "  Restarting the library (HTTPS stays up)..."
+    stop_app
+    start_app
+    echo ""
+    echo "  Local  : http://localhost:9600"
+    echo "  Now press Ctrl+F5 in the browser to pick up the new front end."
+    ;;
+
   watchdog)
     # Runs on a timer, with nobody watching. Does nothing unless the flag says
     # it should be up.
@@ -137,6 +150,6 @@ case "${1:-status}" in
     ;;
 
   *)
-    echo "  usage: ./zerko-service.sh start|stop|status|watchdog"
+    echo "  usage: ./zerko-service.sh start|stop|restart|status|watchdog"
     ;;
 esac

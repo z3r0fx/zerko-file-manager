@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link2, Copy, Check, X, Smartphone } from 'lucide-react';
+import { Link2, Copy, Check, X, Smartphone, Send, Inbox } from 'lucide-react';
 import { apiCall } from '../../lib/api';
 import QRCode from 'qrcode';
 
@@ -18,7 +18,12 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
   const [allowSelects, setAllowSelects] = useState(true);
   // With no folder and no selection there is nothing to show, so the only
   // thing such a portal can be is one that receives.
-  const [allowUpload, setAllowUpload] = useState(!folderId && !(videoIds?.length));
+  // A portal is one of two things, and saying so up front is clearer than a
+  // row of flags that might add up to either.
+  const hasContent = !!folderId || !!(videoIds?.length);
+  const [kind, setKind] = useState(hasContent ? 'send' : 'receive');
+  const allowUpload = kind !== 'send';
+  const [allowZip, setAllowZip] = useState(true);
   const [includeSubfolders, setIncludeSubfolders] = useState(true);
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -36,7 +41,9 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
         password: password || undefined,
         allow_download: allowDownload,
         allow_selects: allowSelects,
+        kind,
         allow_upload: allowUpload,
+        allow_zip: allowZip,
       };
       if (count > 0) body.video_ids = videoIds;
       else { body.folder_id = folderId; body.include_subfolders = includeSubfolders; }
@@ -114,6 +121,20 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
                   : 'A portal for receiving files. It starts empty and fills up from whoever you send it to.'}
             </p>
 
+            <div className="grid grid-cols-2 gap-2">
+              <KindCard
+                icon={Send} title="Sending" active={kind === 'send'}
+                disabled={!hasContent}
+                onClick={() => setKind('send')}
+                hint="They look, pick favourites and leave notes. Downloads optional."
+              />
+              <KindCard
+                icon={Inbox} title="Receiving" active={kind === 'receive'}
+                onClick={() => setKind('receive')}
+                hint="They send files in and see nothing of your library."
+              />
+            </div>
+
             <Field label="Title">
               <input value={title} onChange={(e) => setTitle(e.target.value)} className={inputCls} />
             </Field>
@@ -139,6 +160,7 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
               </Field>
             </div>
 
+            {kind !== 'receive' && (
             <div className="space-y-2 rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
               <Toggle checked={allowSelects} onChange={setAllowSelects}
                       label="Let them pick favourites"
@@ -146,16 +168,18 @@ export default function ShareDialog({ folderId, folderName, videoIds, onClose })
               <Toggle checked={allowDownload} onChange={setAllowDownload}
                       label="Allow downloads"
                       hint="Off means view-only streaming of the proxy." />
-              {count === 0 && (
-                <Toggle checked={allowUpload} onChange={setAllowUpload}
-                        label="Let them send files in"
-                        hint="Uploads land in a holding folder of their own. Nothing joins the library until you review the inbox under Portals and file it - so a phone can never drop footage into the wrong project." />
+              {allowDownload && (
+                <Toggle checked={allowZip} onChange={setAllowZip}
+                        label="Offer the whole folder as one zip"
+                        hint="Off means files one at a time. That is what a phone wants anyway - a zip lands in Files, not the camera roll - so this is ignored on phones either way." />
               )}
+
               {count === 0 && (
                 <Toggle checked={includeSubfolders} onChange={setIncludeSubfolders}
                         label="Include subfolders" />
               )}
             </div>
+            )}
 
             {error && <p className="text-sm text-red-400">{error}</p>}
 
@@ -236,5 +260,25 @@ function ScanToOpen({ url, upload }) {
         </p>
       </div>
     </div>
+  );
+}
+
+function KindCard({ icon: Icon, title, hint, active, disabled, onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={
+        'rounded-lg border p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-40 ' +
+        (active ? 'border-accent bg-accent/10' : 'border-zinc-700 hover:border-zinc-500')
+      }
+    >
+      <span className={'flex items-center gap-2 text-sm font-medium ' +
+                       (active ? 'text-accent' : 'text-zinc-200')}>
+        <Icon className="h-4 w-4" /> {title}
+      </span>
+      <span className="mt-1 block text-[11px] leading-snug text-zinc-500">{hint}</span>
+    </button>
   );
 }

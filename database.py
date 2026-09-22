@@ -68,6 +68,11 @@ class IndexedFolder(Base):
     order = Column(Integer, default=0)
     added_at = Column(DateTime, default=datetime.utcnow)
     last_scanned = Column(DateTime, nullable=True)
+    # Set when a person made this folder here in Zerko, rather than it being
+    # found on disk by the indexer. An empty folder you just made should still
+    # appear in the sidebar; an empty folder that happens to exist on the drive
+    # should not.
+    created_in_app = Column(DateTime, nullable=True)
     # Nested folders: mirrors the directory tree on disk.
     parent_id = Column(Integer, ForeignKey("indexed_folders.id"), nullable=True)
     relative_path = Column(String, nullable=True)   # path relative to the media root
@@ -188,6 +193,21 @@ class Share(Base):
     # for letting an agent send footage in without an account.
     allow_upload = Column(Boolean, default=False)
     upload_count = Column(Integer, default=0)
+    # What this portal is FOR. One flag-soup portal that might send and might
+    # receive is harder to reason about than two named kinds - and the viewer
+    # sees a different page for each.
+    #   send    - they look, pick, comment, maybe download
+    #   receive - they send files in and see nothing of the library
+    #   both    - the old behaviour, kept for links already out in the world
+    kind = Column(String, default="send")
+    # When the viewer said "I am done". Picks save as they are made, but
+    # nothing ever told them so and nothing told you they had finished.
+    confirmed_at = Column(DateTime, nullable=True)
+    confirmed_by = Column(String, nullable=True)
+    # Downloading as one archive. Off means the zip endpoint refuses and the
+    # viewer is only offered files one at a time - which is also what a phone
+    # wants, because a zip lands in Files rather than the camera roll.
+    allow_zip = Column(Boolean, default=True)
     # Where files sent through this link are held until someone files them.
     intake_folder_id = Column(Integer, ForeignKey("indexed_folders.id"), nullable=True)
 
@@ -246,7 +266,8 @@ def init_db():
         if "order" not in existing_folder_cols:
             logging.info("Adding column order to indexed_folders table")
             conn.execute(text("ALTER TABLE indexed_folders ADD COLUMN 'order' INTEGER DEFAULT 0"))
-        for col, col_type in {"parent_id": "INTEGER", "relative_path": "TEXT"}.items():
+        for col, col_type in {"parent_id": "INTEGER", "relative_path": "TEXT",
+                              "created_in_app": "TIMESTAMP"}.items():
             if col not in existing_folder_cols:
                 logging.info(f"Adding column {col} to indexed_folders table")
                 conn.execute(text(f"ALTER TABLE indexed_folders ADD COLUMN {col} {col_type}"))
@@ -262,7 +283,11 @@ def init_db():
         existing_share_cols = [row[1] for row in res]
         for col, col_type in {"allow_upload": "BOOLEAN DEFAULT 0",
                               "upload_count": "INTEGER DEFAULT 0",
-                              "intake_folder_id": "INTEGER"}.items():
+                              "intake_folder_id": "INTEGER",
+                              "kind": "TEXT DEFAULT 'send'",
+                              "allow_zip": "BOOLEAN DEFAULT 1",
+                              "confirmed_at": "DATETIME",
+                              "confirmed_by": "TEXT"}.items():
             if col not in existing_share_cols:
                 logging.info(f"Adding column {col} to shares table")
                 conn.execute(text(f"ALTER TABLE shares ADD COLUMN {col} {col_type}"))

@@ -24,12 +24,17 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, User
 from auth import get_password_hash
 
 router = APIRouter(prefix="/api/setup", tags=["setup"])
+
+# The wizard page itself. Served straight off disk so a fresh install does
+# not depend on the React bundle having been built with a wizard in it.
+page_router = APIRouter(tags=["setup"])
 
 CONFIG_PATH = Path(os.environ.get("ZERKO_CONFIG", "zerko.config.json"))
 
@@ -370,3 +375,41 @@ def _human(n):
             return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+# --- the wizard page -------------------------------------------------------
+
+SETUP_PAGE = Path(__file__).resolve().parent / "setup_page.html"
+
+
+@page_router.get("/setup", include_in_schema=False)
+def setup_page():
+    """The first-run wizard. Plain HTML, no build step, no bundle."""
+    if not setup_needed():
+        return RedirectResponse("/", status_code=303)
+    if not SETUP_PAGE.is_file():
+        raise HTTPException(
+            status_code=500,
+            detail="setup_page.html is missing from this install",
+        )
+    return HTMLResponse(SETUP_PAGE.read_text(encoding="utf-8"))
+
+
+def install_setup_gate(app):
+    """Send anyone landing on the app to /setup until an account exists.
+
+    Only the bare entry points are redirected - assets, API calls and the
+    wizard itself pass straight through, so this cannot deadlock the page it
+    is redirecting to.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    GATED = {"/", "/index.html", "/login"}
+
+    class _SetupGate(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            if request.url.path in GATED and setup_needed():
+                return RedirectResponse("/setup", status_code=307)
+            return await call_next(request)
+
+    app.add_middleware(_SetupGate)

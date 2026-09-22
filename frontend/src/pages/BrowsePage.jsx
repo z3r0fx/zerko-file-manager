@@ -166,6 +166,8 @@ export default function BrowsePage({ sortBy, sortOrder, onSortByChange, onSortOr
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (!dragState.start) return;
+      // a click that wobbles a pixel is still a click: no box until the mouse has really moved
+      if (!isDragging && Math.hypot(e.clientX - dragState.start.x, e.clientY - dragState.start.y) < 6) return;
       setIsDragging(true);
       setDragState(prev => ({ ...prev, current: { x: e.clientX, y: e.clientY } }));
       
@@ -211,19 +213,20 @@ export default function BrowsePage({ sortBy, sortOrder, onSortByChange, onSortOr
         window.removeEventListener('mousemove', handleMouseMove);
         window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [dragState.start, visibleVideos, selectedVideoIds]);
+  }, [dragState.start, isDragging, visibleVideos, selectedVideoIds]);
 
   function handleMouseDown(e) {
-    // The rubber-band box is gone: it kept appearing when you grabbed the
-    // sidebar edge, and the dot on each tile (Shift, Ctrl, or a touch sweep)
-    // does the selecting.
-    return;
-    // eslint-disable-next-line no-unreachable
-    // No rubber-band selection while a video is open, a dialog is up, or the
-    // click started on a control - there is nothing to marquee-select over.
+    // Rubber-band selection: press on the empty space around and between the
+    // tiles and drag. It starts only inside the grid area (never the toolbar,
+    // the sidebar or its resize edge), only with the left button, and only
+    // shows a box once the mouse has really moved.
+    if (e.button !== 0) return;
     if (selectedVideoId || tagSelectorTarget || deleteTarget || renameTarget || createProjectOpen) return;
-    if (e.target.closest('input, textarea, button, a, [contenteditable="true"]')) return;
-    if (e.target.closest('[data-id]') || e.target.closest('button') || e.target.closest('a') || e.target.closest('input')) return;
+    const zone = e.target.closest?.('[data-marquee-zone]');
+    if (!zone) return;
+    if (e.target.closest('input, textarea, select, button, a, [contenteditable="true"], [data-id], [role="slider"]')) return;
+    const box = zone.getBoundingClientRect();
+    if (e.clientX < box.left + 8 || e.clientX > box.right - 18) return;   // sidebar edge / scrollbar
     document.body.style.userSelect = 'none';
     setDragState({ start: { x: e.clientX, y: e.clientY }, current: { x: e.clientX, y: e.clientY } });
   }
@@ -659,7 +662,7 @@ export default function BrowsePage({ sortBy, sortOrder, onSortByChange, onSortOr
         </div>
       )}
         {/* Selection Rectangle */}
-        {dragState.start && (
+        {dragState.start && isDragging && (
             <div className="fixed border border-accent bg-accent/15 rounded-md pointer-events-none z-[100]"
                 style={{
                     left: Math.min(dragState.start.x, dragState.current.x),
@@ -882,7 +885,7 @@ export default function BrowsePage({ sortBy, sortOrder, onSortByChange, onSortOr
             </div>
         )}
         
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto p-6" data-marquee-zone>
             {filter.mediaType === 'files' ? (
               <FileList
                 items={displayVideos}
