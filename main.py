@@ -43,6 +43,10 @@ import projects
 import shoots
 import delivery
 import subclips
+import video_edit
+import ai
+import ai_photo
+import ai_image
 from media_type_utils import get_media_type
 from job_manager import job_manager
 
@@ -4858,11 +4862,23 @@ rooms.install(app)
 delivery.install(app)
 # In/out ranges on clips, rendered on request; searching by spoken word.
 subclips.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
+video_edit.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
+ai.install(app)
+ai_photo.install(app)
+ai_image.install(app)
+import splat
+splat.install(app, resolve_media_path)
+import proofing
+proofing.install(app, _share_state, _share_videos)
+import listing_pack
+listing_pack.install(app)
+import assistant
+assistant.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
 
 
 # The new frontend (web/), served at /v2 beside the legacy app while it is
 # built page by page. Its assets are content-hashed, index.html never cached.
-WEB_DIST = PROJECT_ROOT / "web" / "dist"
+WEB_DIST = Path(os.environ.get("ZK_WEB_DIST") or (PROJECT_ROOT / "web" / "dist"))   # a test copy can serve its own build
 
 
 # The new interface is the front door once it is built. The classic app
@@ -5033,14 +5049,23 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  [!] Could not start catalog backups: {e}")
 
+    # A test copy (tools/dev-test/wsl_testbed.sh) shares this folder with the
+    # live install: it must not mark repairs done, update the DNS record or
+    # watch for updates on the live one's behalf.
+    test_copy = bool(os.environ.get("ZK_TEST_COPY"))
+
     # One-off repairs after an update, in the background, each only once.
     try:
+        if test_copy:
+            raise RuntimeError("skipped in a test copy")
         import maintenance
         maintenance.start(resolve_media_path, move_to_trash, UPLOAD_ROOT)
     except Exception as e:
         print(f"  [!] Could not start maintenance: {e}")
 
     try:
+        if test_copy:
+            raise RuntimeError("skipped in a test copy")
         _start_update_watcher()
     except Exception as e:
         print(f"  [!] Could not start the update watcher: {e}")
@@ -5048,6 +5073,8 @@ if __name__ == "__main__":
     # Dynamic DNS, in-process. The scheduled task this replaces opened a
     # console window every fifteen minutes and took focus with it.
     try:
+        if test_copy:
+            raise RuntimeError("skipped in a test copy")
         import dns_refresh
         if dns_refresh.start_scheduler():
             print("  Dynamic DNS refresh: on (every 15 minutes)", flush=True)

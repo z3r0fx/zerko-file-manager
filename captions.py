@@ -18,6 +18,7 @@ Nothing is made up: a fact that is not filled in is simply not mentioned.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import urllib.request
@@ -68,15 +69,26 @@ DEFAULT_SETTINGS = {"hashtags": "", "signoff": "", "ai_key": "", "ai_model": "cl
 def load_settings() -> dict:
     try:
         d = json.loads(SETTINGS_FILE.read_text())
-        return {**DEFAULT_SETTINGS, **{k: v for k, v in d.items() if k in DEFAULT_SETTINGS}}
+        s = {**DEFAULT_SETTINGS, **{k: v for k, v in d.items() if k in DEFAULT_SETTINGS}}
     except Exception:
-        return dict(DEFAULT_SETTINGS)
+        s = dict(DEFAULT_SETTINGS)
+    return s
+
+
+def _shared_ai() -> bool:
+    """Manage > AI (an API key or Claude Code on this computer) serves the
+    caption writer when it has no key of its own."""
+    try:
+        import ai
+        return ai.enabled()
+    except Exception:
+        return False
 
 
 def _public(s: dict) -> dict:
     key = s.get("ai_key") or ""
     return {"hashtags": s["hashtags"], "signoff": s["signoff"], "ai_model": s["ai_model"],
-            "ai": bool(key), "ai_key_hint": ("..." + key[-4:]) if key else ""}
+            "ai": bool(key) or _shared_ai(), "ai_key_hint": ("..." + key[-4:]) if key else ""}
 
 
 # --------------------------------------------------------------------------
@@ -472,6 +484,9 @@ def write_ai(facts: dict, place: dict, o: Opts, earlier: List[str], settings: di
         rules.append("It must read clearly differently from these earlier captions for the same property "
                      "(different opening, structure and wording):\n---\n" + "\n---\n".join(earlier[:8]))
     rules.append("Reply with the caption text only.")
+    if not settings.get("ai_key"):
+        import ai
+        return ai.ask("\n".join(rules), max_tokens=900, temperature=0.8, tier="fast")
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({"model": settings.get("ai_model") or DEFAULT_SETTINGS["ai_model"], "max_tokens": 900,
@@ -545,7 +560,7 @@ def make_caption(shoot_id: int, o: Opts, db: Session = Depends(get_db), current_
     settings = load_settings()
     source, note = "writer", None
     text = ""
-    if settings.get("ai_key"):
+    if settings.get("ai_key") or _shared_ai():
         try:
             text = write_ai(facts, place, o, [c.text for c in earlier if c.platform == o.platform][:8], settings)
             source = "ai"

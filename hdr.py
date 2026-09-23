@@ -4,11 +4,12 @@ A property shoot comes home as sets of three, five or seven frames of the same
 room at different exposures. This finds those sets and fuses each one into a
 single natural-looking photo, in bulk, without anybody opening Lightroom.
 
-The fusion is Mertens exposure fusion, not tone-mapped HDR: it picks the
-best-exposed, best-contrast pixels from each frame and blends them in a
-pyramid. That is what gives the clean, believable look estate agents ask for -
-bright windows that still show the view, no halos, no grey mush - and it needs
-no camera response curve, so it works with JPEG, TIFF and RAW alike.
+The HDR panel merges with hdr_merge: the frames become one linear radiance
+image (RAW read linear, JPEGs through the camera's measured curve), lined up
+on the sharpest frame and with blurred or moved pixels left out, then tone
+mapped without halos. Lamps stay white, walls do not band, a hand-held long
+frame does not soften the room. The older Mertens exposure fusion is still
+used where no panel settings come with the request, and for flambient.
 
 Nothing is overwritten. Results land in a subfolder (default "HDR") beside the
 frames they came from, and are added to the library so the existing proxy
@@ -39,6 +40,9 @@ _media_root: Optional[Path] = None
 _resolve = lambda p: p              # replaced by install()
 
 JOBS: Dict[str, dict] = {}
+_preview_frames: Dict[str, object] = {}
+_preview_merged: Dict[tuple, np.ndarray] = {}
+_preview_lock = threading.Lock()
 _jobs_lock = threading.Lock()
 _slots = threading.Semaphore(1)     # fusing is memory-hungry; one at a time
 
@@ -109,6 +113,24 @@ def _exif_capture(path: str) -> Tuple[Optional[datetime], Optional[float], Optio
                         shutter = num
     except Exception:
         pass
+    if taken is None or shutter is None:
+        # Pillow cannot open most RAW files (NEF, ARW...), so their capture
+        # time used to be the file's own time - copied files all share a
+        # minute, and every frame of a shoot fell into one set
+        try:
+            import hdr_merge
+            info = hdr_merge.exif_exposure(path)
+            if taken is None and info.get("taken"):
+                taken = datetime.strptime(str(info["taken"])[:19], "%Y:%m:%d %H:%M:%S")
+                sub = str(info.get("subsec") or "").strip()
+                if sub.isdigit():
+                    taken = taken.replace(microsecond=int((sub + "000000")[:6]))
+            if bias is None and info.get("bias") is not None:
+                bias = float(info["bias"])
+            if shutter is None and info.get("t"):
+                shutter = float(info["t"])
+        except Exception:
+            pass
     if taken is None:
         try:
             taken = datetime.fromtimestamp(os.path.getmtime(path))
@@ -143,6 +165,12 @@ def _load(path: str, max_dim: int, fast: bool = False) -> Tuple[np.ndarray, str]
             img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         except Exception:
             img = None
+        if img is None:
+            # a RAW LibRaw cannot decode yet (Nikon ZR HE NEF...): the camera's
+            # own full-size JPEG inside it fuses well; only a small preview does not
+            rgb, full = previews.camera_jpeg(path)
+            if rgb is not None and full:
+                img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
     # Deliberately NOT cv2.imread for RAW: OpenCV will happily open a DNG as a
     # plain TIFF and hand back the undemosaiced sensor data, which looks like a
@@ -332,6 +360,7 @@ class HdrLook(BaseModel):
     saturation: float = Field(0.05, ge=-1, le=1)
     detail: float = Field(0.2, ge=0, le=1)      # local contrast
     warmth: float = Field(0, ge=-1, le=1)
+    noise: float = Field(0.4, ge=0, le=1)       # grain smoothed in the merge (edges and texture kept)
 
 
 class MergeBody(BaseModel):
@@ -369,116 +398,67 @@ def _polish(img: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
-def _deghost(frames: List[np.ndarray]) -> List[np.ndarray]:
-    """Where a frame disagrees with the middle one once exposure is matched
-    (a moving tree, a person, water), use the middle frame there, brightened
-    or darkened to that frame's exposure - so fusion blends one moment."""
-    cv2 = _cv2()
-    ref_i = len(frames) // 2
-    ref = frames[ref_i].astype(np.float32) / 255.0
-    rl = ref.mean(axis=2)
-    ok_ref = (rl > 0.05) & (rl < 0.92)
-    out = []
-    for i, f in enumerate(frames):
-        if i == ref_i:
-            out.append(f)
-            continue
-        cur = f.astype(np.float32) / 255.0
-        cl = cur.mean(axis=2)
-        both = ok_ref & (cl > 0.05) & (cl < 0.92)
-        gain = float(np.median(cl[both] / np.maximum(rl[both], 1e-3))) if both.sum() > 500 else 1.0
-        diff = np.abs(np.clip(rl * gain, 0, 1) - cl)
-        valid = both.astype(np.float32)
-        ghost = cv2.GaussianBlur(((diff > 0.12) * valid).astype(np.float32), (0, 0), max(2.0, f.shape[1] / 400))
-        ghost = np.clip(ghost * 2.5, 0, 1)[..., None]
-        if ghost.max() < 0.05:
-            out.append(f)
-            continue
-        swap = np.clip(ref * gain, 0, 1)
-        out.append(np.clip((cur * (1 - ghost) + swap * ghost) * 255.0, 0, 255).astype(np.uint8))
-    return out
-
-
-def fuse_look(frames: List[np.ndarray], look: "HdrLook", shutters: Optional[List[Optional[float]]] = None) -> np.ndarray:
-    """Frames (BGR uint8, same size, lined up) -> the finished photo, float BGR 0..1."""
-    cv2 = _cv2()
-    if look.deghost and len(frames) > 2:
-        frames = _deghost(frames)
-    if look.method == "hdr":
-        # a radiance map and a tone map: bolder, more "HDR". Exposure times
-        # from EXIF, or worked out from how bright each frame is.
-        order = sorted(range(len(frames)), key=lambda k: float(frames[k].mean()))
-        frames = [frames[k] for k in order]
-        sh = [shutters[k] if shutters and k < len(shutters) else None for k in order]
-        if not all(sh):
-            m = [max(1e-3, float(f.astype(np.float32).mean()) / 255.0) for f in frames]
-            mid = m[len(m) // 2]
-            sh = [(x / mid) ** 2.2 / 60.0 for x in m]
-        times = np.array(sh, dtype=np.float32)
-        hdr = cv2.createMergeDebevec().process(frames, times.copy())
-        img = cv2.createTonemapReinhard(gamma=1.0, intensity=0.2, light_adapt=0.85, color_adapt=0.0).process(hdr)
-        img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
-        # Reinhard leaves it dim and gamma-light: bring the mid-tones where fusion puts them
-        med = float(np.median(img)) or 0.2
-        img = np.clip(img * (0.42 / max(med, 1e-3)), 0, 1) ** 0.85
+def merge_look(paths: List[str], look: "HdrLook", *, align: bool = True, max_dim: int = DEFAULT_MAX_DIM,
+               fast: bool = False, frames=None, allow_preview_raw: bool = False) -> np.ndarray:
+    """The HDR panel's merge (hdr_merge): radiance from every frame, lined up
+    on the sharpest one, blur and movement left out per pixel, then tone
+    mapped without halos. Returns float BGR 0..1."""
+    import hdr_merge
+    if frames is None:
+        frames = [hdr_merge.load(p, max_dim, fast) for p in paths]
+    degraded = [os.path.basename(p) for p, f in zip(paths, frames) if f.how == "preview"]
+    if degraded and not allow_preview_raw and not fast:
+        raise RuntimeError(
+            previews.raw_decode_note(next(p for p in paths if os.path.basename(p) == degraded[0]))
+            + " Only a small preview could be read, so this set was not merged "
+              "(tick 'fuse anyway' to accept the lower quality).")
+    shape = frames[0].img.shape
+    keep = [(p, f) for p, f in zip(paths, frames) if f.img.shape == shape and f.linear == frames[0].linear]
+    if len(keep) < 2:
+        raise RuntimeError("the frames in this set are not the same size")
+    paths = [p for p, _ in keep]
+    frames = [f for _, f in keep]
+    key = None
+    if fast:
+        # the preview: sliders only change the tone mapping, so the merged
+        # set is kept and a slider move costs a fraction of a second
+        key = (tuple((p, os.path.getmtime(p)) for p in paths), align, look.deghost, frames[0].img.shape)
+        with _preview_lock:
+            E = _preview_merged.get(key)
     else:
-        img = np.clip(cv2.createMergeMertens(1.0, 1.0, 1.0).process(frames), 0, 1)
-    img = img.astype(np.float32)
-    # windows: in the brightest areas, lean on the darkest frame (the view)
-    if look.windows > 0:
-        dark = min(frames, key=lambda f: float(f.mean())).astype(np.float32) / 255.0
-        L = img.mean(axis=2)
-        m = np.clip((L - 0.72) / 0.26, 0, 1)
-        m = cv2.GaussianBlur(m, (0, 0), max(1.5, img.shape[1] / 700))[..., None] * float(look.windows)
-        # keep the view's own contrast but lift it so a window still reads as bright
-        dl = max(1e-3, float(dark.mean()))
-        lift = np.clip(dark * min(3.0, 0.55 / dl), 0, 1)
-        img = img * (1 - m) + np.clip(0.5 * dark + 0.5 * lift, 0, 1) * m
-    return _finish(img, look)
-
-
-def _finish(img: np.ndarray, look: "HdrLook") -> np.ndarray:
-    """Shadows, contrast, detail, saturation, warmth - on float BGR 0..1."""
-    cv2 = _cv2()
-    if look.exposure:
-        img = img * np.float32(2.0 ** float(look.exposure))
-    L = img @ np.float32([0.0722, 0.7152, 0.2126])
-    if look.shadows:
-        k = float(look.shadows)
-        gain = 1.0 + k * 1.2 * np.clip(1.0 - L / 0.5, 0, 1) ** 2
-        img = img * gain[..., None]
-    if look.contrast:
-        c = float(look.contrast)
-        x = np.clip(img, 0, 1)
-        s_curve = x + c * 0.6 * (x - 0.5) * (1 - np.abs(2 * x - 1))
-        img = s_curve
-    if look.detail > 0:
-        sigma = max(2.0, img.shape[1] / 120)
-        blur = cv2.GaussianBlur(img, (0, 0), sigma)
-        img = img + float(look.detail) * 0.9 * (img - blur)
-    img = np.clip(img, 0, 1).astype(np.float32)
-    if look.saturation:
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hsv[..., 1] = np.clip(hsv[..., 1] * (1 + float(look.saturation)), 0, 1)
-        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-    if look.warmth:
-        w = float(look.warmth) * 0.06
-        img = img * np.float32([1 - w, 1.0, 1 + w])
-    return np.clip(img, 0, 1).astype(np.float32)
+        E = None
+    if E is None:
+        bright, light = hdr_merge.exposures(paths, [f.img for f in frames], frames[0].linear)
+        E = hdr_merge.merge(frames, bright, light, align=align, deghost=look.deghost,
+                            fine=0 if fast else 1600)
+        if key is not None:
+            with _preview_lock:
+                while len(_preview_merged) >= 4:
+                    _preview_merged.pop(next(iter(_preview_merged)))
+                _preview_merged[key] = E
+    return hdr_merge.tonemap(E, exposure=look.exposure, shadows=look.shadows, contrast=look.contrast,
+                             saturation=look.saturation, detail=look.detail, warmth=look.warmth,
+                             windows=look.windows, noise=look.noise, bold=look.method == "hdr")
 
 
 def _fuse(paths: List[str], body: MergeBody) -> np.ndarray:
     cv2 = _cv2()
+    if body.look is not None:
+        import hdr_merge
+        img = merge_look(paths, body.look, align=body.align, max_dim=body.max_dim,
+                         allow_preview_raw=body.allow_preview_raw)
+        if body.fmt == "tif" and body.bits16:
+            return (img * 65535.0 + 0.5).astype(np.uint16)
+        return hdr_merge.to_uint8(img)
     loaded = [_load(p, body.max_dim) for p in paths]
     frames = [img for img, _ in loaded]
 
     degraded = [os.path.basename(p) for p, (_, how) in zip(paths, loaded) if how == "preview"]
     if degraded and not body.allow_preview_raw:
         raise RuntimeError(
-            "no RAW decoder is installed, so only the small preview inside "
-            f"{degraded[0]} could be read - fusing that would throw away most "
-            "of the detail. Install one with:  venv/bin/pip install rawpy  "
-            "(or tick 'fuse anyway' to accept the lower quality)")
+            previews.raw_decode_note(next(p for p in paths if os.path.basename(p) == degraded[0]))
+            + " Only a small preview could be read, so this set was not merged "
+              "(tick 'fuse anyway' to accept the lower quality).")
 
     # Frames that differ in size (one shot portrait by mistake) cannot fuse.
     shape = frames[0].shape
@@ -492,12 +472,6 @@ def _fuse(paths: List[str], body: MergeBody) -> np.ndarray:
         except Exception:
             pass                            # tripod shots do not need it anyway
 
-    if body.look is not None:
-        shutters = [_exif_capture(p)[2] for p in paths]
-        img = fuse_look(frames, body.look, shutters)
-        if body.fmt == "tif" and body.bits16:
-            return (img * 65535.0 + 0.5).astype(np.uint16)
-        return (img * 255.0 + 0.5).astype(np.uint8)
     merged = cv2.createMergeMertens().process(frames)      # float32 0..1
     out = np.clip(merged * 255.0, 0, 255).astype(np.uint8)
     return _polish(out) if body.polish else out
@@ -703,8 +677,9 @@ def _run(job_id: str, body: MergeBody):
                         k += 1
 
                     cv2 = _cv2()
+                    # TIFF: lossless deflate - a fifth smaller than raw, nothing lost
                     params = ([cv2.IMWRITE_JPEG_QUALITY, body.quality]
-                              if body.fmt == "jpg" else [])
+                              if body.fmt == "jpg" else [cv2.IMWRITE_TIFF_COMPRESSION, 8])
                     if not cv2.imwrite(str(out_path), img, params):
                         raise RuntimeError("could not write the finished photo")
 
@@ -746,17 +721,17 @@ class PreviewBody(BaseModel):
     size: int = Field(1400, ge=400, le=2400)
 
 
-_preview_frames: Dict[str, np.ndarray] = {}
-_preview_lock = threading.Lock()
 
 
-def _preview_frame(path: str, size: int) -> np.ndarray:
+
+def _preview_frame(path: str, size: int):
+    import hdr_merge
     st = os.stat(path)
-    key = f"{path}|{st.st_mtime_ns}|{size}"
+    key = f"{path}|{st.st_mtime_ns}|{size}|2"
     with _preview_lock:
         if key in _preview_frames:
             return _preview_frames[key]
-    img, _ = _load(path, size, fast=True)
+    img = hdr_merge.load(path, size, fast=True)
     with _preview_lock:
         while len(_preview_frames) > 30:
             _preview_frames.pop(next(iter(_preview_frames)))
@@ -780,16 +755,10 @@ def preview(body: PreviewBody, db: Session = Depends(get_db), current_user: User
     if len(paths) < 2:
         raise HTTPException(status_code=400, detail="A set needs at least two frames that can be read")
     frames = [_preview_frame(p, body.size) for p in paths]
-    shape = frames[0].shape
-    frames = [f if f.shape == shape else cv2.resize(f, (shape[1], shape[0]), interpolation=cv2.INTER_AREA) for f in frames]
-    frames = [f.copy() for f in frames]
-    if body.align:
-        try:
-            cv2.createAlignMTB().process(frames, frames)
-        except Exception:
-            pass
-    shutters = [_exif_capture(p)[2] for p in paths]
-    img = fuse_look(frames, body.look, shutters)
+    try:
+        img = merge_look(paths, body.look, align=body.align, max_dim=body.size, fast=True, frames=frames)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     ok, buf = cv2.imencode(".jpg", (img * 255 + 0.5).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 88])
     if not ok:
         raise HTTPException(status_code=500, detail="Could not make the preview")

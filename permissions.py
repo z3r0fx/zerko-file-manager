@@ -194,6 +194,18 @@ RULES = [
     # is a download (checked again in the endpoint, which takes a query token).
     (("POST",), r"^/api/subclips/\d+/export$", UPLOAD),
     (("GET",), r"^/api/subclips/\d+/file$", None),
+    # The video editor: edits are shared work, made by people who can add
+    # to the library; renders and Resolve timelines are downloads.
+    (("POST",), r"^/api/video-projects/\d+/(render|pack)$", DOWNLOAD),
+    (("GET",), r"^/api/video-projects/\d+/fcpxml$", None),
+    (("GET",), r"^/api/video-render/\w+/file$", None),
+    (("POST",), r"^/api/video-render/\w+/cancel$", DOWNLOAD),
+    (("GET",), r"^/api/video-edit/frame/\d+$", None),
+    (("POST",), r"^/api/video-edit/luts$", UPLOAD),
+    (("POST", "PUT", "DELETE"), r"^/api/video-projects(/|$)", UPLOAD),
+    # Cuts handed over as a download (nothing written to the library).
+    (("POST",), r"^/api/cuts/download$", DOWNLOAD),
+    (("GET",), r"^/api/cuts/download/\w+/file$", None),
 
     # Reading is reading.
     (("GET",), r"^/api/", READ),

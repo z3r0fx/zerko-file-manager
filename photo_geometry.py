@@ -211,16 +211,12 @@ def cover_scale(straighten: float = 0.0, persp_v: float = 0.0) -> float:
 # for "full", the horizontals level. Lines stay lines under that mapping, so
 # a segment's angle in the result is the angle between its mapped ends.
 
-def _to_output(a, b, straighten, persp_v, persp_h, distortion, rotate):
+def _to_output(a, b, straighten, persp_v, persp_h, distortion, rotate, distortion2=0.0):
     """Source (centred, x in aspect units) -> output (centred), the inverse
     of photo_edit.source_uv without crop, scale and flips."""
-    # undo the lens: source q = p * (1 + k|p|^2)
-    if distortion:
-        px, py = a.copy(), b.copy()
-        for _ in range(6):
-            f = 1.0 + distortion * (px * px + py * py)
-            px, py = a / f, b / f
-        a, b = px, py
+    # undo the lens: source q = p * (1 + k|p|^2 + k2|p|^4)
+    if distortion or distortion2:
+        a, b = _undist(a, b, distortion, distortion2)
     d = 1.0 - persp_v * b - persp_h * a
     d = np.where(np.abs(d) < 1e-3, 1e-3, d)
     xs, ys = a / d, b / d
@@ -244,6 +240,7 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
     segs = _lines(gray)
     asp = w / float(h)
     dist = float(current.get("distortion", 0) or 0)
+    dist2 = float(current.get("distortion2", 0) or 0)
     rot = float(current.get("rotate", 0) or 0)
     # in the photo as it stands (lens corrected, not yet straightened), which
     # family is each line meant to be in?
@@ -253,8 +250,8 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
     ax, ay = (S[:, 0] / w - 0.5) * asp, S[:, 1] / h - 0.5
     bx, by = (S[:, 2] / w - 0.5) * asp, S[:, 3] / h - 0.5
     ln = S[:, 4]
-    cx0, cy0 = _to_output(ax, ay, 0, 0, 0, dist, rot)
-    cx1, cy1 = _to_output(bx, by, 0, 0, 0, dist, rot)
+    cx0, cy0 = _to_output(ax, ay, 0, 0, 0, dist, rot, dist2)
+    cx1, cy1 = _to_output(bx, by, 0, 0, 0, dist, rot, dist2)
     ang = np.degrees(np.arctan2(cy1 - cy0, cx1 - cx0))
     from_h = np.abs(((ang + 90) % 180) - 90)       # 0 = horizontal
     from_v = 90 - from_h                            # 0 = vertical
@@ -275,9 +272,9 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
 
         def angles(sel):
             a0x, a0y, a1x, a1y = ax[sel], ay[sel], bx[sel], by[sel]
-            if dist:
-                a0x, a0y = _undist(a0x, a0y, dist)
-                a1x, a1y = _undist(a1x, a1y, dist)
+            if dist or dist2:
+                a0x, a0y = _undist(a0x, a0y, dist, dist2)
+                a1x, a1y = _undist(a1x, a1y, dist, dist2)
             out = []
             for (px, py) in ((a0x, a0y), (a1x, a1y)):
                 d = 1.0 - pv * py - ph * px
@@ -336,12 +333,20 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
     }
 
 
-def _undist(a, b, k):
-    px, py = a.copy(), b.copy()
-    for _ in range(6):
-        f = 1.0 + k * (px * px + py * py)
-        px, py = a / f, b / f
-    return px, py
+def _undist(a, b, k, k2=0.0):
+    """Output point for a source point: solves q = p (1 + k|p|^2 + k2|p|^4)
+    for p along its radius (Newton). The plain fixed-point loop used before
+    flew off for strong corrections (k below about -0.3)."""
+    rq = np.sqrt(a * a + b * b)
+    r = rq.copy()
+    for _ in range(12):
+        r2 = r * r
+        g = r * (1.0 + k * r2 + k2 * r2 * r2) - rq
+        dg = 1.0 + 3.0 * k * r2 + 5.0 * k2 * r2 * r2
+        dg = np.where(np.abs(dg) < 0.05, np.sign(dg) * 0.05 + (dg == 0) * 0.05, dg)
+        r = np.clip(r - g / dg, 0.0, 4.0 * np.maximum(rq, 1e-9) + 1.0)
+    s = np.where(rq > 1e-12, r / np.maximum(rq, 1e-12), 1.0)
+    return a * s, b * s
 
 
 # --------------------------------------------------------------------------
@@ -415,59 +420,192 @@ def _dng_opcodes(path: str) -> dict:
     return out
 
 
-def distortion_from_warp(kr, aspect: float) -> float:
-    """The editor's single lens coefficient that best matches a DNG warp.
+def distortion_from_warp(kr, aspect: float):
+    """The editor's two lens terms (k, k2) that best match a DNG warp.
     DNG: source radius = r * (kr0 + kr1 r^2 + kr2 r^4 + kr3 r^6), r = 1 at the
-    corner. Editor: source = p * (1 + k |p|^2), |p| = R at the corner."""
+    corner. Editor: source = p * (1 + k |p|^2 + k2 |p|^4), |p| = R at the corner."""
     R2 = (aspect / 2.0) ** 2 + 0.25
-    rs = np.linspace(0.05, 1.0, 40)
+    rs = np.linspace(0.05, 1.0, 60)
     g = kr[0] + kr[1] * rs ** 2 + kr[2] * rs ** 4 + kr[3] * rs ** 6
     g = g / kr[0] - 1.0          # the overall scale is left to "fill the frame"
-    k = float((g * rs ** 2).sum() / max(1e-9, (R2 * rs ** 4).sum()))
-    return round(max(-0.5, min(0.5, k)), 4)
+    A = np.stack([R2 * rs ** 2, (R2 * rs ** 2) ** 2], axis=1)
+    (k, k2), *_ = np.linalg.lstsq(A, g, rcond=None)
+    clamp = lambda v: round(max(-0.5, min(0.5, float(v))), 4)
+    return clamp(k), clamp(k2)
 
 
-def measure_distortion(rgb01: np.ndarray) -> Optional[float]:
-    """Plumb-line: the lens coefficient that makes the photo's long edges
-    straightest. None when there are too few edges to say."""
+def measure_distortion(rgb01: np.ndarray):
+    """Plumb-line: the two lens terms (k, k2) that make the photo's straight
+    edges straightest. None when there are too few edges to say.
+
+    Every edge pixel is pushed through a candidate correction and votes for
+    the line it lies on (angle from its own gradient, so any direction
+    counts - verticals, horizontals and the converging lines of a hallway).
+    Straight lines pile their votes into single cells; the correction with
+    the peakiest votes is the one that straightens the most edge. The old
+    measure only rewarded edges lining up with columns and rows, which a
+    hallway games: it over-corrected the edges and bent the middle lines."""
     img = np.clip(rgb01, 0, 1)
     gray = (img @ np.float32([0.2126, 0.7152, 0.0722]) * 255).astype(np.uint8)
     h, w = gray.shape[:2]
-    k_ = 800.0 / max(h, w)
+    k_ = 1000.0 / max(h, w)
     if k_ < 1:
         gray = cv2.resize(gray, (int(w * k_), int(h * k_)), interpolation=cv2.INTER_AREA)
         h, w = gray.shape[:2]
-    edges = _edges(gray)
     asp = w / float(h)
-    xs = (np.arange(w, dtype=np.float32) + 0.5) / w
-    ys = (np.arange(h, dtype=np.float32) + 0.5) / h
-    gx, gy = np.meshgrid((xs - 0.5) * asp, ys - 0.5)
-    r2 = gx * gx + gy * gy
-    min_len = int(0.12 * min(h, w))
-
-    # Straight edges pile up on single columns (verticals) and rows
-    # (horizontals); curved ones smear across several. The peakiness of the
-    # column and row profiles of the corrected edge map is the straightness.
-    def score(k):
-        f = 1.0 + k * r2
-        mx = ((gx * f) / asp + 0.5) * w - 0.5
-        my = ((gy * f) + 0.5) * h - 0.5
-        e = cv2.remap(edges, mx.astype(np.float32), my.astype(np.float32), cv2.INTER_NEAREST).astype(np.float32)
-        col = e.sum(axis=0)
-        row = e.sum(axis=1)
-        return float((col ** 2).sum() + (row ** 2).sum())
-
-    base = score(0.0)
-    if (edges > 0).sum() < 4 * min_len:
+    edges = _edges(gray)
+    g = cv2.GaussianBlur(gray, (5, 5), 0).astype(np.float32)
+    gx_, gy_ = cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1)
+    ys, xs = np.nonzero(edges)
+    if len(xs) < 2000:
         return None
-    ks = np.arange(-0.3, 0.301, 0.02)
-    sc = [score(float(k)) for k in ks]
-    best = float(ks[int(np.argmax(sc))])
-    for step in (0.005, 0.002):
-        cand = [best + d * step for d in (-2, -1, 0, 1, 2)]
-        sc2 = [score(c) for c in cand]
-        best = cand[int(np.argmax(sc2))]
-    # only speak up when straightening really helps
-    if score(best) < base * 1.05:
-        return 0.0
-    return round(max(-0.5, min(0.5, best)), 4)
+    rng = np.random.default_rng(1)
+    if len(xs) > 40000:
+        pick = rng.choice(len(xs), 40000, replace=False)
+        xs, ys = xs[pick], ys[pick]
+    gxs, gys = gx_[ys, xs], gy_[ys, xs]
+    gn = np.maximum(np.sqrt(gxs * gxs + gys * gys), 1e-6)
+    tx, ty = -gys / gn, gxs / gn                        # along the edge
+    ax = ((xs + 0.5) / w - 0.5) * asp
+    ay = (ys + 0.5) / h - 0.5
+    rq = np.sqrt(ax * ax + ay * ay)
+    med_q = float(np.median(rq))
+    NT = 360                                            # 0.5 degree cells
+    t_bins = np.arange(-2, 3)
+    cos_t = np.cos(np.arange(NT) * np.pi / NT)
+    sin_t = np.sin(np.arange(NT) * np.pi / NT)
+    rho_cell = 1.2 / h                                  # about a pixel
+    nrho = int(2.2 / rho_cell) + 2
+
+    R2 = (asp / 2.0) ** 2 + 0.25
+    rr = np.linspace(0, np.sqrt(R2) * 1.02, 40) ** 2
+
+    def sane(k, k2):
+        # the correction must not fold the picture back on itself before the
+        # corners (a strong pair of terms can): that "straightens" by piling
+        # edges onto each other
+        return bool(np.all(1.0 + 3.0 * k * rr + 5.0 * k2 * rr * rr > 0.35)
+                    and np.all(1.0 + k * rr + k2 * rr * rr > 0.35))
+
+    def peaky(k, k2):
+        if not sane(k, k2):
+            return 0.0
+        e = 1.5 / h
+        if k or k2:
+            x, y = _undist(ax, ay, k, k2)
+            x2, y2 = _undist(ax + tx * e, ay + ty * e, k, k2)
+        else:
+            x, y, x2, y2 = ax, ay, ax + tx * e, ay + ty * e
+        # the edge's direction after the correction (it turns near the corners)
+        th = np.arctan2(x2 - x, -(y2 - y))
+        # keep the picture's size: shrinking everything would fake straightness
+        sc = med_q / max(1e-9, float(np.median(np.sqrt(x * x + y * y))))
+        x, y = x * sc, y * sc
+        tb = (np.round((th % np.pi) / np.pi * NT).astype(np.int64))[:, None] + t_bins[None, :]
+        tb %= NT
+        rho = x[:, None] * cos_t[tb] + y[:, None] * sin_t[tb]
+        rb = np.clip(np.round(rho / rho_cell).astype(np.int64) + nrho // 2, 0, nrho - 1)
+        acc = np.bincount((tb * nrho + rb).ravel(), minlength=NT * nrho).astype(np.float64)
+        return float((acc * acc).sum())
+
+    base = peaky(0.0, 0.0)
+    best, best_v = (0.0, 0.0), base
+    for a in np.arange(-0.3, 0.301, 0.03):
+        for b2 in np.arange(-0.3, 0.301, 0.06):
+            v = peaky(float(a), float(b2))
+            if v > best_v:
+                best, best_v = (float(a), float(b2)), v
+    for step in (0.01, 0.004):
+        a0, b0 = best
+        for da in (-2, -1, 0, 1, 2):
+            for db in (-2, -1, 0, 1, 2):
+                c2 = (a0 + da * step, b0 + db * 2 * step)
+                v = peaky(*c2)
+                if v > best_v:
+                    best, best_v = c2, v
+    # the second term only when it clearly adds something; alone it fits noise
+    one = max(((float(a), 0.0) for a in np.arange(best[0] - 0.06, best[0] + 0.061, 0.004)),
+              key=lambda c: peaky(*c))
+    if peaky(*one) >= best_v * 0.99:
+        best, best_v = one, peaky(*one)
+    # only speak up when it really straightens the lines
+    if best_v < base * 1.04:
+        return 0.0, 0.0
+    clamp = lambda v: round(max(-0.5, min(0.5, float(v))), 4)
+    return clamp(best[0]), clamp(best[1])
+
+
+# --------------------------------------------------------------------------
+# Colour fringes: lateral chromatic aberration, measured from the photo
+# --------------------------------------------------------------------------
+
+CA_UNIT = 0.003          # photo_edit.CA_UNIT - one slider step of 1.0
+
+
+def measure_ca(rgb01: np.ndarray):
+    """How much bigger or smaller the red and the blue picture are than the
+    green one, as (ca_r, ca_b) in slider units (1.0 = CA_UNIT), or None when
+    there are too few hard edges to tell.
+
+    Each channel's edges are scaled about the centre until they sit on the
+    green channel's edges (best correlation of their gradients), looking only
+    at strong edges away from the middle - that is where the fringes are and
+    where the scale shows."""
+    img = np.clip(rgb01, 0, 1).astype(np.float32)
+    h, w = img.shape[:2]
+    k_ = min(1.0, 3000.0 / max(h, w))
+    if k_ < 1:
+        img = cv2.resize(img, (int(w * k_), int(h * k_)), interpolation=cv2.INTER_AREA)
+        h, w = img.shape[:2]
+
+    def grads(ch):
+        g = cv2.GaussianBlur(ch, (0, 0), 0.8)
+        return cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+
+    gxg, gyg = grads(img[..., 1])
+    mag = np.sqrt(gxg * gxg + gyg * gyg)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    rr = np.sqrt(((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2) / np.sqrt(2)
+    strong = mag > np.percentile(mag, 97)
+    mask = strong & (rr > 0.35)
+    if mask.sum() < 3000:
+        return None
+    # not where a channel is blown: a clipped edge has no colour to compare
+    mask &= (img.max(axis=2) < 0.98) | (img.min(axis=2) > 0.02)
+    ys, xs = np.nonzero(mask)
+    if len(ys) > 60000:
+        pick = np.random.default_rng(3).choice(len(ys), 60000, replace=False)
+        ys, xs = ys[pick], xs[pick]
+    G = np.concatenate([gxg[ys, xs], gyg[ys, xs]])
+    G = (G - G.mean()) / (G.std() + 1e-9)
+    cx, cy = w / 2.0 - 0.5, h / 2.0 - 0.5
+
+    def score(gx, gy, k):
+        # the channel sampled at (1 + k) times the distance from the centre
+        n = len(xs)
+        pad = (-n) % 256                            # remap wants a 2-D map under 32k wide
+        sx = np.pad((cx + (xs - cx) * (1.0 + k)).astype(np.float32), (0, pad)).reshape(-1, 256)
+        sy = np.pad((cy + (ys - cy) * (1.0 + k)).astype(np.float32), (0, pad)).reshape(-1, 256)
+        a = cv2.remap(gx, sx, sy, cv2.INTER_LINEAR).ravel()[:n]
+        b = cv2.remap(gy, sx, sy, cv2.INTER_LINEAR).ravel()[:n]
+        C = np.concatenate([a, b])
+        C = (C - C.mean()) / (C.std() + 1e-9)
+        return float((C * G).mean())
+
+    out = []
+    for ch in (0, 2):
+        gx, gy = grads(img[..., ch])
+        ks = np.arange(-2.0, 2.001, 0.1) * CA_UNIT
+        sc = [score(gx, gy, k) for k in ks]
+        i = int(np.argmax(sc))
+        k = float(ks[i])
+        if 0 < i < len(ks) - 1:                     # parabola through the peak
+            a, b, c = sc[i - 1], sc[i], sc[i + 1]
+            den = a - 2 * b + c
+            if den < 0:
+                k += 0.5 * (a - c) / den * float(ks[1] - ks[0])
+        # only when it clearly lines up better than leaving it
+        base = score(gx, gy, 0.0)
+        best = score(gx, gy, k)
+        out.append(round(k / CA_UNIT, 3) if best > base + 0.002 else 0.0)
+    return out[0], out[1]

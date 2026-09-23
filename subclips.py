@@ -2,9 +2,10 @@
 
 Sub-clips: mark an in and an out on a clip, keep the range, and when wanted
 render it out with ffmpeg. The range is the record; the rendered file is a
-by-product that can be made again. A render lands in a "Clips" folder beside
-the source and joins the library as an ordinary video, so it can be tagged,
-shared on a portal or dragged into Resolve like anything else.
+by-product that can be made again. Normally a cut is handed over as a
+download (one file, or several as a ZIP) and nothing is written to the drive
+(/api/cuts/download). "Save to library" still renders into a "Clips" folder
+beside the source, joining the library as an ordinary video.
 
 Two render modes, because they answer different questions:
   fast  - stream copy. Seconds even for 4K, but the cut snaps to the keyframe
@@ -147,7 +148,15 @@ def list_subclips(video_id: Optional[int] = None, limit: int = 500,
     if video_id is not None:
         q = q.filter(SubClip.video_id == video_id)
     rows = q.order_by(SubClip.video_id, SubClip.start).limit(max(1, min(limit, 2000))).all()
-    return {"subclips": [_as_dict(db, c) for c in rows]}
+    out = [_as_dict(db, c) for c in rows]
+    # what each range is cut from, for lists that span the library
+    ids = {c.video_id for c in rows}
+    vids = {v.id: v for v in db.query(Video).filter(Video.id.in_(ids)).all()} if ids else {}
+    for d in out:
+        v = vids.get(d["video_id"])
+        d["video_filename"] = v.filename if v else None
+        d["video_thumbnail"] = v.thumbnail_path if v else None
+    return {"subclips": out}
 
 
 @router.post("/api/subclips")
@@ -456,6 +465,186 @@ def subclip_file(clip_id: int, token: Optional[str] = None,
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="The rendered file is gone")
     return FileResponse(path, filename=v.filename, media_type="application/octet-stream")
+
+
+# --------------------------------------------------------------------------
+# cuts as downloads
+# --------------------------------------------------------------------------
+# Marking in and out and exporting should hand the cut over, not put a second
+# copy of the footage on the drive. These render into the system temp folder,
+# go to the browser (one cut as its file, several as one ZIP) and are thrown
+# away after a couple of hours. "Save to library" above is still there for the
+# rare cut worth keeping.
+
+import tempfile
+import time
+import uuid
+import zipfile
+
+CUT_JOBS: dict = {}
+_cut_lock = threading.Lock()
+_CUT_TTL = 2 * 3600
+
+
+def _cuts_dir() -> Path:
+    d = Path(tempfile.gettempdir()) / "zerko-cuts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sweep_cuts():
+    now = time.time()
+    with _cut_lock:
+        old = [k for k, j in CUT_JOBS.items() if now - j["t"] > _CUT_TTL]
+        for k in old:
+            CUT_JOBS.pop(k, None)
+    for d in _cuts_dir().iterdir():
+        try:
+            if now - d.stat().st_mtime > _CUT_TTL:
+                shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink()
+        except OSError:
+            pass
+
+
+class CutItem(BaseModel):
+    video_id: int
+    start: float = Field(..., ge=0)
+    end: float = Field(..., gt=0)
+    name: Optional[str] = Field(None, max_length=200)
+
+
+class CutDownload(BaseModel):
+    items: list[CutItem] = []
+    subclip_ids: list[int] = []
+    mode: str = "fast"
+    zip_name: Optional[str] = Field(None, max_length=120)
+
+
+def _safe(s: str) -> str:
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "", s or "").strip(" .")
+    return re.sub(r"\s+", " ", s)[:120]
+
+
+def _run_cuts(job_id: str):
+    job = CUT_JOBS[job_id]
+    out_dir = Path(job["dir"])
+    done = []
+    used = set()
+    for i, it in enumerate(job["items"]):
+        with _cut_lock:
+            job["current"] = it["label"]
+            job["done"] = i
+        src = it["src"]
+        stem = _safe(it["name"]) or f"{Path(src).stem}_{_file_tc(it['start'])}-{_file_tc(it['end'])}"
+        ext = ".mp4" if job["mode"] == "exact" else (Path(src).suffix.lower() or ".mp4")
+        name = f"{stem}{ext}"
+        n = 2
+        while name.lower() in used:
+            name = f"{stem}_{n}{ext}"
+            n += 1
+        used.add(name.lower())
+        out = out_dir / name
+        args = _ffmpeg_args(src, str(out), it["start"], it["end"], job["mode"])
+        args = args[:-1] + ["-f", _muxer_for(ext), args[-1]]
+        kw = {}
+        if os.name == "posix":
+            kw["preexec_fn"] = lambda: os.nice(5)
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=6 * 3600, **kw)
+            ok = r.returncode == 0 and out.exists() and out.stat().st_size > 0
+            err = "" if ok else ((r.stderr or b"").decode("utf-8", "replace")[-400:] or "ffmpeg failed")
+        except Exception as e:
+            ok, err = False, str(e)[:400]
+        if ok:
+            done.append(out)
+        else:
+            with _cut_lock:
+                job["errors"].append(f"{it['label']}: {err}")
+    with _cut_lock:
+        job["done"] = len(job["items"])
+        job["current"] = ""
+    if not done:
+        with _cut_lock:
+            job["status"] = "failed"
+        return
+    if len(done) == 1:
+        path, fname = done[0], done[0].name
+    else:
+        fname = (_safe(job.get("zip_name") or "") or "Cuts") + ".zip"
+        path = out_dir / fname
+        # video is already compressed: store, don't squeeze
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+            for f in done:
+                z.write(f, f.name)
+                f.unlink(missing_ok=True)
+    with _cut_lock:
+        job["file"], job["filename"], job["status"] = str(path), fname, "done"
+
+
+@router.post("/api/cuts/download")
+def start_cut_download(body: CutDownload, db: Session = Depends(get_db),
+                       current_user: User = Depends(get_current_user)):
+    mode = (body.mode or "fast").lower()
+    if mode not in ("fast", "exact"):
+        raise HTTPException(status_code=400, detail="mode is 'fast' or 'exact'")
+    items = []
+    wanted = [dict(video_id=i.video_id, start=i.start, end=i.end, name=i.name or "") for i in body.items]
+    if body.subclip_ids:
+        rows = db.query(SubClip).filter(SubClip.id.in_(body.subclip_ids)).all()
+        by = {r.id: r for r in rows}
+        for cid in body.subclip_ids:
+            r = by.get(cid)
+            if r:
+                wanted.append(dict(video_id=r.video_id, start=r.start, end=r.end, name=r.name or ""))
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Nothing to export")
+    if len(wanted) > 200:
+        raise HTTPException(status_code=400, detail="At most 200 cuts at a time")
+    for w in wanted:
+        v = _video_or_404(db, w["video_id"])
+        start, end = _clean_range(v, w["start"], w["end"])
+        src = _resolve(v.filepath)
+        if not src or not os.path.exists(src):
+            raise HTTPException(status_code=404, detail=f"{v.filename} is not on the drive")
+        items.append(dict(src=src, start=start, end=end, name=w["name"],
+                          label=f"{v.filename} {_tc(start)}-{_tc(end)}"))
+    _sweep_cuts()
+    job_id = uuid.uuid4().hex[:16]
+    d = _cuts_dir() / job_id
+    d.mkdir(parents=True, exist_ok=True)
+    with _cut_lock:
+        CUT_JOBS[job_id] = dict(t=time.time(), user=current_user.username, dir=str(d), items=items,
+                                mode=mode, zip_name=body.zip_name, status="running", done=0,
+                                current="", errors=[], file=None, filename=None)
+    threading.Thread(target=_run_cuts, args=(job_id,), daemon=True, name=f"zerko-cuts-{job_id}").start()
+    return {"id": job_id, "total": len(items)}
+
+
+@router.get("/api/cuts/download/{job_id}")
+def cut_download_status(job_id: str, current_user: User = Depends(get_current_user)):
+    with _cut_lock:
+        j = CUT_JOBS.get(job_id)
+        if not j or (j["user"] != current_user.username and current_user.role != "admin"):
+            raise HTTPException(status_code=404, detail="That export has expired - export it again")
+        return {"id": job_id, "status": j["status"], "done": j["done"], "total": len(j["items"]),
+                "current": j["current"], "errors": j["errors"][:20], "filename": j["filename"]}
+
+
+@router.get("/api/cuts/download/{job_id}/file")
+def cut_download_file(job_id: str, token: Optional[str] = None, db: Session = Depends(get_db)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user = get_user_from_token(token, db)
+    if not user or not permissions.can(user.role, permissions.DOWNLOAD):
+        raise HTTPException(status_code=403, detail="Your account cannot download files.")
+    with _cut_lock:
+        j = CUT_JOBS.get(job_id)
+    if not j or not j.get("file") or (j["user"] != user.username and user.role != "admin"):
+        raise HTTPException(status_code=404, detail="That export has expired - export it again")
+    if not os.path.exists(j["file"]):
+        raise HTTPException(status_code=404, detail="The file is gone - export it again")
+    mt = "application/zip" if j["file"].endswith(".zip") else "application/octet-stream"
+    return FileResponse(j["file"], media_type=mt, filename=j["filename"], headers={"Cache-Control": "no-store"})
 
 
 # --------------------------------------------------------------------------

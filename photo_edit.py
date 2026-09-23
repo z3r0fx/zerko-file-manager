@@ -117,7 +117,7 @@ class Mask(BaseModel):
     that only makes sense globally - lens correction, the tone curve, the
     watermark - deliberately has no per-mask equivalent.
     """
-    kind: str = "radial"                              # radial | linear | brush
+    kind: str = "radial"                              # radial | linear | brush | colour (the whole frame, by its colour range)
     # brush: a painted (or AI-selected) greyscale bitmap in SOURCE space - the
     # photo as it comes off the card, before crop and geometry - so cropping
     # or straightening later never moves it off what it was painted on.
@@ -158,7 +158,11 @@ class Mask(BaseModel):
     range_soft: float = Field(0.1, ge=0.005, le=0.5)  # how gently the ends fade
     hue_on: bool = False
     hue: float = Field(0, ge=0, le=360)               # degrees
-    hue_width: float = Field(30, ge=5, le=180)        # +- degrees kept fully
+    hue_width: float = Field(30, ge=2, le=180)        # +- degrees kept fully
+    hue_soft: float = Field(25, ge=1, le=90)          # degrees over which it fades
+    # how colourful a pixel must be to count (0 = the old gentle ramp); a
+    # colour picked from a muted sage wall sets this low, so it is still found
+    sat_lo: float = Field(0, ge=0, le=1)
 
 
 def range_weight(s: np.ndarray, m: "Mask") -> Optional[np.ndarray]:
@@ -166,6 +170,8 @@ def range_weight(s: np.ndarray, m: "Mask") -> Optional[np.ndarray]:
     None when neither is in use. Mirrors rangeW() in the COMBINE shader."""
     lum_on = m.range_lo > 0.0 or m.range_hi < 1.0
     if not lum_on and not m.hue_on:
+        if m.kind == "colour":
+            return np.full(s.shape[:2], 0.0 if m.invert else 1.0, np.float32)
         return None
     w = np.ones(s.shape[:2], dtype=np.float32)
     if lum_on:
@@ -179,9 +185,18 @@ def range_weight(s: np.ndarray, m: "Mask") -> Optional[np.ndarray]:
         hue, chroma = _hue_chroma(s)
         d = np.abs(((hue - float(m.hue) + 540.0) % 360.0) - 180.0)
         wid = float(m.hue_width)
-        wh = 1.0 - _smoothstep(wid, wid + 25.0, d)
-        w *= wh * np.clip(chroma * 4.0, 0.0, 1.0)
+        wh = 1.0 - _smoothstep(wid, wid + float(m.hue_soft), d)
+        w *= wh * _chroma_gate(chroma, float(m.sat_lo))
+    if m.kind == "colour" and m.invert:
+        w = 1.0 - w
     return w.astype(np.float32)
+
+
+def _chroma_gate(chroma: np.ndarray, sat_lo: float) -> np.ndarray:
+    """How much a pixel's colourfulness lets it into a colour selection."""
+    if sat_lo <= 0:
+        return np.clip(chroma * 4.0, 0.0, 1.0)
+    return _smoothstep(sat_lo * 0.5, sat_lo + 1e-3, chroma)
 
 
 def _hue_chroma(s: np.ndarray):
@@ -269,6 +284,30 @@ def apply_grade(s: np.ndarray, r: "Recipe") -> np.ndarray:
             + wm[..., None] * (float(r.grade_mid_sat) * _tint(r.grade_mid_hue))
             + wh[..., None] * (float(r.grade_hi_sat) * _tint(r.grade_hi_hue)))
     return np.clip(s + push * 0.25, 0.0, 1.0).astype(np.float32)
+
+
+def primaries(r: "Recipe"):
+    """The four primary wheels as per-channel lift, gain, gamma exponent and
+    offset - or None when they are all at rest. The preview uses the same."""
+    vals = [r.pw_lift_sat, r.pw_lift_y, r.pw_gamma_sat, r.pw_gamma_y, r.pw_gain_sat, r.pw_gain_y, r.pw_offset_sat, r.pw_offset_y]
+    if not any(vals):
+        return None
+    lift = 0.25 * r.pw_lift_y + 0.4 * r.pw_lift_sat * _tint(r.pw_lift_hue)
+    gain = np.exp2(r.pw_gain_y + 0.8 * r.pw_gain_sat * _tint(r.pw_gain_hue))
+    gam = np.exp2(-(0.8 * r.pw_gamma_y + 0.8 * r.pw_gamma_sat * _tint(r.pw_gamma_hue)))
+    off = 0.2 * r.pw_offset_y + 0.25 * r.pw_offset_sat * _tint(r.pw_offset_hue)
+    return lift.astype(np.float32), gain.astype(np.float32), gam.astype(np.float32), off.astype(np.float32)
+
+
+def apply_primaries(s: np.ndarray, r: "Recipe") -> np.ndarray:
+    """Lift / gamma / gain / offset. Mirrors DEVELOP."""
+    p = primaries(r)
+    if p is None:
+        return s
+    lift, gain, gam, off = p
+    v = s * gain + lift * (1.0 - s)
+    v = np.power(np.maximum(v, 0.0), gam) + off
+    return np.clip(v, 0.0, 1.0).astype(np.float32)
 
 
 def mask_dir(video_id) -> Path:
@@ -361,6 +400,8 @@ def mask_field(m: Mask, h: int, w: int) -> np.ndarray:
     u = dx * ct + dy * st
     v = -dx * st + dy * ct
 
+    if m.kind == "colour":
+        return np.full((h, w), float(m.amount), np.float32)
     if m.kind == "linear":
         # Distance across the line, in units of ry. Positive on one side.
         t = v / max(1e-4, float(m.ry))
@@ -407,7 +448,7 @@ def _apply_one_mask(s: np.ndarray, m: Mask, field: Optional[np.ndarray] = None) 
             lin = lin * (1.0 + np.float32(m.shadows) *
                          (1.0 - _smoothstep(0.0, 0.25, y)).astype(np.float32))
         if m.highlights:
-            lin = lin * (1.0 + np.float32(m.highlights) * _smoothstep(0.35, 1.0, y))
+            lin = lin * highlight_gain(y, float(m.highlights))
 
     if m.contrast:
         lin = PIVOT * np.power(np.clip(lin, 1e-6, None) / PIVOT,
@@ -459,7 +500,7 @@ class RemoveArea(BaseModel):
     under .edit-masks, by ref) laid over box = (x, y, w, h), source 0..1."""
     ref: str = Field(..., pattern=r"^\d+/[a-z0-9]{8,32}$")
     box: List[float] = Field(..., min_length=4, max_length=4)
-    kind: str = Field("remove", pattern="^(remove|pull)$")   # pull: a window view from a darker frame
+    kind: str = Field("remove", pattern="^(remove|pull|sky|glow)$")   # pull: a window view from a darker frame; sky: a new sky; glow: windows lit
 
 
 class Spot(BaseModel):
@@ -476,6 +517,48 @@ class Spot(BaseModel):
     opacity: float = Field(1, ge=0, le=1)
     mode: str = Field("heal", pattern="^(heal|clone)$")
     g: int = Field(0, ge=0)                       # spots painted in one stroke share a group
+
+
+class Slice(BaseModel):
+    """One colour, picked from the photo, and what to do with it - Resolve's
+    ColorSlice. The slice sits wherever the colour really is (a sage wardrobe
+    at 80 degrees is neither 'yellow' nor 'green'), as wide as asked, and takes
+    in muted colours too."""
+    hue: float = Field(120, ge=0, le=360)
+    width: float = Field(18, ge=1, le=120)       # +- degrees kept fully
+    soft: float = Field(20, ge=1, le=90)         # degrees over which it fades
+    sat_min: float = Field(0.02, ge=0, le=1)     # colourfulness from which a pixel counts
+    hue_shift: float = Field(0, ge=-90, le=90)   # degrees
+    sat: float = Field(0, ge=-1, le=2)
+    density: float = Field(0, ge=-1, le=1)       # richer and darker (or thinner and lighter)
+    lum: float = Field(0, ge=-1, le=1)
+    enabled: bool = True
+    name: str = Field("", max_length=40)
+
+
+def slice_weight(hue: np.ndarray, chroma: np.ndarray, sl: "Slice") -> np.ndarray:
+    d = np.abs(((hue - float(sl.hue) + 540.0) % 360.0) - 180.0)
+    w = 1.0 - _smoothstep(float(sl.width), float(sl.width) + float(sl.soft), d)
+    return (w * _smoothstep(float(sl.sat_min) * 0.5, float(sl.sat_min) + 1e-3, chroma)).astype(np.float32)
+
+
+def apply_slices(s: np.ndarray, r: "Recipe") -> np.ndarray:
+    """The colour slices, one after the other. Mirrors DEVELOP (uSl*)."""
+    for sl in (r.slices or [])[:6]:
+        if not sl.enabled or not (sl.hue_shift or sl.sat or sl.density or sl.lum):
+            continue
+        hue, chroma = _hue_chroma(s)
+        w = slice_weight(hue, chroma, sl)
+        if sl.hue_shift:
+            live = chroma >= 1e-5
+            moved = _from_hue(hue + float(sl.hue_shift) * w, s.max(axis=-1), s.min(axis=-1))
+            s = np.where(live[..., None], moved, s)
+        y = (s @ LUMA)[..., None]
+        f = 1.0 + (float(sl.sat) + 0.5 * float(sl.density)) * w[..., None]
+        s = y + (s - y) * f
+        s = s * (1.0 + (0.6 * float(sl.lum) - 0.35 * float(sl.density)) * w[..., None])
+        s = np.clip(s, 0.0, 1.0).astype(np.float32)
+    return s
 
 
 class Recipe(BaseModel):
@@ -529,6 +612,21 @@ class Recipe(BaseModel):
     grade_hi_hue: float = Field(45, ge=0, le=360)
     grade_hi_sat: float = Field(0, ge=0, le=1)
     grade_balance: float = Field(0, ge=-1, le=1)
+    # Primary wheels, as in Resolve: lift (blacks), gamma (mids), gain
+    # (whites) and offset (everything). Each has a colour (hue + amount) and
+    # a master that moves its brightness.
+    pw_lift_hue: float = Field(0, ge=0, le=360)
+    pw_lift_sat: float = Field(0, ge=0, le=1)
+    pw_lift_y: float = Field(0, ge=-1, le=1)
+    pw_gamma_hue: float = Field(0, ge=0, le=360)
+    pw_gamma_sat: float = Field(0, ge=0, le=1)
+    pw_gamma_y: float = Field(0, ge=-1, le=1)
+    pw_gain_hue: float = Field(0, ge=0, le=360)
+    pw_gain_sat: float = Field(0, ge=0, le=1)
+    pw_gain_y: float = Field(0, ge=-1, le=1)
+    pw_offset_hue: float = Field(0, ge=0, le=360)
+    pw_offset_sat: float = Field(0, ge=0, le=1)
+    pw_offset_y: float = Field(0, ge=-1, le=1)
     # Watermark. The PNG itself lives in MEDIA_ROOT/_watermarks; these say
     # which one, how strong, how big and where. Opacity 0 means none, so the
     # feature costs nothing until it is switched on.
@@ -564,9 +662,24 @@ class Recipe(BaseModel):
     # green speckle that high ISO leaves in shadows.
     dn_luma: float = Field(0, ge=0, le=1)
     dn_colour: float = Field(0, ge=0, le=1)
+    # 0: noise reduction everywhere. Above 0: only in the shadows, up to this
+    # brightness (fading out over a little either side), so clean bright
+    # detail - leaves, brick - is never touched.
+    dn_shadows: float = Field(0, ge=0, le=1)
     # Geometry, applied before anything else: lens distortion, then keystone,
     # then straightening, then the crop.
     distortion: float = Field(0, ge=-0.5, le=0.5)
+    # A second lens term (r^4): wide lenses bend the edges much more than the
+    # middle, and one term that fixed the edges bent the middle lines the
+    # other way. With both, the edges are corrected and the middle left alone.
+    distortion2: float = Field(0, ge=-0.5, le=0.5)
+    # Colour fringes from the lens (lateral chromatic aberration): the red and
+    # the blue picture are a touch bigger or smaller than the green one, so
+    # every hard edge gets a red/cyan or blue/yellow outline that grows toward
+    # the corners - drone lenses are bad for it. Each is a radial scale of
+    # that channel: 1.0 = CA_UNIT (0.3%, about 8 px at a 20 MP corner).
+    ca_r: float = Field(0, ge=-1, le=1)
+    ca_b: float = Field(0, ge=-1, le=1)
     persp_v: float = Field(0, ge=-1, le=1)
     persp_h: float = Field(0, ge=-1, le=1)
     straighten: float = Field(0, ge=-45, le=45)      # degrees
@@ -578,6 +691,7 @@ class Recipe(BaseModel):
     # Local adjustments. Applied last, over the finished global grade, in the
     # order they were added.
     masks: List[Mask] = Field(default_factory=list)
+    slices: List[Slice] = Field(default_factory=list, max_length=6)
     # Post-crop effects, on the finished frame
     vignette: float = Field(0, ge=-1, le=1)       # - darkens the edges, + lightens
     vig_mid: float = Field(0.5, ge=0, le=1)
@@ -596,6 +710,15 @@ class Recipe(BaseModel):
     # One-click fixes that are on, and exactly what each one added - so
     # switching one off takes back its own change and nothing else.
     fixes: Dict[str, Dict[str, float]] = Field(default_factory=dict)
+    # A generated look (ai_photo): the picture an image model painted from
+    # this edit (gen<id>g.png) and the edit it was painted from (gen<id>d.png),
+    # both over the cropped frame. Their difference is laid over the finished
+    # photo, so the look brings its light and colour and the full-size
+    # detail stays the photo's own. gen_geo: the crop/angle it was made for.
+    gen_ref: str = Field("", pattern=r"^(|\d+/gen[a-f0-9]{12})$")
+    gen_amount: float = Field(1.0, ge=0, le=1)
+    gen_look: str = Field("", max_length=80)
+    gen_geo: str = Field("", max_length=400)
 
 
 # --------------------------------------------------------------------------
@@ -788,7 +911,8 @@ def has_geometry(r: "Recipe") -> bool:
     c = list(r.crop or [0, 0, 1, 1])
     cropped = (abs(c[0]) > 1e-6 or abs(c[1]) > 1e-6
                or abs(c[2] - 1) > 1e-6 or abs(c[3] - 1) > 1e-6)
-    return bool(cropped or r.distortion or r.persp_v or r.persp_h
+    return bool(cropped or r.distortion or getattr(r, "distortion2", 0) or r.persp_v or r.persp_h
+                or getattr(r, "ca_r", 0) or getattr(r, "ca_b", 0)
                 or r.straighten or r.rotate or abs(r.geo_scale - 1) > 1e-6
                 or getattr(r, "flip_h", False) or getattr(r, "flip_v", False))
 
@@ -836,9 +960,9 @@ def source_uv(u: np.ndarray, v: np.ndarray, r: "Recipe", aspect: float):
         x = x / denom
         y = y / denom
 
-    if r.distortion:
+    if r.distortion or getattr(r, "distortion2", 0):
         r2 = x * x + y * y
-        f = 1.0 + float(r.distortion) * r2
+        f = 1.0 + float(r.distortion) * r2 + float(getattr(r, "distortion2", 0) or 0) * r2 * r2
         x = x * f
         y = y * f
 
@@ -861,8 +985,27 @@ def apply_geometry(img: np.ndarray, r: "Recipe") -> np.ndarray:
 
     map_x = (su * w - 0.5).astype(np.float32)
     map_y = (sv * h - 0.5).astype(np.float32)
-    return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    ca = (float(getattr(r, "ca_r", 0) or 0), float(getattr(r, "ca_b", 0) or 0))
+    if not any(ca):
+        return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    # red and blue read from their own, slightly scaled, place (GEOM shader)
+    out = np.empty((out_h, out_w, img.shape[2]), img.dtype)
+    for c in range(img.shape[2]):
+        k = CA_UNIT * (ca[0] if c == 0 else ca[1] if c == 2 else 0.0)
+        mx = ((0.5 + (su - 0.5) * (1.0 + k)) * w - 0.5).astype(np.float32) if k else map_x
+        my = ((0.5 + (sv - 0.5) * (1.0 + k)) * h - 0.5).astype(np.float32) if k else map_y
+        # a scaled channel just past the frame edge repeats the edge (the
+        # shader's texture clamp); outside the frame stays black for all three
+        out[..., c] = cv2.remap(np.ascontiguousarray(img[..., c]), mx, my, interpolation=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_REPLICATE if k else cv2.BORDER_CONSTANT, borderValue=0)
+    if abs(ca[0]) + abs(ca[1]):
+        outside = (su < 0) | (su > 1) | (sv < 0) | (sv > 1)
+        out[outside] = 0
+    return out
+
+
+CA_UNIT = 0.003
 
 
 # --------------------------------------------------------------------------
@@ -887,53 +1030,268 @@ def _from_ycocg(y, co, cg):
     return np.stack([r, g, b], axis=-1).astype(np.float32)
 
 
-def denoise(c: np.ndarray, luma: float, colour: float) -> np.ndarray:
-    """Edge-aware smoothing, the same 5x5 the shader walks.
+# What a photo's noise looks like when nothing is known yet (its profile is
+# measured when the editor opens it): the grain of a clean camera at base ISO.
+NOISE_DEFAULT = {"y": [0.004] * 8, "c": [0.006] * 8}
+_NOISE_CACHE: dict = {}
 
-    Luma keeps an edge by weighting each neighbour on how close its brightness
-    is; colour just averages, because chroma noise has no detail worth saving
-    and blurring it is what actually clears the red-green speckle.
+
+def noise_profile(path: str) -> dict:
+    """How much grain this photo has at each brightness, in its own pixels:
+    {"y": 8 values of luma noise, "c": 8 of colour noise} over 8 brightness
+    bands, in 0..1 units. Measured on the flat patches of the full-size
+    photo, so noise reduction knows what is noise and what is texture."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return NOISE_DEFAULT
+    key = (path, st.st_mtime_ns, st.st_size)
+    if key in _NOISE_CACHE:
+        return _NOISE_CACHE[key]
+    # kept on disk too: a batch export should not decode every RAW twice
+    import hashlib
+    disk = None
+    if _media_root is not None:
+        disk = (_media_root / ".edit-base" /
+                f"noise4_{hashlib.sha1(path.encode()).hexdigest()[:16]}_{st.st_mtime_ns}_{st.st_size}.json")
+        try:
+            prof = json.loads(disk.read_text())
+            if len(prof.get("y", [])) == 8 and len(prof.get("c", [])) == 8:
+                _NOISE_CACHE[key] = prof
+                return prof
+        except Exception:
+            pass
+    try:
+        img = _full_size(path)
+    except Exception:
+        return NOISE_DEFAULT
+    prof = noise_floor(img)
+    _NOISE_CACHE[key] = prof
+    if disk is not None and prof is not NOISE_DEFAULT:
+        try:
+            disk.parent.mkdir(parents=True, exist_ok=True)
+            disk.write_text(json.dumps(prof))
+        except OSError:
+            pass
+    return prof
+
+
+def noise_floor(img: np.ndarray) -> dict:
+    """The grain of a photo at each of 8 brightness bands, luma and colour.
+
+    The whole photo is cut into 16 x 16 blocks and the grain's strength is
+    measured in each (what a small blur takes away). Texture - leaves, fabric,
+    brick - can only add to that, never take away, so the quietest blocks of
+    each brightness are pure grain: the noise floor. Taking the quiet end
+    (not the middle) is what keeps foliage from being read as noise, and
+    looking at every block (not a few crops) is what finds the grain in a
+    small dark room seen through a window. Brightness bands with too few
+    blocks borrow from their neighbours along the curve."""
+    import cv2
+    h, w = img.shape[:2]
+    B = 16
+    band_blocks = [[] for _ in range(8)]
+    band_blocks_c = [[] for _ in range(8)]
+    step = 1024
+    for r0 in range(0, h, step):
+        a0, a1 = max(0, r0 - 16), min(h, r0 + step + 16)
+        c = img[a0:a1].astype(np.float32) / 255.0
+        y, co, cg = _ycocg(c)
+        ry = y - cv2.GaussianBlur(y, (0, 0), 2.0)
+        rc = np.hypot(co - cv2.GaussianBlur(co, (0, 0), 3.0), cg - cv2.GaussianBlur(cg, (0, 0), 3.0))
+        lo = r0 - a0
+        hi = lo + min(step, h - r0)
+        ry, rc, yv = ry[lo:hi], rc[lo:hi], cv2.GaussianBlur(y, (0, 0), 3.0)[lo:hi]
+        hh = (ry.shape[0] // B) * B
+        ww = (w // B) * B
+        if hh < B or ww < B:
+            continue
+        def blocks(a):
+            return a[:hh, :ww].reshape(hh // B, B, ww // B, B).swapaxes(1, 2).reshape(-1, B * B)
+        by = blocks(ry)
+        sd = by.std(axis=1)
+        sc = np.sqrt((blocks(rc) ** 2).mean(axis=1))
+        mean = blocks(yv).mean(axis=1)
+        # clipped blocks (pure black, blown white) have no grain to show
+        ok = (mean > 0.012) & (mean < 0.985)
+        band = np.clip((mean * 8).astype(np.int32), 0, 7)
+        for i in range(8):
+            sel = ok & (band == i)
+            if sel.any():
+                band_blocks[i].append(sd[sel])
+                band_blocks_c[i].append(sc[sel])
+    out_y, out_c = [None] * 8, [None] * 8
+    for i in range(8):
+        if not band_blocks[i]:
+            continue
+        v = np.concatenate(band_blocks[i])
+        cc = np.concatenate(band_blocks_c[i])
+        if len(v) < 40:
+            continue
+        # the quiet end: 12th percentile, corrected for how a percentile of
+        # block estimates sits below the true value
+        out_y[i] = float(np.percentile(v, 12) * 1.12)
+        out_c[i] = float(np.percentile(cc, 12) * 1.12)
+    have = [i for i in range(8) if out_y[i] is not None]
+    if not have:
+        return NOISE_DEFAULT
+    for arr in (out_y, out_c):
+        for i in range(8):
+            if arr[i] is None:
+                j = min(have, key=lambda j: abs(j - i))
+                arr[i] = arr[j]
+        sm = [(arr[max(0, i - 1)] + 2 * arr[i] + arr[min(7, i + 1)]) / 4 for i in range(8)]
+        arr[:] = sm
+    return {"y": [round(max(0.0008, v), 5) for v in out_y],
+            "c": [round(max(0.0008, v), 5) for v in out_c]}
+
+
+def _band8(arr, v: np.ndarray) -> np.ndarray:
+    """Linear read of an 8-band profile at brightness v (band centres at (i+.5)/8)."""
+    a = np.asarray(arr, np.float32)
+    pos = np.clip(v * 8.0 - 0.5, 0.0, 7.0)
+    i0 = np.floor(pos).astype(np.int32)
+    i1 = np.minimum(i0 + 1, 7)
+    t = (pos - i0).astype(np.float32)
+    return a[i0] * (1 - t) + a[i1] * t
+
+
+def denoise(c: np.ndarray, luma: float, colour: float, k: float = 1.0,
+            pre: Optional[np.ndarray] = None, prof: Optional[dict] = None,
+            fringe: float = 0.0, shadows: float = 0.0) -> np.ndarray:
+    """Noise reduction that only takes out noise.
+
+    The photo's measured noise (noise_profile) says how big the grain is at
+    each brightness. A neighbour is averaged in only when it differs by about
+    that much or less - so grain goes and anything bigger (fabric, foliage,
+    hair, a fine edge) is left exactly as it was. The slider sets how many
+    times the grain's size still counts as grain. The noise is read on the
+    photo before development (pre) and scaled by how much the development
+    brightened that spot, since lifting shadows lifts their grain with them.
+    Colour noise the same way, on the colour differences. Mirrored in the
+    preview shader (web/src/editor/shaders.ts DENOISE) - change both.
     """
-    if not luma and not colour:
+    if not luma and not colour and not fringe:
         return c
+    prof = prof or NOISE_DEFAULT
     y, co, cg = _ycocg(c)
+    y0, co0, cg0 = y, co, cg
+    ys = _ycocg(pre)[0] if pre is not None and pre.shape == c.shape else y
     pad = DN_TAPS
     yp = np.pad(y, pad, mode="reflect")
     cop = np.pad(co, pad, mode="reflect")
     cgp = np.pad(cg, pad, mode="reflect")
     h, w = y.shape
 
-    # How different a neighbour may be and still count as the same surface.
-    # It grows with the slider: stronger means smoother. (It used to shrink
-    # as the slider went up, so 100% did almost nothing.) Mirrored in the
-    # preview shader (web/src/editor/shaders.ts DENOISE) - change both.
-    # (At 100% it only took a third of the noise off; now it clears sensor
-    # grain, while edges stronger than the range survive.)
-    sr = float(0.015 + 0.22 * luma) if luma else 1.0
-    sig = float(1.2 + 1.8 * max(luma, colour))
-    lk = min(1.0, 1.6 * float(luma))
+    # k: working pixels per original pixel (below 1 for a reduced copy - the
+    # preview at fit, a 1920 export): the reach shrinks with it so a small copy
+    # is not smeared, and the grain is smaller there (averaged by the resize)
+    k = float(min(1.0, max(0.05, k)))
+    sig = float(max(0.6, (1.0 + 1.5 * max(luma, colour)) * k))
+    gain = np.clip((y + 0.03) / (ys + 0.03), 0.25, 6.0).astype(np.float32)
+    sy = np.maximum(_band8(prof["y"], ys) * np.float32(k) * gain, 0.0015)
+    sr = (sy * np.float32(1.0 + 3.0 * luma)).astype(np.float32)
+    lk = float(min(1.0, 2.0 * luma))
+    sc = np.maximum(_band8(prof["c"], ys) * np.float32(k) * gain, 0.002)
+    scr = (sc * np.float32(1.5 + 4.0 * colour)).astype(np.float32)
     y_acc = np.zeros_like(y); y_wsum = np.zeros_like(y)
     co_acc = np.zeros_like(co); cg_acc = np.zeros_like(cg); c_wsum = np.zeros_like(co)
 
     for dy in range(-DN_TAPS, DN_TAPS + 1):
         for dx in range(-DN_TAPS, DN_TAPS + 1):
-            sy = yp[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
+            sy_ = yp[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
             spatial = np.float32(np.exp(-0.5 * ((dx * dx + dy * dy) / (sig * sig))))
             if luma:
-                wgt = spatial * np.exp(-0.5 * ((sy - y) / sr) ** 2).astype(np.float32)
-                y_acc += sy * wgt
+                wgt = spatial * np.exp(-0.5 * ((sy_ - y) / sr) ** 2).astype(np.float32)
+                y_acc += sy_ * wgt
                 y_wsum += wgt
             if colour:
-                co_acc += cop[pad + dy:pad + dy + h, pad + dx:pad + dx + w] * spatial
-                cg_acc += cgp[pad + dy:pad + dy + h, pad + dx:pad + dx + w] * spatial
-                c_wsum += spatial
+                nco = cop[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
+                ncg = cgp[pad + dy:pad + dy + h, pad + dx:pad + dx + w]
+                dc = ((nco - co) ** 2 + (ncg - cg) ** 2) / (scr * scr)
+                wc = spatial * np.exp(-0.5 * dc).astype(np.float32)
+                co_acc += nco * wc
+                cg_acc += ncg * wc
+                c_wsum += wc
 
+    # shadows only: how dark each spot is (averaged over the same 7x7, so the
+    # grain itself does not flicker the mask), faded over +-0.1 around the limit
+    wmask = np.float32(1.0)
+    if shadows > 0:
+        import cv2
+        ym = cv2.blur(np.pad(y0, pad, mode="reflect"), (2 * pad + 1, 2 * pad + 1))[pad:pad + h, pad:pad + w]
+        t = np.clip((ym - (shadows - 0.1)) / 0.2, 0.0, 1.0)
+        wmask = (1.0 - t * t * (3.0 - 2.0 * t)).astype(np.float32)
     if luma:
-        y = y * (1.0 - lk) + (y_acc / np.maximum(y_wsum, 1e-6)) * lk
+        a = lk * wmask
+        y = y * (1.0 - a) + (y_acc / np.maximum(y_wsum, 1e-6)) * a
     if colour:
-        co = co * (1.0 - colour) + (co_acc / np.maximum(c_wsum, 1e-6)) * colour
-        cg = cg * (1.0 - colour) + (cg_acc / np.maximum(c_wsum, 1e-6)) * colour
+        a = np.float32(colour) * wmask
+        co = co * (1.0 - a) + (co_acc / np.maximum(c_wsum, 1e-6)) * a
+        cg = cg * (1.0 - a) + (cg_acc / np.maximum(c_wsum, 1e-6)) * a
+    if fringe:
+        co, cg = _defringe(y0, co0, cg0, co, cg, float(fringe), k)
     return np.clip(_from_ycocg(y, co, cg), 0.0, 1.0)
+
+
+def _defringe(y0, co0, cg0, co, cg, amount: float, k: float = 1.0):
+    """In bands of rows, so a 45 MP photo does not need gigabytes of scratch
+    (the result is the same: each band sees 8 rows either side)."""
+    h = y0.shape[0]
+    step = max(64, int(4_000_000 / max(1, y0.shape[1])))
+    if h <= step + 16:
+        return _defringe_band(y0, co0, cg0, co, cg, amount, k)
+    oco, ocg = np.empty_like(co), np.empty_like(cg)
+    for r0 in range(0, h, step):
+        a0, a1 = max(0, r0 - 8), min(h, r0 + step + 8)
+        bco, bcg = _defringe_band(y0[a0:a1], co0[a0:a1], cg0[a0:a1], co[a0:a1], cg[a0:a1], amount, k)
+        oco[r0:min(h, r0 + step)] = bco[r0 - a0:r0 - a0 + min(step, h - r0)]
+        ocg[r0:min(h, r0 + step)] = bcg[r0 - a0:r0 - a0 + min(step, h - r0)]
+    return oco, ocg
+
+
+def _defringe_band(y0, co0, cg0, co, cg, amount: float, k: float = 1.0):
+    """Colour fringes of any colour (the red or cyan line a drone lens draws
+    under a white eave, purple, green) on hard edges.
+
+    A fringe is colour that neither side of the edge has. Each pixel on a
+    hard edge looks a few pixels across the edge both ways; when its colour
+    differs from both sides, it takes the colour of the side it matches in
+    brightness. A red roof against a white wall keeps its red: its edge
+    pixels match the roof side. Mirrored in the DENOISE shader - change both.
+    """
+    import cv2
+    b = cv2.BORDER_REFLECT_101
+    h, w = y0.shape
+    k5 = np.ones((5, 5), np.uint8)
+    rng = cv2.dilate(y0, k5, borderType=b) - cv2.erode(y0, k5, borderType=b)
+    e = np.clip((rng - 0.06) / 0.14, 0.0, 1.0)
+    yp = np.pad(y0, 2, mode="reflect")
+    gx = yp[2:2 + h, 4:4 + w] - yp[2:2 + h, 0:w]
+    gy = yp[4:4 + h, 2:2 + w] - yp[0:h, 2:2 + w]
+    m = np.sqrt(gx * gx + gy * gy) + 1e-6
+    reach = float(min(3.0, max(1.5, 3.0 * k)))           # a fringe is narrower in a reduced copy
+    nx, ny = gx / m * reach, gy / m * reach
+    X, Y = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+
+    def at(img, sx, sy):
+        return cv2.remap(img, (X + sx).astype(np.float32), (Y + sy).astype(np.float32),
+                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    s1 = [at(v, nx, ny) for v in (y0, co0, cg0)]
+    s2 = [at(v, -nx, -ny) for v in (y0, co0, cg0)]
+    d1 = np.hypot(co0 - s1[1], cg0 - s1[2])
+    d2 = np.hypot(co0 - s2[1], cg0 - s2[2])
+    w1 = 1.0 / (np.abs(y0 - s1[0]) + 0.02)
+    w2 = 1.0 / (np.abs(y0 - s2[0]) + 0.02)
+    rco = (w1 * s1[1] + w2 * s2[1]) / (w1 + w2)
+    rcg = (w1 * s1[2] + w2 * s2[2]) / (w1 + w2)
+    t = np.clip((np.minimum(d1, d2) - 0.01) / 0.03, 0.0, 1.0)
+    # only where the edge has a clear direction (a thin line or a corner has
+    # none, and which side is which would be a guess)
+    sure = np.clip((m - 0.02) / 0.06, 0.0, 1.0)
+    a = (np.float32(min(1.0, amount)) * e * t * sure).astype(np.float32)
+    return co * (1 - a) + rco * a, cg * (1 - a) + rcg * a
 
 
 def watermark_dir() -> Path:
@@ -1143,6 +1501,69 @@ def _gnoise(px: np.ndarray, py: np.ndarray) -> np.ndarray:
     return (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy
 
 
+_gen_cache: Dict[str, np.ndarray] = {}
+
+
+def gen_pair(ref: str):
+    """The generated look's two pictures (float RGB 0..1), or None."""
+    import cv2
+    out = []
+    vid, name = ref.split("/")
+    for end in ("g", "d", "m", "k"):
+        key = f"{ref}{end}"
+        a = _gen_cache.get(key)
+        if a is None:
+            f = (_media_root or Path(".")) / ".edit-masks" / vid / f"{name}{end}.png"
+            bgr = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+            if bgr is None:
+                if end in ("m", "k"):      # looks made before the light map existed
+                    out.append(None)
+                    continue
+                return None
+            if bgr.ndim == 2:
+                bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+            if bgr.shape[2] == 4:      # the edit's picture carries where detail may go back in
+                a = cv2.cvtColor(bgr, cv2.COLOR_BGRA2RGBA).astype(np.float32) / 255.0
+            else:
+                a = np.dstack([cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0, np.ones(bgr.shape[:2], np.float32)])
+            if len(_gen_cache) > 16:
+                _gen_cache.clear()
+            _gen_cache[key] = a
+        out.append(a)
+    return out
+
+
+def apply_gen(s: np.ndarray, r: "Recipe") -> np.ndarray:
+    """Lay a generated look over the finished photo. Mirrors the start of
+    finish() in the FINAL shader. Two ways, mixed by the repaint map:
+    - relit = photo * 2^light: the photo's own pixels with the look's light
+      and colour (houses, cars and trees stay real);
+    - painted = G + (photo - D) * k * keep: the model's picture with the
+      photo's detail laid back where it still matches (the sky, window views)."""
+    import cv2
+    maps = gen_pair(r.gen_ref)
+    if maps is None:
+        return s
+    h, w = s.shape[:2]
+    rs = lambda x: None if x is None else (cv2.resize(x, (w, h), interpolation=cv2.INTER_LINEAR) if x.shape[:2] != (h, w) else x)
+    g, d, m, kk = (rs(x) for x in maps)
+    g, d = g[..., :3], d[..., :3]
+    if m is not None and kk is not None:
+        keep, rep_ = kk[..., 0:1], kk[..., 1:2]
+    else:
+        keep = rep_ = np.ones((h, w, 1), np.float32)      # a look made before the light map: all painted
+    lg, ld = g @ LUMA, d @ LUMA
+    k = np.clip((lg + 0.02) / (ld + 0.02), 0.0, 1.6)[..., None].astype(np.float32)
+    painted = g + (s - d) * k * keep
+    if m is not None and kk is not None:
+        relit = s * np.exp2(m[..., :3] * np.float32(7.0) - np.float32(4.0))
+        o = relit + (painted - relit) * rep_
+    else:
+        o = painted
+    a = np.float32(r.gen_amount)
+    return np.clip(s + (o - s) * a, 0.0, 1.0).astype(np.float32)
+
+
 def apply_finish(s: np.ndarray, r: "Recipe") -> np.ndarray:
     """Post-crop vignette and film grain, placed on the output frame. Mirrors
     finish() in the FINAL shader."""
@@ -1193,9 +1614,36 @@ def apply_lens_vignette(rgb01: np.ndarray, r: "Recipe", src_hw=None) -> np.ndarr
     return np.clip(_linear_to_srgb(lin), 0, 1).astype(np.float32)
 
 
-def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
-    """rgb01: float32 HxWx3 in 0..1 sRGB. Returns the same, developed."""
+HL_KNEE = 0.3      # linear light: about 58% grey, where Highlights starts to act
+
+
+def highlight_gain(y: np.ndarray, h: float) -> np.ndarray:
+    """The Highlights slider, as a gain on each pixel (y = its linear light).
+
+    Pulling highlights down rolls everything above the knee onto a soft
+    shoulder: y' = k + (y - k) / (1 + b (y - k)). It never turns back on
+    itself, so the brightest point stays the brightest and keeps its detail
+    (the old curve multiplied by 1 - amount, which at -100 took the peaks to
+    black: blown windows and lamps went grey and flat instead of coming
+    back). Pushing up is unchanged. Mirrored in shaders.ts (DEVELOP and the
+    mask develop) - change both."""
+    if h > 0:
+        return (1.0 + np.float32(h) * _smoothstep(0.35, 1.0, y)).astype(np.float32)
+    b = np.float32(-2.5 * h)
+    over = np.maximum(y - HL_KNEE, 0.0)
+    y2 = HL_KNEE + over / (1.0 + b * over)
+    g = np.where(y > HL_KNEE, y2 / np.maximum(y, 1e-6), 1.0)
+    return g.astype(np.float32)
+
+
+def apply_recipe(rgb01: np.ndarray, r: Recipe, src_long: int = 0, noise: Optional[dict] = None) -> np.ndarray:
+    """rgb01: float32 HxWx3 in 0..1 sRGB. Returns the same, developed.
+
+    src_long: the original's long edge, when rgb01 is a reduced copy of it -
+    so pixel-sized work (noise reduction) is scaled to the original's pixels.
+    """
     src_hw = rgb01.shape[:2]
+    px_k = max(src_hw) / src_long if src_long else 1.0
     if r.removes:
         rgb01 = apply_removes(rgb01, r.removes)
     if r.spots:
@@ -1204,6 +1652,7 @@ def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
         rgb01 = apply_geometry(rgb01, r)
     if r.lens_vig or any(r.lens_vig_k):
         rgb01 = apply_lens_vignette(rgb01, r, src_hw)
+    pre = rgb01                     # the photo before development: its grain is measured here
     lin = _srgb_to_linear(rgb01)
 
     lin = lin * wb_gains(r.temp_k, r.tint)
@@ -1218,8 +1667,7 @@ def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
             mask = (1.0 - _smoothstep(0.0, 0.25, y)).astype(np.float32)
             lin = lin * (1.0 + np.float32(r.shadows) * mask)
         if r.highlights:
-            mask = _smoothstep(0.35, 1.0, y)
-            lin = lin * (1.0 + np.float32(r.highlights) * mask)
+            lin = lin * highlight_gain(y, float(r.highlights))
 
     if r.contrast:
         f = np.float32(1.0 + r.contrast)
@@ -1284,10 +1732,14 @@ def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
         s = np.clip(lum_m + (s - lum_m) * mult[..., None], 0.0, 1.0)
 
     s = apply_hsl(s, r)
+    if r.slices:
+        s = apply_slices(s, r)
     s = apply_grade(s, r)
+    s = apply_primaries(s, r)
 
-    if r.dn_luma or r.dn_colour:
-        s = denoise(s, float(r.dn_luma), float(r.dn_colour))
+    if r.dn_luma or r.dn_colour or r.defringe:
+        s = denoise(s, float(r.dn_luma), float(r.dn_colour), px_k, pre, noise, float(r.defringe),
+                    float(r.dn_shadows))
 
     # Local contrast, both built on one big blur of the developed image.
     if r.clarity or r.dehaze:
@@ -1317,30 +1769,6 @@ def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
         for n, pts in enumerate((r.curve_r, r.curve_g, r.curve_b)):
             s[..., n] = _apply_lut(s[..., n], curve_lut(pts))
 
-    if r.defringe:
-        # Fringing is chroma that only exists where luminance changes fast, and
-        # only in the magenta/violet and green corners of the wheel. Find those
-        # two conditions together and pull the colour out, leaving everything
-        # that is genuinely purple or green alone.
-        d = np.float32(r.defringe)
-        y = (s @ LUMA).astype(np.float32)
-        gx = np.abs(np.diff(y, axis=1, prepend=y[:, :1]))
-        gy = np.abs(np.diff(y, axis=0, prepend=y[:1, :]))
-        edge = np.clip((gx + gy) * 6.0, 0.0, 1.0)
-
-        mx = s.max(axis=2)
-        mn = s.min(axis=2)
-        chroma = mx - mn
-        rr, gg, bb = s[..., 0], s[..., 1], s[..., 2]
-        # magenta/violet: blue and red both above green
-        violet = np.clip(np.minimum(rr, bb) - gg, 0.0, None)
-        # green: green above both
-        green = np.clip(gg - np.maximum(rr, bb), 0.0, None)
-        suspect = np.clip((violet + green) * 4.0, 0.0, 1.0)
-
-        amount = (edge * suspect * np.clip(chroma * 3.0, 0.0, 1.0) * d)[..., None]
-        lum3 = y[..., None]
-        s = np.clip(s * (1.0 - amount) + lum3 * amount, 0.0, 1.0)
 
     # Local adjustments, over the finished global grade and before sharpening
     # and the watermark - so a mask cannot fight the sharpener and the logo
@@ -1352,6 +1780,9 @@ def apply_recipe(rgb01: np.ndarray, r: Recipe) -> np.ndarray:
         import cv2
         blur = cv2.GaussianBlur(s, (0, 0), 1.0)
         s = np.clip(s + np.float32(r.sharpen) * (s - blur), 0.0, 1.0)
+
+    if r.gen_ref and r.gen_amount > 0:
+        s = apply_gen(s, r)
 
     if r.vignette or r.grain:
         s = apply_finish(s, r)
@@ -1405,6 +1836,49 @@ def carry_exif(src: str, dst: str) -> bool:
 # reading and writing
 # --------------------------------------------------------------------------
 
+_LONG_CACHE: dict = {}
+
+
+def _source_long(path: str) -> int:
+    """The original's long edge in pixels, read from the header (no decode)."""
+    try:
+        key = (path, os.stat(path).st_mtime_ns)
+    except OSError:
+        return 0
+    if key in _LONG_CACHE:
+        return _LONG_CACHE[key]
+    n = 0
+    is_raw = Path(path).suffix.lower() in previews.RAW_EXT
+    try:
+        if is_raw:
+            import rawpy
+            with rawpy.imread(path) as raw:
+                n = max(raw.sizes.width, raw.sizes.height)
+        else:
+            from PIL import Image
+            with Image.open(path) as im:
+                n = max(im.size)
+    except Exception:
+        n = 0
+    if not n and is_raw:
+        # LibRaw could not even open this RAW's header (a camera newer than
+        # LibRaw, like the Nikon ZR's High Efficiency NEF) - fall back to the
+        # size of the camera's own full-size JPEG inside it, the same image
+        # _read_rgb develops from in that case. Without this, denoise treated
+        # a size-capped export of one of these files as if it were full size
+        # (src_long 0 reads as "no scaling"), smoothing it as strongly as a
+        # native-resolution photo and smearing it - the very bug this
+        # session's noise fix was for, just for this one camera.
+        try:
+            cam, _full = previews.camera_jpeg(path)
+            if cam is not None:
+                n = max(cam.shape[:2])
+        except Exception:
+            n = 0
+    _LONG_CACHE[key] = n
+    return n
+
+
 def _read_rgb(path: str, max_dim: int = 0, strict: bool = False) -> np.ndarray:
     """Any photo as float32 RGB 0..1, optionally capped on the long edge.
 
@@ -1431,17 +1905,24 @@ def _read_rgb(path: str, max_dim: int = 0, strict: bool = False) -> np.ndarray:
         except Exception as e:
             print(f"  [edit] could not develop {Path(path).name}: {e}", flush=True)
             img = None
+        if img is None:
+            # a RAW LibRaw cannot decode yet: the camera's full-size JPEG inside it
+            cam, full = previews.camera_jpeg(path)
+            if cam is not None and (full or not strict):
+                img = cam
         if img is None and strict:
-            raise HTTPException(
-                status_code=415,
-                detail="No RAW decoder is installed, so this file can only be "
-                       "read at preview size. Install one with: "
-                       "venv/bin/pip install rawpy")
+            raise HTTPException(status_code=415, detail=previews.raw_decode_note(path))
     # Never cv2.imread a RAW: OpenCV reads DNG as a plain TIFF and returns
     # undemosaiced sensor data, which looks far worse than the preview.
     if img is None and ext not in previews.RAW_EXT:
-        bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        # ANYDEPTH: a 16-bit TIFF (an HDR merge saved for editing) keeps all
+        # its levels instead of being cut to 8 bits on the way in
+        bgr = cv2.imread(path, cv2.IMREAD_COLOR | cv2.IMREAD_ANYDEPTH)
         if bgr is not None:
+            if bgr.dtype == np.uint16:
+                bgr = bgr.astype(np.float32) / 65535.0
+            elif bgr.dtype != np.uint8:
+                bgr = np.clip(bgr.astype(np.float32), 0, 1)
             img = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     if img is None:
         # In the system temp folder, never beside the photo: a scratch file in
@@ -1687,10 +2168,11 @@ def developed(request: Request, video_id: int, token: Optional[str] = None, w: i
     import hashlib
     key = hashlib.sha1(rtxt.encode()).hexdigest()[:12]
     base = _base_file(video_id, path, w)
-    out = base.parent / f"dev_{video_id}_{copy or 0}_{key}_{base.stat().st_mtime_ns % 10**9}_{w}.jpg"
+    out = base.parent / f"dev2_{video_id}_{copy or 0}_{key}_{base.stat().st_mtime_ns % 10**9}_{w}.jpg"
     if not out.exists() or out.stat().st_size == 0:
         import cv2
-        for old in base.parent.glob(f"dev_{video_id}_{copy or 0}_*_{w}.jpg"):
+        for old in [*base.parent.glob(f"dev_{video_id}_{copy or 0}_*_{w}.jpg"),
+                    *base.parent.glob(f"dev2_{video_id}_{copy or 0}_*_{w}.jpg")]:
             old.unlink(missing_ok=True)
         try:
             rec = Recipe(**json.loads(rtxt))
@@ -1698,7 +2180,7 @@ def developed(request: Request, video_id: int, token: Optional[str] = None, w: i
             rec = Recipe()
         bgr = cv2.imread(str(base), cv2.IMREAD_COLOR)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        res = apply_recipe(rgb, rec)
+        res = apply_recipe(rgb, rec, _source_long(path), noise_profile(path) if (rec.dn_luma or rec.dn_colour) else None)
         cv2.imwrite(str(out), cv2.cvtColor((np.clip(res, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
     return FileResponse(str(out), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
@@ -2014,6 +2496,12 @@ def _used_refs(db: Session, video_id: int) -> set:
         return set()
     used = {str(m.get("ref", "")).split("/")[-1] for m in rec.get("masks", []) if m.get("ref")}
     used |= {str((m.get("part2") or {}).get("ref", "")).split("/")[-1] for m in rec.get("masks", []) if (m.get("part2") or {}).get("ref")}
+    # Remove-tool and AI patches, and a generated look's two pictures, are
+    # files in the same folder: never clear away the ones the edit shows
+    used |= {str(x.get("ref", "")).split("/")[-1] for x in rec.get("removes", []) if x.get("ref")}
+    g = str(rec.get("gen_ref") or "").split("/")[-1]
+    if g:
+        used |= {g + "g", g + "d", g + "m", g + "k"}
     return used
 
 
@@ -2056,7 +2544,9 @@ def get_mask(video_id: int, name: str, request: Request, token: Optional[str] = 
     p = mask_dir(video_id) / f"{name}.png"
     if not p.is_file():
         raise HTTPException(status_code=404, detail="No such mask")
-    return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": "private, max-age=86400"})
+    # a look's light maps can be worked out again later: ask each time (a 304 when unchanged)
+    cc = "private, no-cache" if name.startswith("gen") and name[-1:] in ("m", "k") else "private, max-age=86400"
+    return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": cc})
 
 
 # --------------------------------------------------------------------------
@@ -2374,18 +2864,27 @@ def lens(video_id: int, db: Session = Depends(get_db), current_user: User = Depe
     rgb = _read_rgb(path, max_dim=1600)
     asp = rgb.shape[1] / float(rgb.shape[0])
     ops = photo_geometry._dng_opcodes(path) if path.lower().endswith(".dng") else {}
-    out = {"source": "none", "distortion": None, "vig_k": None,
+    out = {"source": "none", "distortion": None, "distortion2": 0.0, "vig_k": None,
            "camera": " ".join(x for x in (video.camera_make, video.camera_model) if x) or None}
     if ops.get("warp"):
-        out["distortion"] = photo_geometry.distortion_from_warp(ops["warp"]["kr"], asp)
+        out["distortion"], out["distortion2"] = photo_geometry.distortion_from_warp(ops["warp"]["kr"], asp)
         out["source"] = "profile"
     if ops.get("vignette"):
         out["vig_k"] = [round(float(x), 5) for x in ops["vignette"]["k"]]
         out["source"] = "profile"
+    # colour fringes: measured on a bigger copy, they are a pixel or two
+    try:
+        ca = photo_geometry.measure_ca(_read_rgb(path, max_dim=3000))
+        if ca is not None:
+            out["ca_r"], out["ca_b"] = ca
+            if out["source"] == "none" and any(ca):
+                out["source"] = "measured"
+    except Exception as e:
+        print(f"photo_edit: fringe measurement failed: {e}", flush=True)
     if out["distortion"] is None:
         d = photo_geometry.measure_distortion(rgb)
         if d is not None:
-            out["distortion"] = d
+            out["distortion"], out["distortion2"] = d
             if out["source"] == "none":
                 out["source"] = "measured"
     return out
@@ -2393,6 +2892,7 @@ def lens(video_id: int, db: Session = Depends(get_db), current_user: User = Depe
 
 @router.get("/{video_id}/upright")
 def upright(video_id: int, mode: str = "vertical", distortion: float = 0.0, rotate: int = 0,
+            distortion2: float = 0.0,
             db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Straighten and keystone values that make this photo's lines true:
     level (roll only), vertical (walls upright) or full (walls and horizontals)."""
@@ -2406,7 +2906,7 @@ def upright(video_id: int, mode: str = "vertical", distortion: float = 0.0, rota
         raise HTTPException(status_code=404, detail="The photo file is not on disk")
     import photo_geometry
     rgb = _read_rgb(path, max_dim=1600)
-    cur = {"distortion": distortion, "rotate": rotate}
+    cur = {"distortion": distortion, "distortion2": distortion2, "rotate": rotate}
     if mode == "auto":
         # walls upright when there are walls (the property standard), else just level it
         out = photo_geometry.upright(rgb, "vertical", cur)
@@ -2434,7 +2934,8 @@ def full_size_dims(video_id: int, db: Session = Depends(get_db),
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail="The photo file is not on disk")
     h, w = _full_size(path).shape[:2]
-    return {"w": int(w), "h": int(h)}
+    # the grain at each brightness, for noise reduction to take out only that
+    return {"w": int(w), "h": int(h), "noise": noise_profile(path)}
 
 
 @router.get("/{video_id}/tile")
@@ -2562,7 +3063,9 @@ def _write_export(db, video, path: str, recipe: "Recipe", *, width: int, quality
     under a size limit if one is set, named by the pattern."""
     import cv2
     rgb = _read_rgb(path, max_dim=width or 0, strict=True)
-    out_rgb = _output_sharpen(apply_recipe(rgb, recipe), out_sharpen)
+    out_rgb = _output_sharpen(apply_recipe(rgb, recipe, _source_long(path),
+                                           noise_profile(path) if (recipe.dn_luma or recipe.dn_colour) else None),
+                              out_sharpen)
     if out_dir is not None:
         into = ""                # the caller already chose the exact folder
     else:
@@ -2895,7 +3398,9 @@ def _run_set(job_id: str, body: SetExport):
                     raise RuntimeError("not on disk")
                 big = max((o.width for o in body.outputs), default=0)
                 rgb = _read_rgb(path, max_dim=0 if not big else int(big * 2.2), strict=True)
-                dev = apply_recipe(rgb, _recipe_of(db, it.id))
+                rec_ = _recipe_of(db, it.id)
+                dev = apply_recipe(rgb, rec_, _source_long(path),
+                                   noise_profile(path) if (rec_.dn_luma or rec_.dn_colour) else None)
                 del rgb
                 stem = clean(it.name)[:120]
                 for k, o in enumerate(body.outputs):
@@ -3540,6 +4045,8 @@ def _for_photo(look: dict, mine: Optional[dict]) -> dict:
     mine = mine or {}
     out["spots"] = mine.get("spots", [])
     out["removes"] = mine.get("removes", [])
+    for k in ("gen_ref", "gen_amount", "gen_look", "gen_geo"):
+        out[k] = mine.get(k, Recipe.model_fields[k].default)
     own_brushes = [m for m in mine.get("masks", []) if m.get("kind") == "brush"]
     out["masks"] = _portable_masks(look.get("masks", [])) + own_brushes
     return out
@@ -3684,6 +4191,18 @@ def seed_presets():
     """
     db = SessionLocal()
     try:
+        # The eight starter looks are gone for good (AI looks made for each
+        # photo replace them); the studio's own presets stay.
+        gone = Path(__file__).resolve().parent / ".starter-presets-removed"
+        if not gone.exists():
+            n = db.query(PhotoPreset).filter(PhotoPreset.created_by == "starter").delete()
+            db.commit()
+            try:
+                gone.write_text(datetime.utcnow().isoformat(), encoding="utf-8")
+            except Exception:
+                pass
+            if n:
+                print(f"photo_edit: removed {n} starter presets", flush=True)
         if SEED_MARKER.exists():
             return
         have = {name for (name,) in db.query(PhotoPreset.name).all()}

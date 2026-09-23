@@ -240,6 +240,75 @@ def _via_embedded_jpeg(src: str, out: str, width: int) -> Tuple[bool, str]:
         return False, f"the RAW file's preview could not be read ({str(e)[:120]})"
 
 
+def camera_jpeg(src: str):
+    """When the RAW itself cannot be decoded (a camera newer than LibRaw, like
+    the Nikon ZR's High Efficiency NEF), most cameras still store a full-size
+    JPEG of every shot inside the file. Returns (rgb uint8 array, full) where
+    full means it is the whole sensor's size - good enough to merge HDR and to
+    edit - or (None, False)."""
+    import io
+    import numpy as np
+    from PIL import Image
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None, False
+    view = memoryview(data)
+    best = None
+    start, tries = 0, 0
+    while tries < 40:
+        i = data.find(b"\xff\xd8\xff", start)
+        if i < 0:
+            break
+        tries += 1
+        start = i + 3
+        try:
+            im = Image.open(io.BytesIO(view[i:]))
+            if im.format == "JPEG" and im.width >= 320:
+                if best is None or im.width * im.height > best[0]:
+                    best = (im.width * im.height, i)
+        except Exception:
+            continue
+    if best is None:
+        return None, False
+    sensor_long, flip = 0, 0
+    try:
+        import rawpy
+        with rawpy.imread(src) as raw:
+            sensor_long = max(raw.sizes.width, raw.sizes.height)
+            flip = int(raw.sizes.flip or 0)
+    except Exception:
+        pass
+    try:
+        with Image.open(io.BytesIO(view[best[1]:])) as im:
+            im.load()
+            rgb = np.asarray(im.convert("RGB"))
+    except Exception:
+        return None, False
+    # the embedded JPEG is stored the way the sensor lies; turn it like the RAW would be
+    if flip == 3:
+        rgb = rgb[::-1, ::-1]
+    elif flip == 5:
+        rgb = np.rot90(rgb, 1)
+    elif flip == 6:
+        rgb = np.rot90(rgb, -1)
+    long_edge = max(rgb.shape[:2])
+    full = long_edge >= (0.9 * sensor_long if sensor_long else 3800)
+    return np.ascontiguousarray(rgb), full
+
+
+def raw_decode_note(src: str) -> str:
+    """Why a RAW could not be developed, in words for the person looking at it."""
+    try:
+        import rawpy  # noqa: F401
+    except Exception:
+        return "No RAW decoder is installed (venv/bin/pip install rawpy)."
+    return (f"{Path(src).name} is a RAW this version of LibRaw cannot decode yet "
+            "(newer cameras, like the Nikon ZR's High Efficiency NEF). Set the camera to "
+            "Lossless compressed RAW, or convert the files with Adobe DNG Converter.")
+
+
 def _via_pillow(src: str, out: str, width: int) -> Tuple[bool, str]:
     from PIL import Image, ImageOps
     try:

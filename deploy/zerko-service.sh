@@ -26,7 +26,7 @@ app_running() {
     (exec 3<>/dev/tcp/127.0.0.1/9600) 2>/dev/null && { exec 3<&-; return 0; }
     return 1
 }
-app_process_exists() { pgrep -f "python.*main\.py" >/dev/null 2>&1; }
+app_process_exists() { pgrep -f "[p]ython main\.py$" >/dev/null 2>&1; }
 caddy_running() { pgrep -f 'caddy(-duckdns)? run' >/dev/null 2>&1; }
 
 start_app() {
@@ -35,7 +35,7 @@ start_app() {
     # previous stop. Clear it out rather than reporting success.
     if app_process_exists; then
         echo "  library: clearing a stuck process from last time"
-        pkill -9 -f "python.*main\.py" 2>/dev/null
+        pkill -9 -f "[p]ython main\.py$" 2>/dev/null
         sleep 2
     fi
     cd "$APP" || return 1
@@ -51,12 +51,22 @@ start_app() {
         sleep 1
         app_running && break
     done
-    pgrep -f "python.*main\.py" | head -1 > "$PIDF" 2>/dev/null
+    pgrep -f "[p]ython main\.py$" | head -1 > "$PIDF" 2>/dev/null
     if app_running; then
         echo "  library: started"
     else
         echo "  library: FAILED TO START - last lines of the log:"
         tail -12 "$APPLOG" 2>/dev/null | sed 's/^/      /'
+    fi
+}
+
+# The image model for Looks (ComfyUI, ~/zerko-imagegen) holds the graphics
+# card's memory while it runs. Zerko starts it when a look is painted; a full
+# stop ends it too, so a game or Resolve gets the whole card.
+stop_imagegen() {
+    if pgrep -f "zerko-imagegen/ComfyUI|[.]venv/bin/python main\.py --listen 127\.0\.0\.1 --port 8188" >/dev/null 2>&1; then
+        pkill -f "[.]venv/bin/python main\.py --listen 127\.0\.0\.1 --port 8188" 2>/dev/null
+        echo "  image model: stopped"
     fi
 }
 
@@ -67,7 +77,7 @@ stop_app() {
         return
     fi
     # Ask nicely first.
-    pkill -f "python.*main\.py" 2>/dev/null
+    pkill -f "[p]ython main\.py$" 2>/dev/null
     for _ in 1 2 3 4 5 6 7 8; do
         app_process_exists || break
         sleep 1
@@ -76,7 +86,7 @@ stop_app() {
     # the leftover process makes the next start think it is already running.
     if app_process_exists; then
         echo "  library: not stopping cleanly (open connections) - forcing"
-        pkill -9 -f "python.*main\.py" 2>/dev/null
+        pkill -9 -f "[p]ython main\.py$" 2>/dev/null
         sleep 1
     fi
     app_process_exists && echo "  library: STILL RUNNING" || echo "  library: stopped"
@@ -102,6 +112,7 @@ case "${1:-status}" in
     rm -f "$FLAG"
     echo "  Stopping Zerko (it will stay stopped until you start it again)..."
     stop_app
+    stop_imagegen
     "$HERE/caddy-bg.sh" stop 2>&1 | sed 's/^/  /'
     echo ""
     echo "  Everything is off. Nothing will restart it on its own."
