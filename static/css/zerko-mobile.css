@@ -28,3 +28,56 @@
   [data-zerko="edittitle"] { max-width: 38vw; }
   [data-zerko="editbar"] { padding-left: 0.5rem; padding-right: 0.5rem; }
 }
+
+/* ------------------------------------------------------------------ */
+/* The public portal - what a client or agent actually sees.           */
+/* Most of it is fixed in the markup with classes the build already    */
+/* compiled; these are the few rules Tailwind has no class for here.   */
+/* ------------------------------------------------------------------ */
+
+/* The name field and the send button stack on a phone and sit on one
+   line from 640px up. Tailwind's `sm:w-auto` was never compiled, so the
+   widths are undone here rather than with a class that does nothing. */
+@media (min-width: 640px) {
+  [data-zerko="sharebar-input"] { width: auto; }
+  [data-zerko="sharebar-send"]  { width: auto; }
+}
+
+@media (max-width: 639px) {
+  /* A full sentence as a label ate a third of the screen as a narrow
+     column of single words. On a phone it reads as a quiet hint above
+     the field instead. */
+  [data-zerko="sharebar-label"] {
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  /* Thumb-sized targets: a client tapping "I'm done" on a phone should
+     not have to aim. */
+  [data-zerko="sharebar-send"],
+  [data-zerko="sharebar-input"] {
+    min-height: 44px;
+  }
+}
+
+/* The download and pick buttons are positioned against this box, which is
+   the image itself. Before, they were positioned against the whole tile,
+   so on a phone - where they are always visible rather than appearing on
+   hover - the download icon sat on top of "Add a note". */
+[data-zerko="sharemedia"] { position: relative; }
+
+/* Long filenames have nowhere to go in a two-column grid on a phone. */
+@media (max-width: 639px) {
+  [data-zerko="sharemedia"] + figcaption { padding-left: 0.5rem; padding-right: 0.5rem; }
+}
+
+/* A grid, not a scroller: a sideways scrollbar in a 320px sidebar hides
+   tabs behind a gesture a mouse cannot easily make. Two rows of three fit
+   at every width the sidebar can be. */
+@media (max-width: 639px) {
+  [data-zerko="edittabs"] > button { min-height: 34px; }
+}
+
+/* Sub-clip marks (video modal): on a narrow panel the name field wraps onto
+   its own line instead of being squeezed to a few pixels. */
+[data-zerko="subclip-marks"] { flex-wrap: wrap; }
+[data-zerko="subclip-marks"] input { min-width: 8rem; }

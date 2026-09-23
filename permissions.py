@@ -23,17 +23,21 @@ HARD_DELETE = "media.harddelete"   # destroys the file on disk
 TRANSCRIBE = "jobs.transcribe"
 PROXY = "jobs.proxy"               # generating and cancelling proxies
 SHARES = "shares.manage"
+# Shoots are the business record - who the property belongs to, whether it
+# went out, what is still owed. A client tidying their own upload folder has
+# no business creating or closing one.
+SHOOTS = "shoots.manage"
 CREATE_CLIENTS = "users.create_clients"
 ADMIN = "admin"
 
 _EDITOR = {READ, DOWNLOAD, UPLOAD, ORGANISE, ANNOTATE, TRASH,
-           TRANSCRIBE, SHARES, CREATE_CLIENTS}
+           TRANSCRIBE, SHARES, CREATE_CLIENTS, SHOOTS}
 _CLIENT = {READ, DOWNLOAD, UPLOAD, ORGANISE, ANNOTATE, TRASH}
 
 ROLE_CAPS = {
     # Everything, including the things that cannot be undone.
     "admin": {READ, DOWNLOAD, UPLOAD, ORGANISE, ANNOTATE, TRASH, HARD_DELETE,
-              TRANSCRIBE, PROXY, SHARES, CREATE_CLIENTS, ADMIN},
+              TRANSCRIBE, PROXY, SHARES, CREATE_CLIENTS, SHOOTS, ADMIN},
     # Runs the library day to day. No proxy control (it saturates the GPU and
     # the queue is shared), no permanent deletes, no admin dashboard.
     "editor": _EDITOR,
@@ -100,6 +104,8 @@ RULES = [
     (ANY, r"^/api/(security-check|server-stats)$", ADMIN),
     (ANY, r"^/api/library-check(/|$)", ADMIN),
     (ANY, r"^/api/tags/(rules|auto-generate)$", ADMIN),
+    (ANY, r"^/api/tags/(custom-rules|builtin-rules|rules/preview)(/|$)", ADMIN),
+    (("POST",), r"^/api/tags/\d+/rename$", ADMIN),
     (ANY, r"^/api/videos/\d+/reveal$", ADMIN),
     (("POST",), r"^/api/thumbnails/repair$", ADMIN),
     (("GET",), r"^/api/upload/destinations$", UPLOAD),
@@ -116,11 +122,14 @@ RULES = [
 
     # The photo editor: reading a photo and its recipe is a read; saving a
     # recipe annotates it; exporting writes a new file.
-    (("GET",), r"^/api/photo-edit/\d+(/base|/auto|/tile)?$", READ),
+    (("GET",), r"^/api/photo-edit/(\d+(/base|/auto|/tile|/size|/upright|/lens|/developed|/copies)?|ai/status)$", READ),
     (("GET",), r"^/api/photo-edit-batch/[\w-]+$", READ),
+    (("GET",), r"^/api/photo-edit-batch/[\w-]+/zip$", DOWNLOAD),
     (("POST",), r"^/api/photo-edit-batch(/|$)", UPLOAD),
     (("POST", "DELETE"), r"^/api/photo-edit/\d+$", ANNOTATE),
     (("POST",), r"^/api/photo-edit/\d+/(pick|stars)$", ANNOTATE),
+    (("GET",), r"^/api/photo-edit/\d+/snapshots$", READ),
+    (("POST", "DELETE"), r"^/api/photo-edit/\d+/snapshots(/\d+)?$", ANNOTATE),
     (("POST",), r"^/api/photo-edit/\d+/export$", UPLOAD),
     # Presets and copying settings onto other photos are annotations: they
     # change no file on disk.
@@ -144,6 +153,8 @@ RULES = [
 
     # Destroying things.
     (("POST",), r"^/api/trash/empty$", HARD_DELETE),
+    (("POST",), r"^/api/trash/settings$", HARD_DELETE),
+    (("POST",), r"^/api/trash/restore-all$", TRASH),
     (("DELETE",), r"^/api/videos/\d+$", TRASH),
     (("POST",), r"^/api/videos/\d+/restore$", TRASH),
 
@@ -169,6 +180,20 @@ RULES = [
     # Photo export: making a 16:9 ZIP is a download; its status and the ZIP itself are too.
     (("POST",), r"^/api/photo-export/generate$", DOWNLOAD),
     (("GET",), r"^/api/photo-export/jobs/[\w-]+/download$", DOWNLOAD),
+
+    # Shoots are the business record: the address, the agent, whether it went
+    # out and whether it was paid for. Editors and admins only - reading
+    # included, because a client has no business browsing your job list.
+    (ANY, r"^/api/shoots(/|$)", SHOOTS),
+    # The caption writer's settings: editors set hashtags and the sign-off
+    # (the endpoint itself keeps the Claude key to administrators).
+    (ANY, r"^/api/captions(/|$)", SHOOTS),
+
+    # Sub-clips: marking a range is an annotation (the catch-all below);
+    # rendering one writes a new file into the library; fetching the render
+    # is a download (checked again in the endpoint, which takes a query token).
+    (("POST",), r"^/api/subclips/\d+/export$", UPLOAD),
+    (("GET",), r"^/api/subclips/\d+/file$", None),
 
     # Reading is reading.
     (("GET",), r"^/api/", READ),

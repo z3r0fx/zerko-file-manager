@@ -101,6 +101,8 @@ class Video(Base):
     
     # Metadata fields
     rating = Column(Integer, nullable=True) # 1-5
+    # Lightroom-style colour label: red / yellow / green / blue / purple
+    color_label = Column(String, nullable=True)
     shoot_date = Column(DateTime, nullable=True)
     
     # Technical metadata fields
@@ -118,8 +120,13 @@ class Video(Base):
     # otherwise Video.is_active raises AttributeError and every listing 500s.
     is_active = Column(Boolean, default=True)
     original_path = Column(String, nullable=True)  # where it lived before the trash
+    trashed_at = Column(DateTime, nullable=True)     # when it went to the trash (auto-empty counts from here)
     proxy_error = Column(String, nullable=True)
     proxy_created_at = Column(DateTime, nullable=True)
+    # How many times the encode has failed. The background sweeper retries a
+    # failure a few times (a file still being copied in fails once and then
+    # works) and then leaves it alone instead of burning CPU on it forever.
+    proxy_attempts = Column(Integer, default=0)
 
     # Content hash, for finding true duplicates rather than same-named files.
     file_hash = Column(String, nullable=True, index=True)
@@ -211,6 +218,19 @@ class Share(Base):
     # Where files sent through this link are held until someone files them.
     intake_folder_id = Column(Integer, ForeignKey("indexed_folders.id"), nullable=True)
 
+    # The property this portal is delivering. A portal without one is still
+    # perfectly valid - not every link is a job - but when it has one, the
+    # shoot is what the work is filed under and reported against.
+    shoot_id = Column(Integer, nullable=True, index=True)
+    # Previews carry the watermark; the actual download does not. The point of
+    # a delivery is that someone can look at the whole set before anything is
+    # paid for, without being able to use it.
+    watermark_previews = Column(Boolean, default=False)
+    # Which logo, by file name in _watermarks. Empty means the first one - and
+    # a name whose file has since been deleted also falls back to the first,
+    # so a portal never quietly starts showing clean previews.
+    watermark_name = Column(String, nullable=True)
+
     created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     revoked = Column(Boolean, default=False)
@@ -252,7 +272,10 @@ def init_db():
             "proxy_created_at": "DATETIME",
             "transcription_status": "TEXT DEFAULT 'not_started'",
             "is_active": "BOOLEAN DEFAULT 1",
-            "original_path": "TEXT"
+            "original_path": "TEXT",
+            "proxy_attempts": "INTEGER DEFAULT 0",
+            "trashed_at": "TIMESTAMP",
+            "color_label": "TEXT",
         }
         
         for col, col_type in new_cols.items():

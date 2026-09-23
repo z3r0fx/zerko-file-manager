@@ -183,6 +183,13 @@ def run_tagging(progress=None, include_transcripts=True):
 
         wanted = {}
         needed = set()
+        rules = None
+        if include_transcripts:
+            try:
+                import tag_rules
+                rules = tag_rules.active_rules(db)
+            except Exception as e:
+                say(f"custom tag rules unavailable ({e}); using the built-in ones")
         for v in videos:
             rel = folder_rel.get(v.folder_id) or ""
             names = classify(rel, v.filename or "", v.camera_make)
@@ -190,7 +197,7 @@ def run_tagging(progress=None, include_transcripts=True):
             if include_transcripts and v.transcription:
                 try:
                     from transcript_tags import tags_for
-                    t = tags_for(v.transcription)
+                    t = tags_for(v.transcription, rules)
                     if t:
                         names = list(names) + t
                         stats["from_transcripts"] += 1

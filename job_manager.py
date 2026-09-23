@@ -24,7 +24,12 @@ class JobManager:
         if self._initialized:
             return
         
-        self.queue = queue.Queue()
+        # One queue and one worker per job type. With a single shared worker a
+        # "Transcribe All" put every proxy behind hours of whisper, and a new
+        # upload's proxy waited for all of it - which is most of why proxies
+        # never felt like they ran in the background.
+        self.queues = {"proxy": queue.Queue(), "transcribe": queue.Queue()}
+        self.queue = self.queues["proxy"]      # kept for older callers
         self.active_jobs = {} # job_id -> status_dict
 
         # Cancellation. The DB status alone was never enough: clearing
@@ -34,9 +39,15 @@ class JobManager:
         self.cancelled_types = set()   # e.g. {"proxy"} - drop queued work
         self.current_proc = None       # the ffmpeg subprocess, so it can be killed
         self.current_job = None
+        self._cancelled_jobs = set()   # the in-flight job a Stop killed
         self._cancel_lock = threading.Lock()
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
+        self.worker_threads = {}
+        for kind in self.queues:
+            t = threading.Thread(target=self._worker, args=(kind,), daemon=True,
+                                 name=f"zerko-{kind}")
+            t.start()
+            self.worker_threads[kind] = t
+        self.worker_thread = self.worker_threads["proxy"]
         
         # One queue per connected browser. Previously there was a single
         # shared queue, so an event was delivered to whichever client polled
@@ -106,14 +117,14 @@ class JobManager:
                 Video.transcription_status.in_(["queued", "processing"]),
                 Video.media_type.in_(["video", "audio"])).all()
             for v in pending_proxy:
-                self.queue.put((v.id, "proxy", f"proxy_{v.id}"))
+                self._q("proxy").put((v.id, "proxy", f"proxy_{v.id}"))
                 self.active_jobs[f"proxy_{v.id}"] = {
                     "job_id": f"proxy_{v.id}", "video_id": v.id, "type": "proxy",
                     "status": "queued", "progress": 0, "filename": v.filename,
                     "queued_at": datetime.utcnow().isoformat()}
                 requeued["proxy"] += 1
             for v in pending_trans:
-                self.queue.put((v.id, "transcribe", f"transcribe_{v.id}"))
+                self._q("transcribe").put((v.id, "transcribe", f"transcribe_{v.id}"))
                 self.active_jobs[f"transcribe_{v.id}"] = {
                     "job_id": f"transcribe_{v.id}", "video_id": v.id, "type": "transcribe",
                     "status": "queued", "progress": 0, "filename": v.filename,
@@ -134,8 +145,11 @@ class JobManager:
         """Add a job (proxy or transcribe) to the queue."""
         job_id = f"{task_type}_{video_id}"
         
-        # Check if already queued or processing
-        if job_id in self.active_jobs:
+        # Only work that is still waiting or running blocks a re-queue. Every
+        # finished job used to stay in active_jobs, so a clip whose proxy had
+        # failed could never be retried without restarting the server.
+        existing = self.active_jobs.get(job_id)
+        if existing and existing.get("status") in ("queued", "processing"):
             logger.info(f"Job {job_id} already active")
             return
 
@@ -165,27 +179,42 @@ class JobManager:
             db.close()
 
         self.active_jobs[job_id] = status
-        self.queue.put((video_id, task_type, job_id))
+        self._q(task_type).put((video_id, task_type, job_id))
         self._notify_listeners({"type": "job_added", "job": status})
         logger.info(f"Job {job_id} added to queue")
 
-    def _worker(self):
+    def _q(self, task_type):
+        q = self.queues.get(task_type)
+        if q is None:
+            q = self.queues.setdefault(task_type, queue.Queue())
+            t = threading.Thread(target=self._worker, args=(task_type,),
+                                 daemon=True, name=f"zerko-{task_type}")
+            t.start()
+            self.worker_threads[task_type] = t
+        return q
+
+    def _worker(self, kind="proxy"):
+        q = self.queues[kind]
         while True:
             try:
-                video_id, task_type, job_id = self.queue.get()
+                video_id, task_type, job_id = q.get()
 
                 # Drain, do not run: a cancelled batch still has hundreds of
                 # items sitting in this queue and every one of them must be
                 # thrown away rather than processed.
                 if task_type in self.cancelled_types:
                     self.active_jobs.pop(job_id, None)
-                    self.queue.task_done()
+                    q.task_done()
                     continue
 
-                self.current_job = job_id
-                self._process_job(video_id, task_type, job_id)
-                self.current_job = None
-                self.queue.task_done()
+                if task_type == "proxy":
+                    self.current_job = job_id
+                try:
+                    self._process_job(video_id, task_type, job_id)
+                finally:
+                    if task_type == "proxy":
+                        self.current_job = None
+                    q.task_done()
             except Exception as e:
                 logger.error(f"Worker error: {e}")
                 time.sleep(1)
@@ -210,6 +239,22 @@ class JobManager:
             db.commit()
         except Exception as e:
             logger.error(f"Error processing job {job_id}: {e}")
+            # The failed status was set on the row and then rolled back with
+            # the session, so the database said "processing" forever and every
+            # restart re-queued the same broken file. Record it for real.
+            try:
+                db.rollback()
+                v = db.query(Video).filter(Video.id == video_id).first()
+                if v is not None:
+                    if task_type == "proxy":
+                        v.proxy_status = "failed"
+                        v.proxy_error = str(e)[:2000]
+                        v.proxy_attempts = (v.proxy_attempts or 0) + 1
+                    elif task_type == "transcribe":
+                        v.transcription_status = "failed"
+                    db.commit()
+            except Exception as e2:
+                logger.error(f"Could not record failure of {job_id}: {e2}")
             if job_id in self.active_jobs:
                 self.active_jobs[job_id]["status"] = "failed"
                 self.active_jobs[job_id]["error"] = str(e)
@@ -275,12 +320,18 @@ class JobManager:
             try:
                 generate_proxy(video.filepath, str(proxy_path), progress_callback,
                                on_start=_track)
+            except Exception:
+                if job_id in self._cancelled_jobs:
+                    pass            # handled just below as a cancellation
+                else:
+                    raise
             finally:
                 self.current_proc = None
 
             # A killed encode is a cancellation, not a failure - do not leave
             # it sitting in the Jobs panel looking like something went wrong.
-            if "proxy" in self.cancelled_types:
+            if "proxy" in self.cancelled_types or job_id in self._cancelled_jobs:
+                self._cancelled_jobs.discard(job_id)
                 video.proxy_status = "not_generated"
                 video.proxy_error = None
                 db.commit()
@@ -295,6 +346,7 @@ class JobManager:
             video.proxy_status = "completed"
             video.proxy_created_at = datetime.utcnow()
             video.proxy_error = None
+            video.proxy_attempts = 0
             
             self.active_jobs[job_id]["status"] = "completed"
             self.active_jobs[job_id]["progress"] = 100
@@ -431,9 +483,10 @@ class JobManager:
 
         # Empty the pending queue of this type, keeping anything else.
         keep, dropped = [], 0
+        tq = self._q(task_type)
         while True:
             try:
-                item = self.queue.get_nowait()
+                item = tq.get_nowait()
             except queue.Empty:
                 break
             if item[1] == task_type:
@@ -441,12 +494,14 @@ class JobManager:
                 dropped += 1
             else:
                 keep.append(item)
-            self.queue.task_done()
+            tq.task_done()
         for item in keep:
-            self.queue.put(item)
+            tq.put(item)
 
         # Kill the encode that is in flight right now.
         killed = False
+        if task_type == "proxy" and self.current_job:
+            self._cancelled_jobs.add(self.current_job)
         proc = self.current_proc
         if proc is not None and proc.poll() is None:
             try:

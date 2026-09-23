@@ -105,3 +105,13 @@ def is_playable(filename):
 
 def can_have_proxy(filename):
     return get_media_type(filename) == 'video'
+
+
+def is_junk_name(name: str) -> bool:
+    """Files the app (or another program) leaves while it is still writing
+    something - never catalogue them as media. Hidden files are included:
+    nothing a person keeps on purpose starts with a dot on a media drive."""
+    n = os.path.basename(name or "")
+    low = n.lower()
+    return (not n or n.startswith(".") or ".edittmp-" in low or ".hdrtmp-" in low or low.startswith("~$")
+            or low.endswith((".part", ".partial", ".crdownload", ".tmp", ".download")))

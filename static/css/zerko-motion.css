@@ -1,0 +1,59 @@
+/* Motion.
+   Kept apart from zerko-mobile.css so it can be tuned or removed on its own.
+   Everything here is short - 120 to 320ms. Anything slower stops feeling like
+   feedback and starts feeling like waiting. */
+
+@media (prefers-reduced-motion: reduce) {
+  /* Some people get motion sick, and some just turned it off. Honour it. */
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+@keyframes zk-rise { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: none; } }
+@keyframes zk-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes zk-pop  { from { opacity: 0; transform: scale(.975); } to { opacity: 1; transform: none; } }
+
+/* --- things you click ------------------------------------------------- */
+/* A button that reacts the instant you touch it feels responsive even when
+   the work behind it takes a moment. */
+button, [role="button"], a.zk-press {
+  transition: background-color .16s ease, color .16s ease,
+              border-color .16s ease, opacity .16s ease, transform .08s ease;
+}
+button:active:not(:disabled), [role="button"]:active { transform: scale(.97); }
+/* The mask handles are positioned by pixel; scaling them on press would move
+   the thing you are dragging out from under your finger. */
+[data-zerko="maskroot"] * { transition: none !important; transform: none; }
+[data-zerko="maskroot"] *:active { transform: none !important; }
+
+/* --- the editor's panels ---------------------------------------------- */
+/* Sections mount when you switch tabs, so this reads as the new tab sliding
+   in rather than the panel blinking. The stagger is what sells it. */
+[data-zerko="section"] { animation: zk-rise .26s cubic-bezier(.22,.8,.3,1) both; }
+[data-zerko="section"]:nth-of-type(2) { animation-delay: .04s; }
+[data-zerko="section"]:nth-of-type(3) { animation-delay: .08s; }
+[data-zerko="section"]:nth-of-type(4) { animation-delay: .12s; }
+
+/* --- pictures ---------------------------------------------------------- */
+/* A thumbnail that pops in at full opacity the moment it decodes is what
+   makes a grid feel like it is stuttering. Fading each one as it arrives
+   turns the same loading into something that looks deliberate. */
+img[data-zk-img] { opacity: 0; transition: opacity .32s ease; }
+img[data-zk-img][data-zk-ready] { opacity: 1; }
+
+/* Tiles arriving in a grid. */
+figure[data-vid], [data-zk-tile] { animation: zk-fade .28s ease both; }
+
+/* --- dialogs and overlays ---------------------------------------------- */
+[role="dialog"] { animation: zk-pop .18s cubic-bezier(.22,.8,.3,1) both; }
+
+/* --- the little things -------------------------------------------------- */
+/* Hovering a tile should acknowledge the pointer without shoving the layout
+   about, so this is transform only - no margins, no size changes. */
+@media (hover: hover) {
+  figure[data-vid] { transition: transform .18s ease, box-shadow .18s ease; }
+  figure[data-vid]:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,.45); }
+}

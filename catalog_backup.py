@@ -24,7 +24,18 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-DB_PATH = Path(os.environ.get("CATALOG_DB", "mediamanager.db")).resolve()
+def _db_path() -> Path:
+    """The database the app actually uses: CATALOG_DB, else the sqlite file
+    named in DATABASE_URL, else mediamanager.db beside the app."""
+    if os.environ.get("CATALOG_DB"):
+        return Path(os.environ["CATALOG_DB"]).resolve()
+    url = os.environ.get("DATABASE_URL", "")
+    if url.startswith("sqlite:///"):
+        return Path(url[len("sqlite:///"):]).resolve()
+    return Path("mediamanager.db").resolve()
+
+
+DB_PATH = _db_path()
 KEEP = int(os.environ.get("CATALOG_BACKUP_KEEP", "14"))
 INTERVAL_HOURS = float(os.environ.get("CATALOG_BACKUP_HOURS", "24"))
 

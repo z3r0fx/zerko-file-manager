@@ -16,7 +16,7 @@ from video_processor import (
     VIDEO_EXTENSIONS, IMAGE_EXTENSIONS, AUDIO_EXTENSIONS,
     MEDIA_EXTENSIONS, SIDECAR_EXTENSIONS, get_duration_fast,
 )
-from media_type_utils import get_media_type
+from media_type_utils import get_media_type, is_junk_name
 
 # Folders the app itself writes into - never index these back in
 EXCLUDED_DIRS = {"thumbnails", "proxies", "transcriptions", "_catalog-backup", "_Trash",
@@ -82,7 +82,7 @@ def index_tree(root=None, queue_proxies=False, progress=None, db=None):
 
             rel = rel.replace(os.sep, "/")
             media_files = [f for f in sorted(files)
-                           if Path(f).suffix.lower() in MEDIA_EXTENSIONS]
+                           if Path(f).suffix.lower() in MEDIA_EXTENSIONS and not is_junk_name(f)]
             stats["sidecars"] += sum(1 for f in files
                                      if Path(f).suffix.lower() in SIDECAR_EXTENSIONS)
 

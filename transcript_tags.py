@@ -77,11 +77,14 @@ COMPILED = [(name, re.compile(pat, re.I), hits) for name, pat, hits in RULES]
 OWNED = {name for name, _, _ in RULES}
 
 
-def tags_for(text):
+def tags_for(text, rules=None):
+    """Tags for one transcript. `rules` is the active set from tag_rules
+    (built-ins minus the switched-off ones, plus your own); without it, the
+    built-ins as written here."""
     if not text:
         return []
     out = []
-    for name, rx, min_hits in COMPILED:
+    for name, rx, min_hits in (rules if rules is not None else COMPILED):
         if len(rx.findall(text)) >= min_hits:
             out.append(name)
     return out

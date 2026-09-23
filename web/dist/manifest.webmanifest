@@ -1,0 +1,10 @@
+{
+  "name": "Zerko",
+  "short_name": "Zerko",
+  "start_url": "/v2/library",
+  "scope": "/v2/",
+  "display": "standalone",
+  "background_color": "#08080a",
+  "theme_color": "#08080a",
+  "icons": [{ "src": "/v2/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

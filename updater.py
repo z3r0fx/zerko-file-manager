@@ -25,6 +25,7 @@ import ssl
 import stat
 import tempfile
 import urllib.request
+import urllib.error
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -188,8 +189,20 @@ def check() -> dict:
     url = f"https://api.github.com/repos/{s['owner']}/{s['repo']}/releases/latest"
     try:
         data = _get_json(url)
+    except urllib.error.HTTPError as e:
+        # 404: no release published yet. 403: the repository is private (or
+        # GitHub is rate-limiting). Neither is a fault on this machine.
+        if e.code in (403, 404):
+            return {"ok": True, "current": current_version(), "latest": current_version(),
+                    "update_available": False, "has_asset": False, "download_url": None,
+                    "notes": ("No published release to compare against yet - you are on the "
+                              "newest build. Updates will show here once a release is published."),
+                    "no_release": True, "checked_at": datetime.utcnow().isoformat()}
+        return {"ok": False, "error": f"GitHub answered {e.code} - try again later.",
+                "current": current_version()}
     except Exception as e:
-        return {"ok": False, "error": f"Could not reach GitHub: {e}",
+        return {"ok": False, "error": f"No connection to GitHub right now ({e.__class__.__name__}). "
+                                      "Everything else keeps working; it will check again later.",
                 "current": current_version()}
 
     tag = (data.get("tag_name") or "").lstrip("vV")

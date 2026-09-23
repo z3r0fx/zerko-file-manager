@@ -15,6 +15,11 @@ psutil==5.9.8
 # install crashed on startup with ModuleNotFoundError while existing installs
 # carried on working - the worst kind of gap to leave in a dependency list.
 filelock==3.16.1
+# Camera RAW (DJI .DNG and the rest). Without it RAW files could only be read
+# as raw sensor data - green, with a stripe of unused sensor on the right.
+rawpy==0.27.1
 # openai-whisper requires torch which may not have Python 3.14 wheels yet.
 # Install separately if needed: pip install openai-whisper
 # openai-whisper==20231117
+# Segment Anything for the editor's selections (the model downloads on first use)
+onnxruntime==1.30.0

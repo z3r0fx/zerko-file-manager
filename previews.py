@@ -194,6 +194,52 @@ def _via_rawpy(src: str, out: str, width: int) -> Tuple[bool, str]:
         return False, f"could not decode this RAW file ({str(e)[:120]})"
 
 
+def _via_embedded_jpeg(src: str, out: str, width: int) -> Tuple[bool, str]:
+    """Camera RAW with no decoder installed: the camera's own JPEG preview.
+
+    Every RAW format carries one or more ordinary JPEGs inside it, rendered by
+    the camera with its own colour. Without rawpy this is the only way to get
+    the colours right: ffmpeg and Pillow read the sensor data (or a lossless
+    JPEG of it) with no demosaic or colour matrix, which is what made DJI DNG
+    files come out bright green. Lossless-JPEG sensor data does not decode as
+    an ordinary JPEG, so it is skipped by construction.
+    """
+    import io
+    from PIL import Image
+    try:
+        with open(src, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return False, f"could not read the file ({e})"
+    best = None                          # (pixels, offset)
+    start, tries = 0, 0
+    view = memoryview(data)
+    while tries < 40:
+        i = data.find(b"\xff\xd8\xff", start)
+        if i < 0:
+            break
+        tries += 1
+        start = i + 3
+        try:
+            # Pillow reads from the start of whatever it is given, so each
+            # candidate gets a stream that begins at its own marker.
+            im = Image.open(io.BytesIO(view[i:]))
+            if im.format == "JPEG" and im.width >= 320 and im.height >= 200:
+                px = im.width * im.height
+                if best is None or px > best[0]:
+                    best = (px, i)
+        except Exception:
+            continue
+    if best is None:
+        return False, "no usable preview inside this RAW file"
+    try:
+        with Image.open(io.BytesIO(view[best[1]:])) as im:
+            im.load()
+            return _save_jpeg(im, out, width)
+    except Exception as e:
+        return False, f"the RAW file's preview could not be read ({str(e)[:120]})"
+
+
 def _via_pillow(src: str, out: str, width: int) -> Tuple[bool, str]:
     from PIL import Image, ImageOps
     try:
@@ -223,7 +269,9 @@ def make_image_jpeg(src: str, out: str, width: int = 640) -> Tuple[bool, str]:
     if os.path.getsize(src) == 0:
         return False, "the file is empty"
     ext = Path(src).suffix.lower()
-    order = ([_via_rawpy, _via_ffmpeg_image, _via_pillow] if ext in RAW_EXT
+    # For RAW, ffmpeg goes last: it reads the sensor data with no colour
+    # processing, which is a green picture - better than nothing, but only just.
+    order = ([_via_rawpy, _via_embedded_jpeg, _via_ffmpeg_image] if ext in RAW_EXT
              else [_via_pillow, _via_ffmpeg_image])
     reasons = []
     for fn in order:

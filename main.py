@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, File, UploadFile, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select, or_, case, text
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +40,9 @@ import library_check
 import hdr
 import photo_edit
 import projects
+import shoots
+import delivery
+import subclips
 from media_type_utils import get_media_type
 from job_manager import job_manager
 
@@ -354,6 +357,14 @@ def serve_proxy(
         original = resolve_media_path(video.filepath)
         if not os.path.exists(original):
             raise HTTPException(status_code=404, detail="Original video file not found")
+        # Someone wants to watch this and there is no proxy: make one now.
+        # Phone HEVC and camera ProRes play as sound only in most browsers,
+        # so waiting for the nightly sweep means a black box until tomorrow.
+        if (video.media_type or "video") == "video" and video.proxy_status not in ("queued", "processing"):
+            try:
+                job_manager.add_job(video.id, "proxy")
+            except Exception as e:
+                print(f"[proxy] could not queue {video.id} on view: {e}", flush=True)
         return FileResponse(original, filename=video.filename, media_type='application/octet-stream',
                             headers={"Accept-Ranges": "bytes"})
 
@@ -502,7 +513,9 @@ class RenameRequest(BaseModel):
 
 class UserCreate(BaseModel):
     username: str
-    email: str
+    # Optional: an agent or a client often has no reason to give one, and an
+    # empty string would collide with the next person's under the unique index.
+    email: Optional[str] = None
     password: str
     role: str = "user"
 # --- brute-force protection -------------------------------------------------
@@ -565,9 +578,29 @@ def _client_ip(request: Request) -> str:
 _request_ip = contextvars.ContextVar("request_ip", default="unknown")
 
 
+# "Preview as the client": staff open a client page with ?preview=<their own
+# sign-in token>. It gets in without the client's password, and nothing it
+# does counts - no view, no download, no picks saved.
+_staff_preview = contextvars.ContextVar("staff_preview", default=False)
+
+
 @app.middleware("http")
 async def _remember_client_ip(request: Request, call_next):
     _request_ip.set(_client_ip(request))
+    preview = request.query_params.get("preview")
+    ok = False
+    if preview and request.url.path.startswith("/api/public/share/"):
+        db = SessionLocal()
+        try:
+            u = get_user_from_token(preview, db, check_session=False)
+            ok = bool(u) and permissions.can(u.role, permissions.SHARES)
+        except Exception:
+            ok = False
+        finally:
+            db.close()
+        if ok and request.method != "GET":
+            return JSONResponse(status_code=403, content={"detail": "This is a preview - nothing is saved."})
+    _staff_preview.set(ok)
     return await call_next(request)
 
 
@@ -604,6 +637,11 @@ def login(request: LoginRequest, http_request: Request, db: Session = Depends(ge
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     _login_attempts.pop(ip, None)
+    try:
+        user.last_login = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
     token_data = create_access_token({"sub": user.username})
     return {"token": token_data["token"], "user": {"id": user.id, "username": user.username, "role": user.role}}
 
@@ -789,9 +827,22 @@ def list_videos(search: Optional[str] = None, tags: Optional[str] = None, sort_b
                                        Video.id.asc())
         videos = query.all()
 
+    # the editor's picks and whether a photo has been edited, for the filters
+    edits = {}
+    try:
+        import photo_edit
+        ids = [v.id for v in videos if v.media_type == "photo"]
+        for i in range(0, len(ids), 900):
+            for vid, pick, rec in db.query(photo_edit.PhotoEdit.video_id, photo_edit.PhotoEdit.pick,
+                                           photo_edit.PhotoEdit.recipe).filter(
+                    photo_edit.PhotoEdit.video_id.in_(ids[i:i + 900])).all():
+                edits[vid] = (pick or 0, bool(rec and rec not in ("{}", "")))
+    except Exception as e:
+        print(f"list_videos: could not read edits: {e}", flush=True)
     res = []
     for v in videos:
         matches = next((sr["matches"] for sr in search_results if sr["video"].id == v.id), [])
+        pick, edited = edits.get(v.id, (0, False))
         res.append({
             "id": v.id, "filename": v.filename, "filepath": v.filepath, "file_size": v.file_size,
             "file_size_formatted": format_file_size(v.file_size), "duration": v.duration,
@@ -809,15 +860,16 @@ def list_videos(search: Optional[str] = None, tags: Optional[str] = None, sort_b
             "rating": v.rating, "shoot_date": v.shoot_date.isoformat() if v.shoot_date else None,
             "camera_make": v.camera_make, "camera_model": v.camera_model, "video_codec": v.video_codec,
             "frame_rate": v.frame_rate, "resolution": v.resolution, "audio_codec": v.audio_codec,
-            "search_matches": matches
+            "search_matches": matches, "pick": pick, "edited": edited, "label": v.color_label,
         })
     return res if isinstance(res, list) else []
 
 
 @app.get("/api/videos/{video_id}/notes")
 def get_video_notes(video_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    notes = db.query(Note).filter(Note.media_id == video_id).all()
-    return [{"id": n.id, "content": n.content, "created_at": n.created_at.isoformat()} for n in notes]
+    notes = db.query(Note).filter(Note.media_id == video_id).order_by(Note.created_at.asc()).all()
+    return [{"id": n.id, "content": n.content, "author": n.author,
+             "created_at": n.created_at.isoformat() if n.created_at else None} for n in notes]
 
 @app.get("/api/video-access-token")
 def get_video_access_token(current_user: User = Depends(get_current_user)):
@@ -828,11 +880,139 @@ def get_video_access_token(current_user: User = Depends(get_current_user)):
 def list_users(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
     # Explicit fields: returning the ORM rows sends the password hash and the
     # session marker to the browser along with everything else.
+    uploads = dict(db.query(Video.uploaded_by, func.count(Video.id)).filter(Video.uploaded_by.isnot(None)).group_by(Video.uploaded_by).all())
+    notes = dict(db.query(Note.author, func.count(Note.id)).group_by(Note.author).all())
     return [{
         "id": u.id, "username": u.username, "email": u.email, "role": u.role,
         "created_at": u.created_at, "last_login": u.last_login,
         "is_active": u.is_active,
+        "uploads": uploads.get(u.username, 0), "notes": notes.get(u.username, 0),
     } for u in db.query(User).all()]
+
+
+# One-time "set your password" links an admin can hand someone: no need to
+# say a password out loud. Only a hash of the token is kept.
+RESETS_FILE = Path(__file__).resolve().parent / "password_resets.json"
+
+
+def _resets() -> dict:
+    try:
+        return json.loads(RESETS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+@app.post("/api/users/{user_id}/reset-link")
+def make_reset_link(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
+    import hashlib, secrets as _secrets
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    token = _secrets.token_urlsafe(24)
+    r = {k: v for k, v in _resets().items() if v.get("exp", 0) > time.time() and v.get("user_id") != user_id}
+    r[hashlib.sha256(token.encode()).hexdigest()] = {"user_id": user_id, "exp": time.time() + 48 * 3600}
+    RESETS_FILE.write_text(json.dumps(r))
+    return {"url": f"/v2/reset/{token}", "expires_hours": 48, "username": target.username}
+
+
+PREFS_FILE = Path(__file__).resolve().parent / "user_prefs.json"
+_prefs_lock = threading.Lock()
+
+
+def _prefs() -> dict:
+    try:
+        return json.loads(PREFS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+@app.get("/api/me/appearance")
+def get_my_appearance(current_user: User = Depends(get_current_user)):
+    """Appearance kept on the account, so it follows you to other computers."""
+    return {"appearance": _prefs().get(current_user.username, {}).get("appearance")}
+
+
+@app.put("/api/me/appearance")
+def put_my_appearance(payload: dict = Body(...), current_user: User = Depends(get_current_user)):
+    a = (payload or {}).get("appearance")
+    if a is not None and (not isinstance(a, dict) or len(json.dumps(a)) > 8000):
+        raise HTTPException(status_code=400, detail="Not an appearance")
+    with _prefs_lock:
+        p = _prefs()
+        p.setdefault(current_user.username, {})["appearance"] = a
+        PREFS_FILE.write_text(json.dumps(p))
+    return {"ok": True}
+
+
+_PREF_KEYS = {"export_presets", "sync_groups", "room_export_types"}
+
+
+@app.get("/api/me/prefs/{key}")
+def get_my_pref(key: str, current_user: User = Depends(get_current_user)):
+    if key not in _PREF_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown setting")
+    return {"value": _prefs().get(current_user.username, {}).get(key)}
+
+
+@app.put("/api/me/prefs/{key}")
+def put_my_pref(key: str, payload: dict = Body(...), current_user: User = Depends(get_current_user)):
+    if key not in _PREF_KEYS:
+        raise HTTPException(status_code=404, detail="Unknown setting")
+    value = (payload or {}).get("value")
+    if len(json.dumps(value)) > 20000:
+        raise HTTPException(status_code=400, detail="Too big")
+    with _prefs_lock:
+        p = _prefs()
+        p.setdefault(current_user.username, {})[key] = value
+        PREFS_FILE.write_text(json.dumps(p))
+    return {"value": value}
+
+
+@app.get("/api/me/views")
+def get_my_views(current_user: User = Depends(get_current_user)):
+    """Saved library views ("smart collections"): a name and the filters."""
+    return {"views": _prefs().get(current_user.username, {}).get("views", [])}
+
+
+@app.put("/api/me/views")
+def put_my_views(payload: dict = Body(...), current_user: User = Depends(get_current_user)):
+    views = (payload or {}).get("views") or []
+    if not isinstance(views, list) or len(views) > 60:
+        raise HTTPException(status_code=400, detail="Too many saved views")
+    clean = []
+    for v in views:
+        if isinstance(v, dict) and isinstance(v.get("name"), str) and isinstance(v.get("qs"), str):
+            clean.append({"name": v["name"].strip()[:60], "qs": v["qs"][:1000]})
+    with _prefs_lock:
+        p = _prefs()
+        p.setdefault(current_user.username, {})["views"] = clean
+        PREFS_FILE.write_text(json.dumps(p))
+    return {"views": clean}
+
+
+@app.post("/api/password-reset")
+def use_reset_link(payload: dict = Body(...), db: Session = Depends(get_db)):
+    import hashlib
+    token = str((payload or {}).get("token") or "")
+    new = str((payload or {}).get("new_password") or "")
+    key = hashlib.sha256(token.encode()).hexdigest()
+    r = _resets()
+    entry = r.get(key)
+    if not entry or entry.get("exp", 0) < time.time():
+        raise HTTPException(status_code=400, detail="This link has expired or was already used. Ask for a new one.")
+    if len(new) < 10:
+        raise HTTPException(status_code=400, detail="Use at least 10 characters")
+    if new.lower() in ("admin123", "password", "123456789", "changeme", "password123"):
+        raise HTTPException(status_code=400, detail="That password is far too common")
+    target = db.query(User).filter(User.id == entry["user_id"]).first()
+    if not target:
+        raise HTTPException(status_code=400, detail="That account no longer exists")
+    target.hashed_password = get_password_hash(new)
+    revoke_sessions(target)
+    db.commit()
+    r.pop(key, None)
+    RESETS_FILE.write_text(json.dumps(r))
+    return {"message": "Password set. You can sign in now.", "username": target.username}
 
 @app.post("/api/register")
 def register_user(user: UserCreate, db: Session = Depends(get_db),
@@ -872,7 +1052,7 @@ def register_user(user: UserCreate, db: Session = Depends(get_db),
     if user.email and db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=400, detail="That email is already in use")
 
-    new_user = User(username=username, email=user.email,
+    new_user = User(username=username, email=(user.email or "").strip() or None,
                     hashed_password=get_password_hash(user.password), role=role)
     db.add(new_user)
     db.commit()
@@ -1212,19 +1392,172 @@ def get_stats(db: Session = Depends(get_db), current_user: User = Depends(get_cu
         result["users_usage"] = [{"username": row.username, "video_count": row.video_count, "total_size": row.total_size, "total_size_formatted": format_file_size(row.total_size or 0)} for row in users_usage]
     return result
 
+@app.get("/api/overview")
+def overview(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """The Overview page's extras: what came in each month, where the
+    properties stand, how much has been edited."""
+    now = datetime.utcnow()
+    months = []
+    y, m = now.year, now.month
+    for _ in range(12):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    months.reverse()
+    start = datetime(months[0][0], months[0][1], 1)
+    rows = (db.query(Video.created_at, Video.file_size, Video.media_type)
+            .filter(Video.is_active.isnot(False), Video.created_at >= start).all())
+    buckets = {k: {"files": 0, "bytes": 0, "photos": 0, "videos": 0} for k in months}
+    for at, size, kind in rows:
+        if not at:
+            continue
+        b = buckets.get((at.year, at.month))
+        if b is None:
+            continue
+        b["files"] += 1
+        b["bytes"] += size or 0
+        if kind == "photo":
+            b["photos"] += 1
+        elif kind == "video":
+            b["videos"] += 1
+    monthly = [{"month": f"{y:04d}-{m:02d}", **buckets[(y, m)],
+                "formatted": format_file_size(buckets[(y, m)]["bytes"])} for y, m in months]
+    props = {}
+    try:
+        import shoots
+        for status, n in db.query(shoots.Shoot.status, func.count(shoots.Shoot.id)).group_by(shoots.Shoot.status).all():
+            props[status or "shot"] = n
+    except Exception:
+        pass
+    edited = 0
+    try:
+        import photo_edit
+        edited = db.query(photo_edit.PhotoEdit).count()
+    except Exception:
+        pass
+    week = now - timedelta(days=7)
+    return {
+        "monthly": monthly,
+        "properties": props,
+        "edited": edited,
+        "added_week": db.query(Video).filter(Video.is_active.isnot(False), Video.created_at >= week).count(),
+        "photos": db.query(Video).filter(Video.is_active.isnot(False), Video.media_type == "photo").count(),
+        "videos": db.query(Video).filter(Video.is_active.isnot(False), Video.media_type == "video").count(),
+    }
+
+
+_BAD_NAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def _clean_name(name: str) -> str:
+    name = _BAD_NAME.sub("-", (name or "").strip()).strip(" .")
+    return re.sub(r"\s+", " ", name)[:180]
+
+
+def _rename_on_disk(v: Video, new_name: str) -> str:
+    """Rename the file itself (same folder, same extension), and the row.
+    Returns the name it got - a clash gets " (2)" rather than overwriting."""
+    ext = os.path.splitext(v.filename or "")[1]
+    stem = _clean_name(os.path.splitext(new_name)[0] if new_name.lower().endswith(ext.lower()) and ext else new_name)
+    if not stem:
+        raise ValueError("That name is empty once the characters Windows does not allow are taken out")
+    real = resolve_media_path(v.filepath) if v.filepath else None
+    final = stem + ext
+    if real and os.path.exists(real):
+        folder = os.path.dirname(real)
+        target = os.path.join(folder, final)
+        n = 2
+        while os.path.exists(target) and os.path.normcase(os.path.abspath(target)) != os.path.normcase(os.path.abspath(real)):
+            final = f"{stem} ({n}){ext}"
+            target = os.path.join(folder, final)
+            n += 1
+        if target != real:
+            os.rename(real, target)
+            # the stored path keeps the library's own spelling (Windows or WSL)
+            sep = "\\" if "\\" in (v.filepath or "") else "/"
+            v.filepath = v.filepath.rsplit(sep, 1)[0] + sep + final if sep in (v.filepath or "") else final
+    v.filename = final
+    return final
+
+
 @app.post("/api/videos/{video_id}/rename")
 def rename_video(video_id: int, request: RenameRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    
-    new_name = request.name
-    if not new_name:
+    if not request.name:
         raise HTTPException(status_code=400, detail="Name is required")
-        
-    video.filename = new_name
+    try:
+        final = _rename_on_disk(video, request.name)
+    except (OSError, ValueError) as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=f"Could not rename: {e}")
     db.commit()
-    return {"message": "Video renamed successfully"}
+    return {"message": "Renamed", "name": final}
+
+
+class BatchRename(BaseModel):
+    video_ids: List[int]
+    pattern: str = "{name}"
+    start: int = 1
+    digits: int = Field(3, ge=1, le=6)
+    dry_run: bool = True
+
+
+@app.post("/api/videos/rename-batch")
+def rename_batch(body: BatchRename, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Rename many files from one pattern, in the order given. Words in
+    braces are filled in: {name} the current name, {n} a counter, {date} the
+    shoot date, {folder} the folder, {property} the property's address.
+    dry_run shows what would happen and changes nothing."""
+    rows = {v.id: v for v in db.query(Video).filter(Video.id.in_(body.video_ids)).all()}
+    prop_cache: dict = {}
+
+    def prop_of(v):
+        if v.folder_id in prop_cache:
+            return prop_cache[v.folder_id]
+        name = ""
+        try:
+            import shoots
+            sh = shoots.shoot_for_path(db, v.filepath)
+            name = sh.address if sh else ""
+        except Exception:
+            pass
+        prop_cache[v.folder_id] = name
+        return name
+
+    out, n = [], body.start
+    for vid in body.video_ids:
+        v = rows.get(vid)
+        if not v:
+            continue
+        stem = os.path.splitext(v.filename or "")[0]
+        date = (v.shoot_date or v.created_at)
+        text = (body.pattern
+                .replace("{name}", stem)
+                .replace("{n}", str(n).zfill(body.digits))
+                .replace("{date}", date.strftime("%Y-%m-%d") if date else "")
+                .replace("{folder}", v.folder.name if v.folder else "")
+                .replace("{property}", prop_of(v) if "{property}" in body.pattern else ""))
+        new = _clean_name(text) + os.path.splitext(v.filename or "")[1]
+        out.append({"id": v.id, "old": v.filename, "new": new})
+        n += 1
+    if body.dry_run:
+        return {"preview": out}
+    if not permissions.can(current_user.role, permissions.ORGANISE):
+        raise HTTPException(status_code=403, detail="Your account cannot move or rename files.")
+    done, failed = 0, []
+    for r in out:
+        v = rows[r["id"]]
+        try:
+            r["new"] = _rename_on_disk(v, r["new"])
+            db.commit()
+            done += 1
+        except Exception as e:
+            db.rollback()
+            failed.append(f"{r['old']}: {e}")
+    return {"renamed": done, "failed": failed[:20], "preview": out}
 
 @app.get("/api/upload/status/{job_id}")
 def get_upload_status(job_id: str, current_user: User = Depends(get_current_user)):
@@ -1236,14 +1569,15 @@ def get_upload_status(job_id: str, current_user: User = Depends(get_current_user
 
 @app.get("/api/videos/transcript-search")
 def transcript_search(q: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    pattern = f"%{q}%"
-    segments = db.query(TranscriptionSegment).filter(TranscriptionSegment.text.ilike(pattern)).all()
-    
+    # Same matching as /api/search/spoken - every word, any order, punctuation
+    # ignored, "quoted phrases" exact - kept in this response shape because
+    # the library search box merges it by video id. Trashed clips no longer
+    # appear, and the result is bounded.
+    import subclips as _sc
     results = {}
-    for seg in segments:
-        if seg.video_id not in results:
-            results[seg.video_id] = []
-        results[seg.video_id].append({"text": seg.text, "start": seg.start_time, "end": seg.end_time})
+    for r in _sc.spoken_search(db, q, limit=200, per_clip=20):
+        results[r["video_id"]] = [{"text": m["text"], "start": m["start"], "end": m["end"]}
+                                  for m in r["moments"]]
     return results
 
 @app.get("/api/videos/{video_id}")
@@ -1278,6 +1612,7 @@ def get_video(
         "proxy_status": video.proxy_status,
         "has_proxy": video.proxy_path is not None and os.path.exists(video.proxy_path),
         "rating": video.rating,
+        "label": video.color_label,
         "shoot_date": video.shoot_date.isoformat() if video.shoot_date else None,
         "camera_make": video.camera_make,
         "camera_model": video.camera_model,
@@ -1470,15 +1805,61 @@ def move_video_to_folder(video_id: int, payload: dict = Body(...), db: Session =
     return {"message": "Video moved", "file_moved": moved, "path": video.filepath}
 
 
+def _meta_rating(v):
+    if v in (None, "", 0, "0"):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A rating is a whole number from 0 to 5")
+    if not 0 <= n <= 5:
+        raise HTTPException(status_code=400, detail="A rating is a whole number from 0 to 5")
+    return n or None
+
+
+def _meta_text(limit):
+    def check(v):
+        if v is None:
+            return None
+        if not isinstance(v, str) or len(v) > limit:
+            raise HTTPException(status_code=400, detail=f"Use plain text of at most {limit} characters")
+        return v.strip() or None
+    return check
+
+
+def _meta_status(v):
+    s = _meta_text(32)(v)
+    return s or "raw"
+
+
+# field -> how to clean the value. Paths, owners, sizes and job state are not here.
+_EDITABLE_METADATA = {
+    "rating": _meta_rating,
+    "status": _meta_status,
+    "camera_make": _meta_text(80),
+    "camera_model": _meta_text(80),
+}
+
+
 @app.post("/api/videos/{video_id}/metadata")
 def update_video_metadata(video_id: int, payload: dict = Body(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    body = payload
+    """Change the descriptive fields of one file.
+
+    This used to setattr() every key it was given, so any account with edit
+    rights could rewrite a row's filepath, owner or trash state and point the
+    catalogue at any file on the machine. Only the fields a person is meant to
+    edit are accepted now; everything else is refused by name.
+    """
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+    body = payload if isinstance(payload, dict) else {}
+    refused = sorted(k for k in body if k not in _EDITABLE_METADATA)
+    if refused:
+        raise HTTPException(status_code=400,
+                            detail=f"These fields cannot be changed here: {', '.join(refused)}")
     for key, value in body.items():
-        if hasattr(video, key):
-            setattr(video, key, value)
+        setattr(video, key, _EDITABLE_METADATA[key](value))
     db.commit()
     return {"message": "Metadata updated successfully"}
 
@@ -1560,6 +1941,7 @@ def delete_video(video_id: int, delete_file: bool = False, permanent: bool = Fal
                 video.original_path = video.original_path or video.filepath
                 video.filepath = move_to_trash(real)
             video.is_active = False
+            video.trashed_at = datetime.utcnow()
             db.commit()
             return {"message": "Moved to trash", "trashed": True}
         except Exception as e:
@@ -1644,9 +2026,14 @@ def add_note(video_id: int, payload: dict = Body(...), db: Session = Depends(get
         raise HTTPException(status_code=400, detail="Note content is required")
     if not db.query(Video.id).filter(Video.id == video_id).first():
         raise HTTPException(status_code=404, detail="Video not found")
-    note = Note(media_id=video_id, content=content, created_at=datetime.utcnow())
+    if len(content) > 5000:
+        raise HTTPException(status_code=400, detail="Keep a note under 5000 characters")
+    # The author is what lets the bell leave your own notes out of your count.
+    note = Note(media_id=video_id, content=content, author=current_user.username,
+                created_at=datetime.utcnow())
     db.add(note); db.commit(); db.refresh(note)
-    return {"id": note.id, "content": note.content, "created_at": note.created_at.isoformat()}
+    return {"id": note.id, "content": note.content, "author": note.author,
+            "created_at": note.created_at.isoformat()}
 
 
 @app.delete("/api/notes/{note_id}")
@@ -1655,6 +2042,12 @@ def delete_note(note_id: int, db: Session = Depends(get_db),
     note = db.query(Note).filter(Note.id == note_id).first()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
+    # Your own notes, or anyone's if you are an admin. Notes from before
+    # authors were recorded have none, so they fall to an editor or admin.
+    mine = note.author and note.author == current_user.username
+    if not (mine or current_user.role == "admin"
+            or (not note.author and permissions.can(current_user.role, permissions.ORGANISE))):
+        raise HTTPException(status_code=403, detail="You can only delete your own notes")
     db.delete(note); db.commit()
     return {"message": "Note deleted"}
 
@@ -1728,6 +2121,9 @@ def delete_folder(folder_id: int, delete_files: bool = False, db: Session = Depe
     return {"message": "Folder deleted", "removed_from_disk": removed_from_disk}
 
 
+COLOR_LABELS = ("red", "yellow", "green", "blue", "purple")
+
+
 @app.post("/api/videos/bulk")
 def bulk_action(payload: dict = Body(...), db: Session = Depends(get_db),
                 current_user: User = Depends(get_current_user)):
@@ -1762,6 +2158,13 @@ def bulk_action(payload: dict = Body(...), db: Session = Depends(get_db),
                 affected += 1
             except Exception as e:
                 print(f"Move failed for {v.filename}: {e}")
+    elif action == "label":
+        label = (payload.get("label") or "").strip().lower() or None
+        if label not in (None, *COLOR_LABELS):
+            raise HTTPException(status_code=400, detail=f"A label is one of: {', '.join(COLOR_LABELS)}")
+        for v in videos:
+            v.color_label = label
+            affected += 1
     elif action == "status":
         new_status = payload.get("status")
         if not new_status:
@@ -1784,6 +2187,7 @@ def bulk_action(payload: dict = Body(...), db: Session = Depends(get_db),
                     v.original_path = v.original_path or v.filepath
                     v.filepath = move_to_trash(real)
                 v.is_active = False
+                v.trashed_at = datetime.utcnow()
                 affected += 1
             except Exception as e:
                 print(f"Trash failed for {v.filename}: {e}")
@@ -2091,7 +2495,9 @@ def list_trash(db: Session = Depends(get_db), current_user: User = Depends(get_c
             "file_size_formatted": format_file_size(v.file_size or 0),
             "media_type": v.media_type, "thumbnail_path": v.thumbnail_path,
             "original_path": v.original_path or v.filepath,
+            "trashed_at": v.trashed_at.isoformat() + "Z" if v.trashed_at else None,
         } for v in rows],
+        "auto_days": _trash_settings().get("auto_days", 0),
     }
 
 
@@ -2118,13 +2524,13 @@ def restore_video(video_id: int, db: Session = Depends(get_db),
             raise HTTPException(status_code=500, detail=f"Could not restore: {e}")
     video.is_active = True
     video.original_path = None
+    video.trashed_at = None
     db.commit()
     return {"message": "Restored", "path": video.filepath}
 
 
-@app.post("/api/trash/empty")
-def empty_trash(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
-    rows = db.query(Video).filter(Video.is_active == False).all()
+def _purge(db, rows) -> dict:
+    """Delete these trashed files for good: the file, and its catalogue row."""
     freed, removed, errors = 0, 0, []
     for v in rows:
         real = resolve_media_path(v.filepath)
@@ -2143,12 +2549,79 @@ def empty_trash(db: Session = Depends(get_db), current_user: User = Depends(get_
     # tidy up the empty directory skeleton left behind
     try:
         for dirpath, dirnames, filenames in os.walk(trash_root(), topdown=False):
-            if not dirnames and not filenames:
+            if not dirnames and not filenames and Path(dirpath) != trash_root():
                 os.rmdir(dirpath)
     except Exception:
         pass
     return {"removed": removed, "freed": freed,
             "freed_formatted": format_file_size(freed), "errors": errors[:10]}
+
+
+@app.post("/api/trash/empty")
+def empty_trash(db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
+    return _purge(db, db.query(Video).filter(Video.is_active == False).all())
+
+
+@app.post("/api/trash/restore-all")
+def restore_all(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    ids = [v.id for v in db.query(Video.id).filter(Video.is_active == False).all()]
+    done, failed = 0, []
+    for vid in ids:
+        try:
+            restore_video(vid, db, current_user)
+            done += 1
+        except HTTPException as e:
+            failed.append(str(e.detail))
+    return {"restored": done, "failed": failed[:10]}
+
+
+TRASH_SETTINGS = Path(__file__).resolve().parent / "trash_settings.json"
+
+
+def _trash_settings() -> dict:
+    try:
+        return json.loads(TRASH_SETTINGS.read_text())
+    except Exception:
+        return {"auto_days": 0}
+
+
+class TrashSettings(BaseModel):
+    auto_days: int = Field(0, ge=0, le=365)   # 0 = never empty by itself
+
+
+@app.post("/api/trash/settings")
+def set_trash_settings(body: TrashSettings, current_user: User = Depends(get_admin_user)):
+    TRASH_SETTINGS.write_text(json.dumps(body.model_dump()))
+    return body.model_dump()
+
+
+def _trash_auto_loop():
+    """Once an hour: date anything trashed before dates were kept, then delete
+    for good what has sat in the trash longer than the setting allows."""
+    while True:
+        try:
+            days = int(_trash_settings().get("auto_days", 0) or 0)
+            db = SessionLocal()
+            try:
+                undated = db.query(Video).filter(Video.is_active == False, Video.trashed_at.is_(None)).all()
+                for v in undated:
+                    v.trashed_at = datetime.utcnow()
+                if undated:
+                    db.commit()
+                if days > 0:
+                    cut = datetime.utcnow() - timedelta(days=days)
+                    old = db.query(Video).filter(Video.is_active == False, Video.trashed_at < cut).all()
+                    if old:
+                        r = _purge(db, old)
+                        print(f"Trash: emptied {r['removed']} files older than {days} days ({r['freed_formatted']})", flush=True)
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Trash auto-empty: {e}", flush=True)
+        time.sleep(3600)
+
+
+threading.Thread(target=_trash_auto_loop, daemon=True, name="trash-auto").start()
 
 
 @app.post("/api/videos/jobs/clear")
@@ -2464,8 +2937,18 @@ def proxy_status(db: Session = Depends(get_db),
         "missing": base.filter(Video.proxy_status.notin_(["completed"])).count(),
         "queued": base.filter(Video.proxy_status.in_(["queued", "processing"])).count(),
         "failed": base.filter(Video.proxy_status == "failed").count(),
+        "gave_up": base.filter(Video.proxy_status == "failed",
+                               Video.proxy_attempts >= 3).count(),
         "percent": round(done / total * 100) if total else 100,
+        "sweeper": __import__("proxy_sweeper").status(),
     }
+
+
+@app.post("/api/proxies/sweep")
+def proxy_sweep_now(current_user: User = Depends(require_admin)):
+    """Run the background sweep now rather than waiting for the next pass."""
+    import proxy_sweeper
+    return proxy_sweeper.sweep(resolve=resolve_media_path)
 
 
 @app.post("/api/proxies/generate-missing")
@@ -2762,6 +3245,11 @@ def tag_overview(db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     """What tags exist, how much each holds, and where they came from."""
     from transcript_tags import OWNED as TRANSCRIPT_TAGS
+    try:
+        import tag_rules
+        TRANSCRIPT_TAGS = set(TRANSCRIPT_TAGS) | {r.tag for r in db.query(tag_rules.CustomTagRule).all()}
+    except Exception:
+        pass
     try:
         from enrich import CAMERA_TAG_BY_MAKE
         camera_tags = set(CAMERA_TAG_BY_MAKE.values())
@@ -3164,6 +3652,7 @@ def resolve_duplicates(payload: dict = Body(...), db: Session = Depends(get_db),
                     v.original_path = v.original_path or v.filepath
                     v.filepath = move_to_trash(real)
                 v.is_active = False
+                v.trashed_at = datetime.utcnow()
             deleted += 1
         except Exception as e:
             refused.append({"id": vid, "reason": str(e)})
@@ -3233,7 +3722,7 @@ def _share_state(db: Session, token: str, password: Optional[str] = None) -> Sha
         raise HTTPException(status_code=404, detail="This link is no longer available")
     if share.expires_at and datetime.utcnow() > share.expires_at:
         raise HTTPException(status_code=410, detail="This link has expired")
-    if share.password_hash:
+    if share.password_hash and not _staff_preview.get():
         if not password:
             raise HTTPException(status_code=401, detail="Password required")
         # A wrong guess counts against this address on this link. Without a
@@ -3314,6 +3803,15 @@ def _share_payload(db: Session, share: Share):
     }
 
 
+def _wm_name_or_400(name):
+    name = os.path.basename((name or "").strip())
+    if not name:
+        return None
+    if not delivery.watermark_exists(name):
+        raise HTTPException(status_code=400, detail="There is no watermark with that name.")
+    return name
+
+
 @app.post("/api/shares")
 def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
@@ -3382,6 +3880,8 @@ def create_share(payload: dict = Body(...), db: Session = Depends(get_db),
         # Default on for a desktop audience; a portal meant for a phone is
         # better without it, because a zip lands in Files, not the camera roll.
         allow_zip=bool(payload.get("allow_zip", True)),
+        watermark_previews=bool(payload.get("watermark_previews", False)),
+        watermark_name=_wm_name_or_400(payload.get("watermark_name")),
         intake_folder_id=intake_id,
         created_by=current_user.username,
     )
@@ -3405,6 +3905,10 @@ def list_shares(db: Session = Depends(get_db),
         out.append({
             "id": sh.id, "token": sh.token, "url": f"/s/{sh.token}",
             "title": sh.title, "folder": folder.name if folder else None,
+            "folder_id": sh.folder_id,
+            "message": sh.message,
+            "allow_selects": bool(sh.allow_selects),
+            "include_subfolders": bool(sh.include_subfolders),
             "count": len(_share_videos(db, sh)),
             "has_password": bool(sh.password_hash),
             "allow_download": bool(sh.allow_download),
@@ -3419,6 +3923,9 @@ def list_shares(db: Session = Depends(get_db),
             "confirmed_at": sh.confirmed_at.isoformat() if sh.confirmed_at else None,
             "confirmed_by": sh.confirmed_by,
             "allow_zip": True if sh.allow_zip is None else bool(sh.allow_zip),
+            "watermark_previews": bool(sh.watermark_previews),
+            "watermark_name": sh.watermark_name,
+            "shoot_id": sh.shoot_id,
             "uploads": sh.upload_count or 0,
             "intake_folder_id": sh.intake_folder_id,
             # How much is sitting in the inbox right now - uploads counts
@@ -3684,9 +4191,11 @@ def _looks_like_a_phone(request: Request) -> bool:
 def public_share(token: str, request: Request, password: Optional[str] = None,
                  db: Session = Depends(get_db)):
     share = _share_state(db, token, password)
-    share.view_count = (share.view_count or 0) + 1
-    share.last_viewed_at = datetime.utcnow()
-    db.commit()
+    if not _staff_preview.get():
+        share.view_count = (share.view_count or 0) + 1
+        share.last_viewed_at = datetime.utcnow()
+        db.commit()
+        delivery.log(db, share, delivery.VIEWED, request=request)
     payload = _share_payload(db, share)
     phone = _looks_like_a_phone(request)
     payload["on_phone"] = phone
@@ -3694,6 +4203,27 @@ def public_share(token: str, request: Request, password: Optional[str] = None,
     # when the portal allows one, so the answer is not simply allow_zip.
     payload["offer_zip"] = bool(payload.get("allow_zip", True)) and not phone
     payload["offer_single_files"] = bool(payload.get("allow_download"))
+    payload["watermark_previews"] = bool(share.watermark_previews)
+    # What has been picked and said on this link so far, so coming back to it
+    # (another day, another device) shows the same picks instead of a blank page.
+    payload["picks"] = {
+        str(sel.video_id): {"picked": bool(sel.picked), "comment": sel.comment or ""}
+        for sel in share.selects if sel.picked or (sel.comment or "").strip()
+    } if share.allow_selects else {}
+    payload["confirmed_by"] = share.confirmed_by
+    if share.watermark_previews:
+        # Opening the portal is the moment someone will want to play things,
+        # so this is when the marked videos start being made.
+        by_id = {v.id: v for v in _share_videos(db, share)}
+        for item in payload.get("videos", []):
+            v = by_id.get(item["id"])
+            if v is None or (v.media_type or "video") != "video":
+                continue
+            src = _marked_source(v)
+            delivery.watermarked_video(src, str(_WM_CACHE_DIR), f"v{v.id}",
+                                       mark_name=share.watermark_name)
+            item["preview_state"] = delivery.video_state(src, str(_WM_CACHE_DIR), f"v{v.id}",
+                                                         mark_name=share.watermark_name)
     return payload
 
 
@@ -3707,8 +4237,55 @@ def public_thumb(token: str, video_id: int, password: Optional[str] = None,
     path = resolve_thumbnail_path(v.thumbnail_path) if v else None
     if not path:
         raise HTTPException(status_code=404, detail="No thumbnail")
+    # A delivery lets someone see the whole set before anything is paid for.
+    # The preview carries the mark; the download, which is gated separately,
+    # does not.
+    if share.watermark_previews:
+        path = delivery.watermarked_preview(path, mark_name=share.watermark_name)
     return FileResponse(path, media_type="image/jpeg",
-                        headers={"Cache-Control": "public, max-age=86400"})
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
+_WM_CACHE_DIR = UPLOAD_ROOT / "thumbnails"
+
+
+def _marked_source(v):
+    """What a marked copy is made from: the proxy when there is one (smaller,
+    and already decodes everywhere), otherwise the original."""
+    if (v.media_type or "video") == "video" and v.proxy_status == "completed" and v.proxy_path:
+        p = resolve_media_path(v.proxy_path)
+        if p and os.path.exists(p):
+            return p
+    return resolve_media_path(v.filepath)
+
+
+def _marked_stream(v, mark_name=None):
+    """The response for a watermarked portal's viewer, or None to fall through
+    (audio and documents carry no mark). Fails closed for photos and video."""
+    kind = v.media_type or "video"
+    key = f"v{v.id}"
+    if kind == "photo":
+        path = delivery.watermarked_display(resolve_media_path(v.filepath),
+                                            str(_WM_CACHE_DIR), key, mark_name=mark_name)
+        if not path:
+            thumb = resolve_thumbnail_path(v.thumbnail_path)
+            marked = delivery.watermarked_preview(thumb, mark_name=mark_name) if thumb else None
+            if not marked or marked == thumb:
+                raise HTTPException(status_code=404, detail="No preview available")
+            path = marked
+        return FileResponse(path, media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=3600"})
+    if kind == "video":
+        path = delivery.watermarked_video(_marked_source(v), str(_WM_CACHE_DIR), key,
+                                          mark_name=mark_name)
+        if not path:
+            raise HTTPException(status_code=503,
+                                detail="The preview is still being prepared.",
+                                headers={"Retry-After": "30"})
+        return FileResponse(path, media_type="video/mp4",
+                            headers={"Accept-Ranges": "bytes",
+                                     "Content-Disposition": "inline"})
+    return None
 
 
 @app.get("/api/public/share/{token}/stream/{video_id}")
@@ -3719,10 +4296,20 @@ def public_stream(token: str, video_id: int, password: Optional[str] = None,
         raise HTTPException(status_code=404, detail="Not in this share")
     if download and not share.allow_download:
         raise HTTPException(status_code=403, detail="Downloads are off for this link")
+    if download:
+        if not _staff_preview.get():
+            delivery.log(db, share, delivery.DOWNLOADED, video_id=video_id)
 
     v = db.query(Video).filter(Video.id == video_id).first()
     if not v:
         raise HTTPException(status_code=404, detail="Not found")
+
+    # A watermarked portal never streams an unmarked original to the viewer.
+    # This is the path the lightbox uses, so it matters more than the thumb.
+    if share.watermark_previews and not download:
+        marked = _marked_stream(v, share.watermark_name)
+        if marked is not None:
+            return marked
 
     # Always prefer the proxy for a share: the viewer is remote and on the
     # wrong end of an asymmetric line. Originals only on explicit download.
@@ -3903,6 +4490,10 @@ def public_download_zip(token: str, ids: Optional[str] = None,
     if not share.allow_download:
         raise HTTPException(status_code=403, detail="Downloads are off for this link")
 
+    if not _staff_preview.get():
+        delivery.log(db, share, delivery.DOWNLOADED_ZIP,
+                     detail=(f"{len(ids.split(','))} selected" if ids else "everything"))
+
     allowed = {v.id: v for v in _share_videos(db, share)}
     if ids:
         try:
@@ -3996,9 +4587,8 @@ def public_download_zip(token: str, ids: Optional[str] = None,
 def share_intake(share_id: int, db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     """What has arrived through this link and not been filed yet."""
-    share = db.query(Share).filter(Share.id == share_id).first()
-    if not share:
-        raise HTTPException(status_code=404, detail="Link not found")
+    # Same rule as the portal list: an admin, or whoever made the link.
+    share = _share_for_owner(db, share_id, current_user)
     if not share.intake_folder_id:
         return {"folder_id": None, "folder": None, "count": 0, "items": []}
 
@@ -4035,9 +4625,9 @@ def file_intake(share_id: int, payload: dict = Body(...),
     if not permissions.can(current_user.role, permissions.ORGANISE):
         raise HTTPException(status_code=403, detail="Your account cannot move files.")
 
-    share = db.query(Share).filter(Share.id == share_id).first()
-    if not share:
-        raise HTTPException(status_code=404, detail="Link not found")
+    share = _share_for_owner(db, share_id, current_user)
+    if not share.intake_folder_id:
+        raise HTTPException(status_code=400, detail="This link has no inbox")
 
     video_ids = (payload or {}).get("video_ids")
     folder_id = (payload or {}).get("folder_id")
@@ -4094,6 +4684,7 @@ def public_confirm(token: str, payload: dict = Body(None),
     share.confirmed_at = datetime.utcnow()
     share.confirmed_by = who
     db.commit()
+    delivery.log(db, share, delivery.CONFIRMED, viewer_name=who)
 
     picks = sum(1 for s in share.selects if s.picked)
     notes = sum(1 for s in share.selects if (s.comment or "").strip())
@@ -4105,6 +4696,7 @@ def public_confirm(token: str, payload: dict = Body(None),
 
 @app.post("/api/public/share/{token}/upload")
 def public_upload(token: str,
+                  request: Request,
                   file: UploadFile = File(...),
                   password: Optional[str] = Form(None),
                   sender: Optional[str] = Form(None),
@@ -4173,6 +4765,8 @@ def public_upload(token: str,
         db.rollback()
         raise HTTPException(status_code=409, detail="Could not save that file")
     db.refresh(video)
+    delivery.log(db, share, delivery.UPLOADED,
+                 detail=file_path.name, viewer_name=(sender or None), request=request)
     _process_new_upload(video.id, video.media_type)
     return {"status": "ok", "id": video.id, "filename": video.filename,
             "media_type": video.media_type, "size": video.file_size}
@@ -4252,10 +4846,88 @@ files_api.install(app, UPLOAD_ROOT)
 # Photo export: 16:9 copies of photos as a ZIP, plus saved per-photo framing.
 photo_proxy.install(app, UPLOAD_ROOT, resolve_media_path)
 activity.install(app)
+import tag_rules
+tag_rules.install(app)
 library_check.install(app, UPLOAD_ROOT, resolve_media_path)
 hdr.install(app, UPLOAD_ROOT, resolve_media_path)
 photo_edit.install(app, UPLOAD_ROOT, resolve_media_path)
 projects.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
+shoots.install(app, UPLOAD_ROOT, resolve_media_path)
+import rooms
+rooms.install(app)
+delivery.install(app)
+# In/out ranges on clips, rendered on request; searching by spoken word.
+subclips.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
+
+
+# The new frontend (web/), served at /v2 beside the legacy app while it is
+# built page by page. Its assets are content-hashed, index.html never cached.
+WEB_DIST = PROJECT_ROOT / "web" / "dist"
+
+
+# The new interface is the front door once it is built. The classic app
+# stays at /browse (and every other old path) for what v2 does not do yet -
+# the photo editor, Files, admin - and client portals (/s/...) are untouched.
+@app.get("/", include_in_schema=False)
+def front_door(request: Request):
+    from fastapi.responses import RedirectResponse
+    if (WEB_DIST / "index.html").exists():
+        return RedirectResponse("/v2/library", status_code=302)
+    return serve_frontend("", request)
+
+
+@app.api_route("/v2", methods=["GET"])
+@app.api_route("/v2/{full_path:path}", methods=["GET"])
+def serve_web_v2(full_path: str = ""):
+    if not (WEB_DIST / "index.html").exists():
+        raise HTTPException(status_code=404,
+                            detail="The new interface has not been built yet (web/dist).")
+    if full_path:
+        candidate = (WEB_DIST / full_path).resolve()
+        try:
+            candidate.relative_to(WEB_DIST.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Not found")
+        if candidate.is_file():
+            cache = ("public, max-age=31536000, immutable"
+                     if full_path.startswith("assets/") else "no-cache")
+            return FileResponse(str(candidate), headers={"Cache-Control": cache})
+    return FileResponse(str(WEB_DIST / "index.html"),
+                        headers={"Cache-Control": "no-store"})
+
+
+# The classic app's pages, and where each one lives in the new interface.
+# Old bookmarks and links land in the right place instead of in the old app,
+# which had no way back. ?classic=1 still opens the old page, as an escape
+# hatch. Client links (/s/..., /f/...) are not here: they stay as they are.
+_CLASSIC_TO_V2 = {
+    "browse": "/v2/library",
+    "upload": "/v2/library",
+    "files": "/v2/files",
+    "shares": "/v2/portals",
+    "portals": "/v2/portals",
+    "dashboard": "/v2/manage/overview",
+    "duplicates": "/v2/manage/duplicates",
+    "tags": "/v2/manage/tagging",
+    "admin": "/v2/manage/updates",
+}
+
+
+def _classic_redirect(request: Request, full_path: str):
+    from fastapi.responses import RedirectResponse
+    q = request.query_params
+    if q.get("classic") or not (WEB_DIST / "index.html").exists():
+        return None
+    head = full_path.strip("/").split("/")[0]
+    target = _CLASSIC_TO_V2.get(head)
+    if not target:
+        return None
+    # /browse?video=ID&t=SEC was the deep link to a clip: open it there instead.
+    if head == "browse" and q.get("video", "").isdigit():
+        vid = int(q["video"])
+        t = q.get("t", "")
+        target += f"?open={vid}&sel={vid}" + (f"&t={t}" if re.fullmatch(r"[0-9.]+", t or "") else "")
+    return RedirectResponse(target, status_code=302)
 
 
 # --- first-run setup -------------------------------------------------------
@@ -4288,9 +4960,23 @@ except Exception as _e:
     print(f"  [!] Setup routes unavailable: {_e}")
 
 # Catch-all: serve index.html for all non-API routes (React Router)
+# Client links open in the new interface too (it has pages for them that
+# need no account). ?classic=1 still gets the old page.
+@app.get("/s/{token}", include_in_schema=False)
+@app.get("/f/{token}", include_in_schema=False)
+def client_link_page(token: str, request: Request):
+    if request.query_params.get("classic") or not (WEB_DIST / "index.html").exists():
+        return serve_frontend(request.url.path.lstrip("/"), request)
+    return FileResponse(str(WEB_DIST / "index.html"), media_type="text/html",
+                        headers={"Cache-Control": "no-cache", "X-Robots-Tag": "noindex"})
+
+
 @app.api_route("/{full_path:path}", methods=["GET"])
-def serve_frontend(full_path: str):
+def serve_frontend(full_path: str, request: Request):
     if full_path.startswith("api/"): raise HTTPException(status_code=404, detail="Not found")
+    moved = _classic_redirect(request, full_path)
+    if moved is not None:
+        return moved
     index_path = str(FRONTEND_DIST / "index.html")
     if os.path.exists(index_path):
         # index.html must never be cached. Asset filenames are content-hashed
@@ -4331,6 +5017,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  [!] Could not resume pending jobs: {e}")
 
+    # Proxies as a real background job: new footage, retries, repairs.
+    try:
+        import proxy_sweeper
+        proxy_sweeper.start(resolve=resolve_media_path)
+        print(f"  Proxy sweeper on (mode: {proxy_sweeper.mode()})", flush=True)
+    except Exception as e:
+        print(f"  [!] Could not start the proxy sweeper: {e}")
+
     # Nightly catalog snapshot. The transcripts represent far more work than
     # the database file's size suggests, and they only exist in one place.
     try:
@@ -4338,6 +5032,13 @@ if __name__ == "__main__":
         catalog_backup.start_scheduler()
     except Exception as e:
         print(f"  [!] Could not start catalog backups: {e}")
+
+    # One-off repairs after an update, in the background, each only once.
+    try:
+        import maintenance
+        maintenance.start(resolve_media_path, move_to_trash, UPLOAD_ROOT)
+    except Exception as e:
+        print(f"  [!] Could not start maintenance: {e}")
 
     try:
         _start_update_watcher()

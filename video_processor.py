@@ -268,8 +268,15 @@ def generate_proxy(input_path: str, output_path: str, progress_callback=None,
 
     def run(codec_args):
         """Run one encode, streaming progress. Returns (returncode, tail)."""
+        # Background work: run below normal priority so browsing, previews
+        # and the portal stay quick while a backlog encodes.
+        kw = {}
+        if os.name == "posix":
+            kw["preexec_fn"] = lambda: os.nice(10)
+        elif os.name == "nt":
+            kw["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
         proc = subprocess.Popen(build(codec_args), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True)
+                                stderr=subprocess.STDOUT, text=True, **kw)
         # Hand the process out so a Stop request can terminate it. Without
         # this, cancelling a batch still left the current 4K encode running
         # to completion.
@@ -298,7 +305,9 @@ def generate_proxy(input_path: str, output_path: str, progress_callback=None,
     # says nothing about whether this machine has an NVIDIA card. So a hardware
     # failure is expected, not exceptional: fall back to software and remember
     # the answer so the rest of the queue does not retry the same dead end.
-    if code != 0 and encoder != 'libx264':
+    # code < 0 means the encode was killed (Stop), not that NVENC is missing -
+    # falling back then would start a whole new encode after being told to stop.
+    if code > 0 and encoder != 'libx264':
         print(f"  {encoder} failed (rc={code}); falling back to libx264")
         _ENCODER_CACHE['h264'] = 'libx264'
         if progress_callback:
