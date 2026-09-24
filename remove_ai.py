@@ -102,7 +102,9 @@ def _lama(crop: np.ndarray, mask: np.ndarray) -> np.ndarray:
     # pad to the square the model takes, mirroring so the edge is not a wall
     pw, ph = SIZE - nw, SIZE - nh
     img = cv2.copyMakeBorder(small, 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
-    mm = cv2.copyMakeBorder(m.astype(np.uint8), 0, ph, 0, pw, cv2.BORDER_CONSTANT, value=0)
+    # the mask is mirrored the same way: a hole touching the bottom or right edge is mirrored into the padding,
+    # and marked known there the model continued it (black) instead of filling it
+    mm = cv2.copyMakeBorder(m.astype(np.uint8), 0, ph, 0, pw, cv2.BORDER_REFLECT_101)
     out = _get_session().run(None, {
         "image": img.transpose(2, 0, 1)[None].astype(np.float32),
         "mask": (mm > 0).astype(np.float32)[None, None],

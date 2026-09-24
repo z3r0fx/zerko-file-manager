@@ -8,6 +8,7 @@ generated looks at the end of this file are painted by an image model
 from __future__ import annotations
 
 import json
+import random
 import os
 from typing import Any, Dict, List, Optional
 
@@ -314,6 +315,24 @@ def sky_mask(path: str, rgb: np.ndarray) -> np.ndarray:
     return _skyline_mask(path, rgb, pts, m) if len(pts) >= 2 else m
 
 
+def item_mask(path: str, rgb: np.ndarray, box) -> Optional[np.ndarray]:
+    """A small thing standing on something bigger (a vase on a table): Segment Anything pointed at the middle of
+    the box, told the box's corners are not it - a box prompt alone traced the table instead."""
+    import editor_ai
+    if not _sam_ready():
+        return None
+    h, w = rgb.shape[:2]
+    x0, y0, x1, y1 = box
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    pts = [(cx, cy), (x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+    u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+    try:
+        return editor_ai.sam_click(u8, _u8_key(path, u8), pts, [1, 0, 0, 0, 0], (h, w))
+    except Exception as e:
+        print(f"ai_photo: SAM point failed: {e}", flush=True)
+        return None
+
+
 def box_mask(path: str, rgb: np.ndarray, box) -> np.ndarray:
     """What is inside a dragged box (x0, y0, x1, y1 in 0..1): the house."""
     import editor_ai
@@ -505,8 +524,10 @@ def sky(video_id: int, body: SkyBody, db: Session = Depends(get_db),
 CLUTTER_PROMPT = (
     "This is a property photo for a listing. List the clutter a careful photographer would have tidied away before shooting: "
     "loose items on counters and tables, cables, bins, toiletries, shoes, toys, washing, fridge magnets, remotes, bags, "
-    "personal photos, hoses, a car in a driveway only if it spoils the shot. Do NOT list furniture, fixed fittings, lights, "
-    "plants that belong, art, or anything large that would leave a hole. Give each a short label that says where it is "
+    "personal photos, hoses. NEVER list cars, vehicles or people - the photographer removes those by hand. Do NOT list furniture, fixed fittings, lights, "
+    "plants that belong, art, or anything large that would leave a hole. List every object on its own with its own box - "
+    "never one box round several things (three photo frames are three items), since everything inside a box is removed. "
+    "Leave out anything mostly hidden behind furniture. Give each a short label that says where it is "
     "(\"bottles on the left counter\") and a tight box in 0..1 of the picture: x0, y0 (top left), x1, y1 (bottom right). "
     'Answer as {"items":[{"label":"...","box":[x0,y0,x1,y1]}]} - an empty list if the room is already tidy.'
 )
@@ -518,7 +539,7 @@ def clutter(video_id: int, db: Session = Depends(get_db), current_user: User = D
     v = _video(db, video_id)
     path = _path(v)
     rgb = base_rgb(video_id, path, 1600)
-    d = ai.ask_json(CLUTTER_PROMPT, [ai.jpeg_b64(rgb, 1568, 88)], "", max_tokens=3000, temperature=0.0)
+    d = ai.ask_json(CLUTTER_PROMPT + ai.GRID_NOTE, [ai.grid_b64(rgb)], "", max_tokens=3000, temperature=0.0)
     raw = d.get("items", []) if isinstance(d, dict) else d
     out = []
     for it in raw if isinstance(raw, list) else []:
@@ -530,8 +551,72 @@ def clutter(video_id: int, db: Session = Depends(get_db), current_user: User = D
         y0, y1 = sorted((float(np.clip(y0, 0, 1)), float(np.clip(y1, 0, 1))))
         if (x1 - x0) * (y1 - y0) < 1e-5 or (x1 - x0) * (y1 - y0) > 0.25:
             continue
-        out.append({"label": str(it.get("label") or "Item")[:80], "box": [x0, y0, x1, y1]})
-    return {"items": out[:40]}
+        label = str(it.get("label") or "Item")[:80]
+        # cars and people are the photographer's to remove, never the AI's (his rule)
+        if re.search(r"(car|cars|vehicle|vehicles|truck|bakkie|van|person|people|man|woman|child|kid)s?", label, re.I):
+            continue
+        out.append({"label": label, "box": [x0, y0, x1, y1]})
+    out = out[:40]
+    if out:
+        try:
+            out = _refine_boxes(base_rgb(video_id, path, 3200), out)
+        except Exception as e:
+            print(f"ai_photo: clutter close-ups skipped: {e}", flush=True)
+    return {"items": out}
+
+
+REFINE_PROMPT = (
+    "Each picture is a close-up cut from one property photo, around one thing to tidy away (named below). "
+    "For each picture give a tight box round the WHOLE of that thing - every part of it, nothing of the furniture or floor "
+    "round it - in 0..1 of that close-up: x0, y0 (top left), x1, y1 (bottom right). If the thing is not in its close-up, "
+    'give null for it. Answer as {"boxes":[[x0,y0,x1,y1] or null, ...]} in the same order as the pictures.'
+)
+
+
+def _refine_boxes(rgb: np.ndarray, items: List[dict]) -> List[dict]:
+    """Claude's boxes on the whole photo are often loose or a little off (a cable half outside its box), and a
+    removal stays inside the item's box - so each item is looked at again in a close-up and boxed there."""
+    H, W = rgb.shape[:2]
+    crops, wins = [], []
+    for it in items:
+        x0, y0, x1, y1 = it["box"]
+        # room round the first box: Claude's first box can be off by more than its own size on small things
+        mx, my = max(0.9 * (x1 - x0), 0.07), max(0.9 * (y1 - y0), 0.07 * W / H)
+        cx0, cy0, cx1, cy1 = max(0.0, x0 - mx), max(0.0, y0 - my), min(1.0, x1 + mx), min(1.0, y1 + my)
+        crop = rgb[int(cy0 * H):max(int(cy0 * H) + 2, int(cy1 * H)), int(cx0 * W):max(int(cx0 * W) + 2, int(cx1 * W))]
+        crops.append(ai.grid_b64(crop, 768))
+        wins.append((cx0, cy0, cx1, cy1))
+    labels = "; ".join(f"picture {i + 1}: {it['label']}" for i, it in enumerate(items))
+    d = ai.ask_json(REFINE_PROMPT + " The pictures, in order - " + labels + "." + ai.GRID_NOTE,
+                    crops, "", max_tokens=2000, temperature=0.0)
+    boxes = d.get("boxes") if isinstance(d, dict) else None
+    if not isinstance(boxes, list) or len(boxes) != len(items):
+        return items
+    out = []
+    for it, b, (cx0, cy0, cx1, cy1) in zip(items, boxes, wins):
+        try:
+            bx0, by0, bx1, by1 = [float(np.clip(float(t), 0, 1)) for t in b[:4]]
+        except Exception:
+            out.append(it)          # not found in the close-up, or no answer: the first box stays
+            continue
+        bx0, bx1 = sorted((bx0, bx1))
+        by0, by1 = sorted((by0, by1))
+        if (bx1 - bx0) * (by1 - by0) < 1e-4:
+            out.append(it)
+            continue
+        cw, ch = cx1 - cx0, cy1 - cy0
+        nb = [cx0 + bx0 * cw, cy0 + by0 * ch, cx0 + bx1 * cw, cy0 + by1 * ch]
+        # only a correction of the first box: a close-up with three frames in it can come back boxing all three
+        ob = it["box"]
+        ix = max(0.0, min(ob[2], nb[2]) - max(ob[0], nb[0])) * max(0.0, min(ob[3], nb[3]) - max(ob[1], nb[1]))
+        a_o, a_n = (ob[2] - ob[0]) * (ob[3] - ob[1]), (nb[2] - nb[0]) * (nb[3] - nb[1])
+        # a box that moved is fine (the first one is often beside the thing) as long as it stays about the
+        # same size and near: its centre within about twice the thing's size of the first one's
+        ocx, ocy, ncx, ncy = (ob[0] + ob[2]) / 2, (ob[1] + ob[3]) / 2, (nb[0] + nb[2]) / 2, (nb[1] + nb[3]) / 2
+        near = abs(ncx - ocx) < 2.0 * max(ob[2] - ob[0], 0.03) and abs(ncy - ocy) < 2.0 * max(ob[3] - ob[1], 0.03)
+        ok = (ix > 0.25 * min(a_o, a_n) or near) and 0.15 * a_o < a_n < 2.5 * a_o
+        out.append({**it, "box": nb} if ok else it)
+    return out
 
 
 class DeclutterBody(BaseModel):
@@ -562,10 +647,12 @@ def declutter(video_id: int, body: DeclutterBody, db: Session = Depends(get_db),
             except Exception:
                 failed += 1
                 continue
-            m = box_mask(path, work, [x0, y0, x1, y1]) if _sam_ready() else None
+            # SAM gets the box a little bigger than Claude's, so an edge of the item just outside it is traced too
+            ex, ey = (x1 - x0) * 0.1, (y1 - y0) * 0.1
+            m = box_mask(path, work, [max(0.0, x0 - ex), max(0.0, y0 - ey), min(1.0, x1 + ex), min(1.0, y1 + ey)]) if _sam_ready() else None
             # the item's region in full-size pixels, with room around it
             bw, bh = (x1 - x0) * W, (y1 - y0) * H
-            g = max(bw, bh) * 0.15 + 6
+            g = max(bw, bh) * 0.3 + 6
             X0, Y0 = int(max(0, x0 * W - g)), int(max(0, y0 * H - g))
             X1, Y1 = int(min(W, x1 * W + g)), int(min(H, y1 * H + g))
             if X1 - X0 < 4 or Y1 - Y0 < 4:
@@ -574,6 +661,38 @@ def declutter(video_id: int, body: DeclutterBody, db: Session = Depends(get_db),
             if m is not None:
                 part = m[int(Y0 * wh / H):max(int(Y0 * wh / H) + 1, int(Y1 * wh / H)), int(X0 * ww / W):max(int(X0 * ww / W) + 1, int(X1 * ww / W))]
                 mk = cv2.resize(part, (X1 - X0, Y1 - Y0), interpolation=cv2.INTER_LINEAR) > 0.4
+                # only what is inside the item's own box (grown by a quarter - Claude's box often cuts off a lid or a
+                # corner, and what is left of an item the fill copies back in): when the trace follows the table or
+                # the counter it stands on, the rest of that surface must not go with it
+                inbox = np.zeros_like(mk)
+                gx = gy = int(min(bw, bh) * 0.25) + 4       # by the short side: a long row of frames must not reach far
+                inbox[max(0, int(y0 * H) - Y0 - gy):int(y1 * H) - Y0 + gy, max(0, int(x0 * W) - X0 - gx):int(x1 * W) - X0 + gx] = True
+                spill = (mk & ~inbox).sum()
+                mk = mk & inbox
+                # a trace that spills far past the box, or fills all of it, is the surface, not the item: point at
+                # the item instead, and failing that take the box with its corners rounded off
+                if spill > 0.6 * max(1, mk.sum()) or mk.sum() > 0.92 * inbox.sum():
+                    pm = item_mask(path, work, [x0, y0, x1, y1])
+                    if pm is not None:
+                        pp = pm[int(Y0 * wh / H):max(int(Y0 * wh / H) + 1, int(Y1 * wh / H)), int(X0 * ww / W):max(int(X0 * ww / W) + 1, int(X1 * ww / W))]
+                        pk = cv2.resize(pp, (X1 - X0, Y1 - Y0), interpolation=cv2.INTER_LINEAR) > 0.4
+                        if (pk & ~inbox).sum() <= 0.4 * max(1, (pk & inbox).sum()) and 0.5 * inbox.sum() < (pk & inbox).sum() < 0.9 * inbox.sum():
+                            mk = pk & inbox
+                            spill = 0
+                if spill > 0.6 * max(1, mk.sum()) or mk.sum() > 0.92 * inbox.sum():
+                    # the box itself with its corners rounded (an oval round it reached a quarter past a long, thin
+                    # box - a row of frames took the chairs and vases in front of it)
+                    rr = max(1, int(min(bw, bh) * 0.25))
+                    mk8 = np.zeros(inbox.shape, np.uint8)
+                    cv2.rectangle(mk8, (int(x0 * W) - X0 + rr, int(y0 * H) - Y0 + rr), (int(x1 * W) - X0 - rr, int(y1 * H) - Y0 - rr), 1, -1)
+                    mk = cv2.dilate(mk8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rr + 1, 2 * rr + 1))) > 0
+                # the trace without its dents: whatever is left of an item next to the hole (a box's lid the trace
+                # missed) the fill grows back into the whole thing
+                if mk.any():
+                    cnt, _ = cv2.findContours(mk.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    hull = np.zeros(mk.shape, np.uint8)
+                    cv2.fillPoly(hull, [cv2.convexHull(np.vstack(cnt))], 1)
+                    mk = (hull > 0) & inbox
                 if mk.sum() < 0.08 * bw * bh:
                     mk = None
             else:
@@ -581,7 +700,7 @@ def declutter(video_id: int, body: DeclutterBody, db: Session = Depends(get_db),
             if mk is None:
                 mk = np.zeros((Y1 - Y0, X1 - X0), bool)
                 mk[int(y0 * H) - Y0:int(y1 * H) - Y0, int(x0 * W) - X0:int(x1 * W) - X0] = True
-            grow = max(3, int(max(bw, bh) * 0.06))
+            grow = max(5, int(min(bw, bh) * 0.2))
             mk = cv2.dilate(mk.astype(np.uint8), np.ones((grow, grow), np.uint8)) > 0
             # the fill needs context around the item: a window about three times its size
             c = int(max(X1 - X0, Y1 - Y0) * 1.2) + 32
@@ -815,13 +934,17 @@ def _sort_run(j: dict, body: SortBody):
         try:
             d = ai.ask_json(
                 f"These are {len(keep)} photos of one property, in order. For each, say which room or view it shows, one of: "
-                f'{", ".join(ROOM_TYPES)}. Answer as {{"rooms":["...", ...]}} with exactly {len(keep)} entries in the same order.',
+                f'{", ".join(ROOM_TYPES)}. A photo that does not show part of a house or its grounds - a car, a boat, a '
+                f'person, a product, a close-up of an object on its own - is "None": never guess a room for it. '
+                f'Answer as {{"rooms":["...", ...]}} with exactly {len(keep)} entries in the same order.',
                 imgs, "", max_tokens=800, temperature=0.0, tier="fast")
             names = d.get("rooms", []) if isinstance(d, dict) else d
             for vid, name in zip(keep, names if isinstance(names, list) else []):
                 name = str(name).strip()
                 if name in ROOM_TYPES:
                     j["rooms"].setdefault(name, []).append(vid)
+                else:
+                    j["failed"] += 1            # not a room (a car, say): left for you to place
             j["done"] += len(keep)
         except Exception as e:
             j["failed"] += len(keep)
@@ -876,12 +999,15 @@ def frame_sig(rec: dict) -> str:
     return json.dumps({k: rec.get(k, _DEFAULTS.get(k)) for k in FRAME_KEYS}, sort_keys=True)
 
 
-def gen_input(vid: int, path: str, recipe: dict) -> np.ndarray:
+PREVIEW_PIXELS = ai_image.GEN_PIXELS // 4      # a quick look: a quarter of the size, about a quarter of the cost
+
+
+def gen_input(vid: int, path: str, recipe: dict, pixels: int = 0) -> np.ndarray:
     """The photo as edited (the look layer itself left out), at the model's size."""
-    rec = {**(recipe or {}), "gen_ref": "", "gen_amount": 1.0}
+    rec = {**(recipe or {}), "gen_ref": "", "gen_amount": 1.0, "gen_light": 1.0, "gen_view": 1.0}
     rgb = developed(vid, path, rec, 1600)
     u8 = (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8)
-    w, h = ai_image.fit_size(u8.shape[1], u8.shape[0])
+    w, h = ai_image.fit_size(u8.shape[1], u8.shape[0], pixels or ai_image.GEN_PIXELS)
     return ai_image.resize(u8, w, h)
 
 
@@ -960,6 +1086,10 @@ class GenBody(BaseModel):
     stage_changes: List[str] = Field(default_factory=list, max_length=8)
     stage_words: str = Field("", max_length=600)
     stage_label: bool = True
+    # a quick, small painting to judge the look by (about a quarter of the cost); "Paint it
+    # full size" then paints it again at the full size with the same seed
+    preview: bool = False
+    pipeline: Optional[str] = Field(None, max_length=40)     # the pipeline run that asked, if any
 
 
 def _words(look: dict, body: GenBody, photo: np.ndarray) -> tuple:
@@ -974,9 +1104,28 @@ def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, r
     import cv2
     words, outside, scene = (tuple(words) + (None, None))[:3] if isinstance(words, tuple) else (words, None, None)
     prompt = ai_image.look_prompt({**look, "prompt": words}, len(examples))
+    import ai_usage
     for n in range(body.variations):
         seed = body.seed if body.seed is not None else look.get("seed")
-        g, valid = ai_image.edit_aligned(photo, prompt, examples, None if seed is None else int(seed) + n)
+        seed = int(seed) + n if seed is not None else random.randint(1, 2 ** 31 - 1)
+        ai_usage.context.set({"video_id": vid, "look": look.get("name", ""), "user": j.get("user"),
+                              "kind": "stage" if look.get("stage") else ("preview" if body.preview else "look")})
+        g, valid = ai_image.edit_aligned(photo, prompt, examples, seed)
+        real = look.get("real", True) and not look.get("stage")
+        score = ai_image.match_score(g, photo)
+        ev = ai_image.wants_evening(look.get("prompt", ""))
+        if real and (score < ai_image.MATCH_MIN or ai_image.missed_look(g, photo, ev)):
+            # the model drew a different picture (moved the mountain, the houses): once more,
+            # and the better of the two is kept
+            ai_usage.context.set({**ai_usage.context.get(), "kind": "retry"})
+            seed2 = random.randint(1, 2 ** 31 - 1)
+            g2, v2 = ai_image.edit_aligned(photo, prompt, examples, seed2)
+            s2 = ai_image.match_score(g2, photo)
+            bad1 = score < ai_image.MATCH_MIN or ai_image.missed_look(g, photo, ev)
+            bad2 = s2 < ai_image.MATCH_MIN or ai_image.missed_look(g2, photo, ev)
+            if (bad1 and not bad2) or (bad1 == bad2 and s2 > score):
+                g, valid, score, seed = g2, v2, s2, seed2
+        loose = bool(real and score < ai_image.MATCH_MIN)
         name = "gen" + uuid.uuid4().hex[:12]
         d = pe.mask_dir(vid)
         # four pictures: the painted one (g), the edit it came from (d), the light
@@ -985,16 +1134,24 @@ def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, r
         if look.get("label"):
             g = ai_image.label_staged(g)
         keep = ai_image.detail_keep(g, photo) * valid
+        ex_: dict = {}
         m, rep_ = ai_image.light_maps(g, photo, keep, valid, real=look.get("real", True), outside=outside,
-                                      outdoors=ai_image.is_outdoors(scene, outside))
-        k8 = (np.dstack([np.zeros_like(keep), rep_, keep]) * 255 + 0.5).astype(np.uint8)   # BGR: B unused, G repaint, R keep
+                                      outdoors=ai_image.is_outdoors(scene, outside),
+                                      neutral=ai_image.wants_neutral(look.get("prompt", "")),
+                                      evening=ai_image.wants_evening(look.get("prompt", "")), loose=loose,
+                                      blend=look.get("blend", "detail"), extra=ex_)
+        m = hi_light(vid, _path(_video(db, vid)), rec, m, photo, ex_.get("sky"))
+        # BGR: B where the model painted, G where its picture shows, R where the photo's detail goes back
+        k8 = (np.dstack([valid, rep_, keep]) * 255 + 0.5).astype(np.uint8)
+        g = ai_image.extend_edges(g, valid)          # the sky runs to the frame's edge
         for end, img in (("g", cv2.cvtColor(g, cv2.COLOR_RGB2BGR)), ("d", cv2.cvtColor(photo, cv2.COLOR_RGB2BGR)),
                          ("m", cv2.cvtColor(m, cv2.COLOR_RGB2BGR)), ("k", k8)):
             if not cv2.imwrite(str(d / f"{name}{end}.png"), img):
                 raise HTTPException(status_code=500, detail="Could not save the look")
         item = {"video_id": vid, "ref": f"{vid}/{name}", "look": look.get("name", ""), "look_id": look.get("id"),
                 "prompt": words, "geo": frame_sig(rec), "made": datetime.utcnow().isoformat(), "stage": look.get("stage"),
-                "maps": MAPS_VERSION, "outside": outside, "scene": scene}
+                "maps": MAPS_VERSION, "outside": outside, "scene": scene, "match": round(score, 3), "loose": loose,
+                "seed": seed, "preview": bool(body.preview), "pipeline": body.pipeline}
         # a note beside the pictures, so the photo's looks are listed again next time
         (d / f"{name}.json").write_text(json.dumps(item))
         j["items"].append(item)
@@ -1019,18 +1176,22 @@ def _gen_run(j: dict, body: GenBody):
                 v = _video(db, vid)
                 path = _path(v)
                 rec = body.recipe if (body.recipe is not None and len(body.video_ids) == 1) else saved_recipe(db, vid)
-                photo = gen_input(vid, path, rec)
+                photo = gen_input(vid, path, rec, PREVIEW_PIXELS if body.preview else 0)
                 # Claude writes every look's instruction at once; the card then paints them in turn
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=min(4, len(looks))) as pool:
                     words = list(pool.map(lambda l: _words(l, body, photo), looks))
                 for look, w in zip(looks, words):
-                    ex = ai_image.look_examples(look) if look.get("id") else []
+                    # a look's example photos are other properties: shown them, the model copied their layout
+                    # (a twilight came back as a different house, garden and camera) and only the light could be
+                    # used. The look's words carry the finish; the examples stay the look's picture in the lists.
+                    ex = ai_image.look_examples(look) if look.get("id") and look.get("send_examples") else []
                     _gen_one(db, j, body, vid, look, ex, rec, photo, w)
                 if body.apply and j["items"]:
                     it = j["items"][-1]
                     cur = saved_recipe(db, vid)
-                    cur.update(gen_ref=it["ref"], gen_amount=1.0, gen_look=it["look"][:80], gen_geo=it["geo"])
+                    cur.update(gen_ref=it["ref"], gen_amount=1.0, gen_light=1.0, gen_view=1.0, gen_look=it["look"][:80],
+                               gen_geo=it["geo"])
                     save_recipe(db, vid, cur)
                 j["done"] += 1
             except ai.AiOff as e:
@@ -1051,7 +1212,7 @@ def _gen_run(j: dict, body: GenBody):
         db.close()
 
 
-MAPS_VERSION = 4          # how the light and where-it-paints maps are worked out; older ones are redone
+MAPS_VERSION = 14          # how the light and where-it-paints maps are worked out; older ones are redone
 _remapping: set = set()
 
 
@@ -1077,6 +1238,35 @@ def gen_maps(body: GenMapsBody, current_user: User = Depends(get_current_user)):
     return {"ok": True}
 
 
+HI_LIGHT = 3200      # the light map's long edge: lined up with the photo at about this size
+
+
+def hi_light(vid: int, path: str, rec: Optional[dict], m: np.ndarray, photo: np.ndarray, sky=None) -> np.ndarray:
+    """The light map at up to HI_LIGHT px, following the full photo's own edges (ai_image.upsample_light).
+    Stretched from the painting's size, a twilight's light ran past every edge at full size: a pale
+    rim round loungers, the pool's cyan on the coping. Any trouble: the map as it was."""
+    try:
+        hi = developed(vid, path, {**(rec or {}), "gen_ref": "", "gen_amount": 1.0}, HI_LIGHT)
+        hi8 = (np.clip(hi, 0, 1) * 255 + 0.5).astype(np.uint8)
+        if abs(hi8.shape[1] / hi8.shape[0] - photo.shape[1] / photo.shape[0]) > 0.01 or max(hi8.shape[:2]) <= max(m.shape[:2]):
+            return m
+        return ai_image.upsample_light(m, photo, hi8, sky=sky)
+    except Exception as e:
+        print(f"[looks] light map left at the painting's size: {e}", flush=True)
+        return m
+
+
+def _same_frame(a: str, b: str) -> bool:
+    """Two frame_sig strings the same framing (one may say 0 where the other says 0.0)."""
+    try:
+        ja, jb = json.loads(a), json.loads(b)
+        return ja.keys() == jb.keys() and all(json.dumps(ja[k]) == json.dumps(jb[k]) or
+                                              np.allclose(np.asarray(ja[k], float), np.asarray(jb[k], float), atol=1e-6)
+                                              for k in ja)
+    except Exception:
+        return a == b
+
+
 def _rebuild_maps(ref: str):
     import cv2
     import shutil
@@ -1089,20 +1279,42 @@ def _rebuild_maps(ref: str):
     g, p = cv2.cvtColor(g, cv2.COLOR_BGR2RGB), cv2.cvtColor(p, cv2.COLOR_BGR2RGB)
     real = True
     note = {}
+    look_words, blend = "", "detail"
     try:
         note = json.loads((d / f"{name}.json").read_text())
         lid = note.get("look_id")
         if lid:
-            real = ai_image.get_look(lid).get("real", True)
+            lk = ai_image.get_look(lid)
+            real, look_words, blend = lk.get("real", True), lk.get("prompt", ""), lk.get("blend", "detail")
     except Exception:
         pass
-    valid = (g.max(axis=2) > 0).astype(np.float32)
+    kk = cv2.imread(str(d / f"{name}k.png"), cv2.IMREAD_COLOR)
+    valid = ai_image.painted_area(g, p, kk)
     keep = ai_image.detail_keep(g, p) * valid
     if note and "outside" not in note and real:
         note["outside"], note["scene"] = outside_boxes(p)      # a result from before the outdoors was marked
-    m, rep_ = ai_image.light_maps(g, p, keep, valid, real=real, outside=note.get("outside"),
-                                  outdoors=ai_image.is_outdoors(note.get("scene"), note.get("outside")))
-    k8 = (np.dstack([np.zeros_like(keep), rep_, keep]) * 255 + 0.5).astype(np.uint8)
+    score = ai_image.match_score(g, p)
+    loose = bool(real and not note.get("stage") and score < ai_image.MATCH_MIN)
+    if note:
+        note["match"], note["loose"] = round(score, 3), loose
+    ex_: dict = {}
+    m, rep_ = ai_image.light_maps(g, p, keep, valid, real=real, outside=note.get("outside"), loose=loose,
+                                  outdoors=ai_image.is_outdoors(note.get("scene"), note.get("outside")),
+                                  neutral=ai_image.wants_neutral(look_words),
+                                  evening=ai_image.wants_evening(look_words), blend=blend, extra=ex_)
+    # the light lined up with the full-size photo, when the photo is still framed as it was painted
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        v = db.query(Video).filter(Video.id == int(vid)).first()
+        rec = saved_recipe(db, int(vid))
+        if v and (not note.get("geo") or _same_frame(frame_sig(rec), note.get("geo"))):
+            m = hi_light(int(vid), _path(v), rec, m, p, ex_.get("sky"))
+    finally:
+        db.close()
+    k8 = (np.dstack([valid, rep_, keep]) * 255 + 0.5).astype(np.uint8)
+    if (valid < 0.5).any():
+        cv2.imwrite(str(d / f"{name}g.png"), cv2.cvtColor(ai_image.extend_edges(g, valid), cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(d / f"{name}m.png"), cv2.cvtColor(m, cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(d / f"{name}k.png"), k8)
     for end in "gdmk":
@@ -1151,6 +1363,32 @@ def gen(body: GenBody, current_user: User = Depends(get_current_user)):
     j["items"] = []
     threading.Thread(target=_gen_run, args=(j, body), daemon=True).start()
     return j
+
+
+@router.get("/look-results/{look_id}")
+def look_results(look_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """The latest photos painted in this look that are still on disk (for Manage > Looks: keep one as the
+    look's example). Found through the paintings log, newest first."""
+    import ai_usage
+    look = ai_image.get_look(look_id)
+    rows = (db.query(ai_usage.AiUsage.video_id).filter(ai_usage.AiUsage.look == (look.get("name") or "")[:80],
+                                                       ai_usage.AiUsage.video_id.isnot(None))
+            .order_by(ai_usage.AiUsage.at.desc()).limit(300).all())
+    vids = list(dict.fromkeys(r.video_id for r in rows))[:40]
+    out = []
+    for vid in vids:
+        d = pe.mask_dir(vid)
+        for f in sorted(d.glob("gen*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                x = json.loads(f.read_text())
+            except Exception:
+                continue
+            if x.get("look_id") == look_id and (d / f"{f.stem}g.png").is_file() and not x.get("preview"):
+                out.append({"video_id": vid, "ref": x.get("ref"), "at": f.stat().st_mtime})
+                break
+        if len(out) >= 12:
+            break
+    return {"items": out}
 
 
 class GenExampleBody(BaseModel):

@@ -132,6 +132,9 @@ def model() -> str:
 
 
 def model_for(tier: str = "smart") -> str:
+    # "cheap": small writing jobs (captions) always go to the smallest model, whatever is chosen for the rest
+    if tier == "cheap":
+        return (CLI_TIERS if backend() == "claude_code" else TIERS)["fast"]
     m = model()
     if m != "auto":
         return m
@@ -229,6 +232,34 @@ def jpeg_b64(rgb, long_edge: int = 1280, quality: int = 85) -> str:
     s = long_edge / max(im.size)
     if s < 1:
         im = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))), Image.LANCZOS)
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=quality)
+    return base64.b64encode(b.getvalue()).decode()
+
+
+GRID_NOTE = (" A thin magenta grid is drawn over the picture at every 0.1 of its width (numbers along the top) and height "
+             "(numbers down the left): read every coordinate off it as exactly as you can, to 0.01. The grid is not part of the photo.")
+
+
+def grid_b64(rgb, long_edge: int = 1568, quality: int = 88) -> str:
+    """The picture with a labelled 0.1 grid over it, as a base64 JPEG: Claude reads positions off the grid
+    far more exactly than it guesses them (its plain boxes were often a tenth of the frame out)."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    a = rgb
+    if a.dtype != np.uint8:
+        a = (np.clip(a, 0, 1) * 255 + 0.5).astype(np.uint8)
+    im = Image.fromarray(a)
+    s = long_edge / max(im.size)
+    if s < 1:
+        im = im.resize((max(1, int(im.width * s)), max(1, int(im.height * s))), Image.LANCZOS)
+    d = ImageDraw.Draw(im)
+    for i in range(1, 10):
+        x, y = int(im.width * i / 10), int(im.height * i / 10)
+        d.line([(x, 0), (x, im.height)], fill=(255, 0, 255), width=1)
+        d.line([(0, y), (im.width, y)], fill=(255, 0, 255), width=1)
+        d.text((x + 3, 3), f"{i / 10:.1f}", fill=(255, 0, 255))
+        d.text((3, y + 3), f"{i / 10:.1f}", fill=(255, 0, 255))
     b = io.BytesIO()
     im.save(b, "JPEG", quality=quality)
     return base64.b64encode(b.getvalue()).decode()

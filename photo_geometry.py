@@ -33,10 +33,13 @@ def _edges(gray: np.ndarray) -> np.ndarray:
     # Blur first: without it every roof tile and leaf becomes an edge and the
     # line detector drowns in texture.
     g = cv2.GaussianBlur(gray, (5, 5), 0)
-    med = float(np.median(g))
-    lo = int(max(0, 0.66 * med))
-    hi = int(min(255, 1.33 * med))
-    return cv2.Canny(g, lo, hi, L2gradient=True)
+    # The thresholds follow how strong this photo's edges are, not how bright it is: set from the median
+    # brightness, a bright HDR room pushed them to the top and only the darkest things (carved chairs, black
+    # railings) were found - the white columns and door frames that should decide were missed.
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1)
+    hi = max(30.0, float(np.percentile(np.sqrt(gx * gx + gy * gy), 90)))
+    return cv2.Canny(g, 0.4 * hi, hi, L2gradient=True)
 
 
 def _lines(gray: np.ndarray):
@@ -230,15 +233,24 @@ def _to_output(a, b, straighten, persp_v, persp_h, distortion, rotate, distortio
     return x, y
 
 
-def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
+def upright(rgb01: Optional[np.ndarray], mode: str, current: dict, guides=None, aspect: Optional[float] = None) -> dict:
     """mode: level (roll only), vertical (roll + vertical keystone), full
     (roll + both keystones). Returns {straighten, persp_v, persp_h, lines,
-    verticals, horizontals} or {"error": ...} when there is nothing to go on."""
-    img = np.clip(rgb01, 0, 1)
-    gray = (img @ np.float32([0.2126, 0.7152, 0.0722]) * 255).astype(np.uint8)
-    h, w = gray.shape[:2]
-    segs = _lines(gray)
-    asp = w / float(h)
+    verticals, horizontals} or {"error": ...} when there is nothing to go on.
+    guides: lines the user drew (Guided Upright), [x0, y0, x1, y1] in 0..1 of the source with its
+    aspect - only those are lined up, each one fully (one line is enough to level)."""
+    guided = guides is not None
+    if guided:
+        asp = float(aspect or 1.5)
+        h = 1000.0
+        w = h * asp
+        segs = [(g[0] * w, g[1] * h, g[2] * w, g[3] * h, float(np.hypot((g[2] - g[0]) * w, (g[3] - g[1]) * h))) for g in guides]
+    else:
+        img = np.clip(rgb01, 0, 1)
+        gray = (img @ np.float32([0.2126, 0.7152, 0.0722]) * 255).astype(np.uint8)
+        h, w = gray.shape[:2]
+        segs = _lines(gray)
+        asp = w / float(h)
     dist = float(current.get("distortion", 0) or 0)
     dist2 = float(current.get("distortion2", 0) or 0)
     rot = float(current.get("rotate", 0) or 0)
@@ -255,12 +267,18 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
     ang = np.degrees(np.arctan2(cy1 - cy0, cx1 - cx0))
     from_h = np.abs(((ang + 90) % 180) - 90)       # 0 = horizontal
     from_v = 90 - from_h                            # 0 = vertical
-    vert = from_v < 25
-    horz = from_h < 15
-    if vert.sum() < 2 and horz.sum() < 2:
+    vert = from_v < (35 if guided else 25)
+    horz = (from_h < 35) & ~vert if guided else from_h < 15
+    if guided:
+        # the lines say what to do: two uprights stand the walls up, with a level one too both ways
+        if vert.sum() < 1 and horz.sum() < 1:
+            return {"error": "Draw along something that should be upright or level."}
+        mode = ("full" if horz.sum() >= 1 else "vertical") if vert.sum() >= 2 else "level"
+    elif vert.sum() < 2 and horz.sum() < 2:
         return {"error": "Not enough straight edges to go on - use the sliders."}
     if mode != "level" and vert.sum() < 2:
         return {"error": "No vertical lines to make upright - try Level instead."}
+    cap_v, cap_h = (40.0, 40.0) if guided else (8.0, 6.0)      # a drawn line counts however far off it is
     wv = ln[vert] / max(1.0, ln[vert].sum()) if vert.any() else None
     wh = ln[horz] / max(1.0, ln[horz].sum()) if horz.any() else None
 
@@ -292,11 +310,11 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
         if wv is not None:
             a = angles(vert)
             dv = np.abs(((a) % 180) - 90)           # 0 = vertical
-            total = total + (np.minimum(dv, 8.0) ** 2 * wv).sum(-1)
+            total = total + (np.minimum(dv, cap_v) ** 2 * wv).sum(-1)
         if wh is not None and mode != "vertical":
             a = angles(horz)
             dh = np.abs(((a + 90) % 180) - 90)
-            total = total + (np.minimum(dh, 6.0) ** 2 * wh).sum(-1) * (1.0 if mode == "full" else 0.7)
+            total = total + (np.minimum(dh, cap_h) ** 2 * wh).sum(-1) * (1.0 if mode == "full" or guided else 0.7)
         elif wh is not None:
             # vertical mode: level horizontals only help with the roll, gently
             a = angles(horz)
@@ -330,6 +348,7 @@ def upright(rgb01: np.ndarray, mode: str, current: dict) -> dict:
         "lines": len(segs),
         "verticals": int(vert.sum()),
         "horizontals": int(horz.sum()),
+        "mode": mode,
     }
 
 

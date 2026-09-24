@@ -41,6 +41,7 @@ import hdr
 import photo_edit
 import projects
 import shoots
+import access
 import delivery
 import subclips
 import video_edit
@@ -693,6 +694,26 @@ def get_me(current_user: User = Depends(get_current_user)):
         "capabilities": sorted(permissions.caps_for(current_user.role)),
     }
 
+def _queue_all_transcripts(retry_failed: bool = False) -> int:
+    s2 = SessionLocal()
+    try:
+        states = [None, "not_started"] + (["failed"] if retry_failed else [])
+        rows = (s2.query(Video.id).filter(Video.is_active != False, Video.media_type.in_(["video", "audio"]),
+                                          or_(Video.transcription_status.is_(None), Video.transcription_status.in_([x for x in states if x])))
+                .all())
+        for (vid,) in rows:
+            job_manager.add_job(vid, "transcribe")
+        return len(rows)
+    finally:
+        s2.close()
+
+
+@app.post("/api/videos/transcribe-all")
+def transcribe_all(payload: Optional[dict] = Body(None), current_user: User = Depends(get_current_user)):
+    """Queue every clip with sound that has no transcript yet (and, when asked, the ones that failed)."""
+    return {"queued": _queue_all_transcripts(bool((payload or {}).get("retry_failed")))}
+
+
 @app.post("/api/videos/batch-transcribe")
 def batch_transcribe(request: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     all_video_ids = request.get("video_ids", [])
@@ -716,6 +737,7 @@ def upload_file(
     current_user: User = Depends(get_current_user)
 ):
     os.makedirs(UPLOAD_ROOT, exist_ok=True)
+    access.require_folder(db, current_user, folder_id, "edit")
     dest_dir = upload_destination_dir(db, folder_id)
     # Uploading a whole directory: recreate its structure under the target
     sub = safe_relative_dir(relative_path)
@@ -773,6 +795,9 @@ def upload_file(
 def list_videos(search: Optional[str] = None, tags: Optional[str] = None, sort_by: Optional[str] = None, sort_order: Optional[str] = "desc", folder_id: Optional[int] = None, include_subfolders: bool = False, date_range: Optional[str] = None, rating: Optional[str] = None, media_type: Optional[str] = None, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     from database import TranscriptionSegment
     query = db.query(Video).filter((Video.is_active == True) | (Video.is_active == None))
+    # Client and viewer accounts see only what was shared with them (access.py).
+    _vis = access.visible_folder_ids(db, current_user)
+    if _vis is not None: query = query.filter(Video.folder_id.in_(_vis))
     if media_type and media_type != 'all': query = query.filter(Video.media_type == media_type)
     
     search_results = []
@@ -1116,6 +1141,9 @@ def create_tag(payload: dict = Body(...), db: Session = Depends(get_db), current
 def list_folders(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     video_count_subquery = select(Video.folder_id, func.count(Video.id).label("count")).group_by(Video.folder_id).subquery()
     folders_with_count = db.query(IndexedFolder, video_count_subquery.c.count).outerjoin(video_count_subquery, IndexedFolder.id == video_count_subquery.c.folder_id).order_by(IndexedFolder.order.asc(), IndexedFolder.name.asc()).all()
+    _vis = access.visible_folder_ids(db, current_user)
+    if _vis is not None:
+        folders_with_count = [(f, c) for f, c in folders_with_count if f.id in _vis]
     return [{"id": f.id, "name": f.name, "path": f.path, "relative_path": f.relative_path,
              "parent_id": f.parent_id,
              "added_at": f.added_at.isoformat() if f.added_at else None,
@@ -1148,10 +1176,14 @@ def list_folders_tree(db: Session = Depends(get_db), current_user: User = Depend
                        .group_by(Video.folder_id, Video.media_type).all()):
         by_type.setdefault(fid, {})[mt or "video"] = n
     folders = db.query(IndexedFolder).order_by(IndexedFolder.name.asc()).all()
+    # A client sees only the folders shared with them; each one's top shows as a root.
+    _vis = access.visible_folder_ids(db, current_user)
+    if _vis is not None:
+        folders = [f for f in folders if f.id in _vis]
 
     by_parent = {}
     for f in folders:
-        by_parent.setdefault(f.parent_id, []).append(f)
+        by_parent.setdefault(f.parent_id if _vis is None or f.parent_id in _vis else None, []).append(f)
 
     def build(folder):
         kids = [build(c) for c in by_parent.get(folder.id, [])]
@@ -1188,6 +1220,7 @@ def rescan_media_root(payload: Optional[dict] = Body(None), db: Session = Depend
     """Index anything new under the media root. Runs in the background."""
     opts = payload or {}
     queue_proxies = bool(opts.get("queue_proxies"))
+    transcribe = bool(opts.get("transcribe"))
 
     if _rescan_state["running"]:
         return {"status": "already_running", "message": _rescan_state["message"]}
@@ -1249,6 +1282,10 @@ def rescan_media_root(payload: Optional[dict] = Body(None), db: Session = Depend
                 # A tagging failure must not make a successful scan look failed.
                 print(f"[rescan] tagging after scan failed: {e}", flush=True)
                 _rescan_state["message"] = "Scan complete (tagging failed)"
+            # "Scan and transcribe everything" (Manage > Jobs): every clip with sound not done yet
+            if transcribe:
+                n = _queue_all_transcripts()
+                _rescan_state["message"] += f" - {n} clips queued to transcribe" if n else " - nothing left to transcribe"
         except Exception as e:
             _rescan_state["message"] = f"Scan failed: {e}"
         finally:
@@ -2683,6 +2720,7 @@ def upload_chunk(
 ):
     """Resumable chunked upload. The frontend has had a chunkedUpload() helper
     all along, pointing at this endpoint, which did not exist."""
+    access.require_folder(db, current_user, folder_id, "edit")
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", upload_id)[:64]
     if not safe_id:
         raise HTTPException(status_code=400, detail="Invalid upload_id")
@@ -3749,6 +3787,17 @@ def _share_state(db: Session, token: str, password: Optional[str] = None) -> Sha
     return share
 
 
+def _share_open(db: Session, token: str, password: Optional[str] = None) -> Share:
+    """A live share whose viewer has agreed to the studio's terms (when it asks for them):
+    what every route that shows or takes something of the portal goes through."""
+    share = _share_state(db, token, password)
+    if not _staff_preview.get():
+        import business
+        if business.terms_pending(db, share):
+            raise HTTPException(status_code=403, detail="Agree to the terms first.")
+    return share
+
+
 def _intake_folder(db: Session, title: str):
     """A holding folder for one upload link, under _Incoming.
 
@@ -3779,12 +3828,40 @@ def _share_folder_name(db: Session, share: Share) -> Optional[str]:
     return row.name if row else None
 
 
+UNPAID_WORDS = "Downloads open once payment is received."
+
+
+def _unpaid(db: Session, share: Share) -> bool:
+    """The property this portal delivers is not paid for yet: watermarked pictures, no downloads."""
+    import shoots as _shoots
+    try:
+        return _shoots.unpaid(db, share.shoot_id)
+    except Exception:
+        return False
+
+
+def _marked(db: Session, share: Share) -> bool:
+    return bool(share.watermark_previews) or _unpaid(db, share)
+
+
 def _share_payload(db: Session, share: Share):
+    import business
     vids = _share_videos(db, share)
+    unpaid = _unpaid(db, share)
+    terms = business.portal_terms(db, share)
+    # nothing of the portal until its terms are agreed (the studio's own preview sees it all)
+    locked = bool(terms and not terms["agreed"]) and not _staff_preview.get()
+    count = len(vids)
+    if locked:
+        vids = []
     return {
+        "terms": terms,
+        "terms_pending": locked,
+        "pay": business.portal_pay(db, share),
         "title": share.title or "Shared media",
         "message": share.message,
-        "allow_download": bool(share.allow_download),
+        "allow_download": bool(share.allow_download) and not unpaid,
+        "unpaid": unpaid,
         "allow_selects": bool(share.allow_selects),
         "allow_upload": bool(share.allow_upload),
         "kind": share.kind or ("both" if share.allow_upload else "send"),
@@ -3793,7 +3870,7 @@ def _share_payload(db: Session, share: Share):
         "intake_folder_id": share.intake_folder_id,
         "upload_folder": _share_folder_name(db, share),
         "expires_at": share.expires_at.isoformat() if share.expires_at else None,
-        "count": len(vids),
+        "count": count,
         "videos": [{
             "id": v.id,
             "filename": v.filename,
@@ -3930,6 +4007,8 @@ def list_shares(db: Session = Depends(get_db),
             "watermark_previews": bool(sh.watermark_previews),
             "watermark_name": sh.watermark_name,
             "shoot_id": sh.shoot_id,
+            "unpaid": _unpaid(db, sh),
+            "ask_terms": sh.ask_terms is not False,
             "uploads": sh.upload_count or 0,
             "intake_folder_id": sh.intake_folder_id,
             # How much is sitting in the inbox right now - uploads counts
@@ -4207,7 +4286,7 @@ def public_share(token: str, request: Request, password: Optional[str] = None,
     # when the portal allows one, so the answer is not simply allow_zip.
     payload["offer_zip"] = bool(payload.get("allow_zip", True)) and not phone
     payload["offer_single_files"] = bool(payload.get("allow_download"))
-    payload["watermark_previews"] = bool(share.watermark_previews)
+    payload["watermark_previews"] = _marked(db, share)
     # What has been picked and said on this link so far, so coming back to it
     # (another day, another device) shows the same picks instead of a blank page.
     payload["picks"] = {
@@ -4215,7 +4294,7 @@ def public_share(token: str, request: Request, password: Optional[str] = None,
         for sel in share.selects if sel.picked or (sel.comment or "").strip()
     } if share.allow_selects else {}
     payload["confirmed_by"] = share.confirmed_by
-    if share.watermark_previews:
+    if payload["watermark_previews"]:
         # Opening the portal is the moment someone will want to play things,
         # so this is when the marked videos start being made.
         by_id = {v.id: v for v in _share_videos(db, share)}
@@ -4231,10 +4310,21 @@ def public_share(token: str, request: Request, password: Optional[str] = None,
     return payload
 
 
+@app.get("/api/public/share/{token}/scenes")
+def public_share_scenes(token: str, password: Optional[str] = None, db: Session = Depends(get_db)):
+    """3D walk-throughs shared with the client for this portal's property."""
+    share = _share_open(db, token, password)
+    try:
+        import splat
+        return {"scenes": splat.shared_for_shoot(share.shoot_id)}
+    except Exception:
+        return {"scenes": []}
+
+
 @app.get("/api/public/share/{token}/thumb/{video_id}")
 def public_thumb(token: str, video_id: int, password: Optional[str] = None,
                  db: Session = Depends(get_db)):
-    share = _share_state(db, token, password)
+    share = _share_open(db, token, password)
     if video_id not in {v.id for v in _share_videos(db, share)}:
         raise HTTPException(status_code=404, detail="Not in this share")
     v = db.query(Video).filter(Video.id == video_id).first()
@@ -4244,7 +4334,7 @@ def public_thumb(token: str, video_id: int, password: Optional[str] = None,
     # A delivery lets someone see the whole set before anything is paid for.
     # The preview carries the mark; the download, which is gated separately,
     # does not.
-    if share.watermark_previews:
+    if _marked(db, share):
         path = delivery.watermarked_preview(path, mark_name=share.watermark_name)
     return FileResponse(path, media_type="image/jpeg",
                         headers={"Cache-Control": "private, max-age=3600"})
@@ -4295,11 +4385,14 @@ def _marked_stream(v, mark_name=None):
 @app.get("/api/public/share/{token}/stream/{video_id}")
 def public_stream(token: str, video_id: int, password: Optional[str] = None,
                   download: bool = False, db: Session = Depends(get_db)):
-    share = _share_state(db, token, password)
+    share = _share_open(db, token, password)
     if video_id not in {v.id for v in _share_videos(db, share)}:
         raise HTTPException(status_code=404, detail="Not in this share")
     if download and not share.allow_download:
         raise HTTPException(status_code=403, detail="Downloads are off for this link")
+    marked = _marked(db, share)
+    if download and _unpaid(db, share):
+        raise HTTPException(status_code=403, detail=UNPAID_WORDS)
     if download:
         if not _staff_preview.get():
             delivery.log(db, share, delivery.DOWNLOADED, video_id=video_id)
@@ -4310,10 +4403,10 @@ def public_stream(token: str, video_id: int, password: Optional[str] = None,
 
     # A watermarked portal never streams an unmarked original to the viewer.
     # This is the path the lightbox uses, so it matters more than the thumb.
-    if share.watermark_previews and not download:
-        marked = _marked_stream(v, share.watermark_name)
-        if marked is not None:
-            return marked
+    if marked and not download:
+        marked_resp = _marked_stream(v, share.watermark_name)
+        if marked_resp is not None:
+            return marked_resp
 
     # Always prefer the proxy for a share: the viewer is remote and on the
     # wrong end of an asymmetric line. Originals only on explicit download.
@@ -4482,7 +4575,7 @@ def public_download_zip(token: str, ids: Optional[str] = None,
     ZIP_STORED (no compression) because video is already compressed: deflate
     would burn CPU for roughly zero saving, and stored entries stream cleanly.
     """
-    share_for_zip = _share_state(db, token, password)
+    share_for_zip = _share_open(db, token, password)
     if not (True if share_for_zip.allow_zip is None else share_for_zip.allow_zip):
         raise HTTPException(
             status_code=403,
@@ -4490,9 +4583,11 @@ def public_download_zip(token: str, ids: Optional[str] = None,
 
     import zipfile
 
-    share = _share_state(db, token, password)
+    share = _share_open(db, token, password)
     if not share.allow_download:
         raise HTTPException(status_code=403, detail="Downloads are off for this link")
+    if _unpaid(db, share):
+        raise HTTPException(status_code=403, detail=UNPAID_WORDS)
 
     if not _staff_preview.get():
         delivery.log(db, share, delivery.DOWNLOADED_ZIP,
@@ -4683,7 +4778,7 @@ def public_confirm(token: str, payload: dict = Body(None),
     a typed note had reached anybody. This is the receipt: it records who
     finished and when, and gives the page something definite to show.
     """
-    share = _share_state(db, token, (payload or {}).get("password"))
+    share = _share_open(db, token, (payload or {}).get("password"))
     who = ((payload or {}).get("viewer_name") or "").strip()[:60] or None
     share.confirmed_at = datetime.utcnow()
     share.confirmed_by = who
@@ -4779,7 +4874,7 @@ def public_upload(token: str,
 @app.post("/api/public/share/{token}/select")
 def public_select(token: str, payload: dict = Body(...),
                   db: Session = Depends(get_db)):
-    share = _share_state(db, token, (payload or {}).get("password"))
+    share = _share_open(db, token, (payload or {}).get("password"))
     if not share.allow_selects:
         raise HTTPException(status_code=403, detail="Picking is off for this link")
 
@@ -4857,6 +4952,10 @@ hdr.install(app, UPLOAD_ROOT, resolve_media_path)
 photo_edit.install(app, UPLOAD_ROOT, resolve_media_path)
 projects.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
 shoots.install(app, UPLOAD_ROOT, resolve_media_path)
+import business
+business.install(app, _share_state)
+import booking
+booking.install(app)
 import rooms
 rooms.install(app)
 delivery.install(app)
@@ -4866,12 +4965,41 @@ video_edit.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
 ai.install(app)
 ai_photo.install(app)
 ai_image.install(app)
+import ai_usage
+ai_usage.install(app)
+import pipeline
+pipeline.install(app)
+import cull
+cull.install(app)
+import ingest
+ingest.install(app, UPLOAD_ROOT, resolve_media_path)
+import fixes
+fixes.install(app)
+import enhance
+enhance.install(app)
+import clip_search
+clip_search.install(app, UPLOAD_ROOT, resolve_media_path)
+import style
+style.install(app)
 import splat
 splat.install(app, resolve_media_path)
 import proofing
-proofing.install(app, _share_state, _share_videos)
+proofing.install(app, _share_open, _share_videos)
+# Groups, who sees which folders and properties, profiles (Discord-style roles).
+access.install(app, UPLOAD_ROOT)
+# Who is online, channels and direct messages.
+import team
+team.install(app)
 import listing_pack
 listing_pack.install(app)
+import print_marketing
+print_marketing.install(app)
+import listing_site
+listing_site.install(app, resolve_media_path, UPLOAD_ROOT)
+import invoices
+invoices.install(app)
+import archive
+archive.install(app, resolve_media_path, UPLOAD_ROOT)
 import assistant
 assistant.install(app, UPLOAD_ROOT, resolve_media_path, ensure_folder_row)
 
@@ -4978,9 +5106,13 @@ except Exception as _e:
 # Catch-all: serve index.html for all non-API routes (React Router)
 # Client links open in the new interface too (it has pages for them that
 # need no account). ?classic=1 still gets the old page.
+@app.get("/book", include_in_schema=False)
+@app.get("/booked/{token}", include_in_schema=False)
+@app.get("/l/{token}", include_in_schema=False)
 @app.get("/s/{token}", include_in_schema=False)
 @app.get("/f/{token}", include_in_schema=False)
-def client_link_page(token: str, request: Request):
+@app.get("/3d/{token}", include_in_schema=False)
+def client_link_page(request: Request, token: str = ""):
     if request.query_params.get("classic") or not (WEB_DIST / "index.html").exists():
         return serve_frontend(request.url.path.lstrip("/"), request)
     return FileResponse(str(WEB_DIST / "index.html"), media_type="text/html",

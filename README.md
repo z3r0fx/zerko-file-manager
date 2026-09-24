@@ -6,7 +6,7 @@ clips to clients with a link.
 
 Your files are never moved, renamed or altered. It only reads them.
 
-Current version: **v1.4.0**
+Current version: **v1.5.0**
 
 ## What it does
 

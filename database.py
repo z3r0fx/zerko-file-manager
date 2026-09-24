@@ -230,6 +230,9 @@ class Share(Base):
     # a name whose file has since been deleted also falls back to the first,
     # so a portal never quietly starts showing clean previews.
     watermark_name = Column(String, nullable=True)
+    # Ask the viewer to agree to the studio's terms (Manage > Business) before anything opens.
+    # None = yes, when the studio has terms switched on.
+    ask_terms = Column(Boolean, nullable=True)
 
     created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -310,7 +313,8 @@ def init_db():
                               "kind": "TEXT DEFAULT 'send'",
                               "allow_zip": "BOOLEAN DEFAULT 1",
                               "confirmed_at": "DATETIME",
-                              "confirmed_by": "TEXT"}.items():
+                              "confirmed_by": "TEXT",
+                              "ask_terms": "BOOLEAN"}.items():
             if col not in existing_share_cols:
                 logging.info(f"Adding column {col} to shares table")
                 conn.execute(text(f"ALTER TABLE shares ADD COLUMN {col} {col_type}"))

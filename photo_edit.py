@@ -500,7 +500,7 @@ class RemoveArea(BaseModel):
     under .edit-masks, by ref) laid over box = (x, y, w, h), source 0..1."""
     ref: str = Field(..., pattern=r"^\d+/[a-z0-9]{8,32}$")
     box: List[float] = Field(..., min_length=4, max_length=4)
-    kind: str = Field("remove", pattern="^(remove|pull|sky|glow)$")   # pull: a window view from a darker frame; sky: a new sky; glow: windows lit
+    kind: str = Field("remove", pattern="^(remove|pull|sky|glow|grass|pool|screen|fire)$")   # pull: a window view from a darker frame; sky: a new sky; glow: windows lit; grass/pool/screen/fire: property fixes (fixes.py)
 
 
 class Spot(BaseModel):
@@ -717,8 +717,13 @@ class Recipe(BaseModel):
     # detail stays the photo's own. gen_geo: the crop/angle it was made for.
     gen_ref: str = Field("", pattern=r"^(|\d+/gen[a-f0-9]{12})$")
     gen_amount: float = Field(1.0, ge=0, le=1)
+    gen_light: float = Field(1.0, ge=0, le=1.5)      # how much of the look's light
+    gen_view: float = Field(1.0, ge=0, le=1)         # how much of its sky, window views and lit windows
     gen_look: str = Field("", max_length=80)
     gen_geo: str = Field("", max_length=400)
+    # the Nodes editor's grade (web/src/editor/nodes.ts): [{id, name, on, settings}] - the settings above are what
+    # the nodes combine to, so the engine never reads this; it is kept for the editor to show the nodes again
+    nodes: List[dict] = Field(default_factory=list, max_length=32)
 
 
 # --------------------------------------------------------------------------
@@ -1533,6 +1538,38 @@ def gen_pair(ref: str):
     return out
 
 
+GEN_FRAME_KEYS = ("crop", "rotate", "flip_h", "flip_v", "straighten", "persp_v", "persp_h", "geo_scale", "distortion",
+                  "distortion2")
+
+
+def gen_map(r: "Recipe"):
+    """Where the look's picture lies in the frame now, when only the crop changed since it was painted: the
+    frame's (u, v) -> the painting's (ox + u * sx, oy + v * sy), so the look stays on the photo. None when
+    nothing moved, or the angle changed (then it stays as painted). Mirrors genMap in recipe.ts."""
+    if not r.gen_ref or not r.gen_geo:
+        return None
+    try:
+        g = json.loads(r.gen_geo)
+    except ValueError:
+        return None
+    cur = r.model_dump()
+
+    def differs(k):
+        a, b = g.get(k), cur.get(k)
+        if isinstance(a, list) and isinstance(b, list):
+            return len(a) != len(b) or any(abs(float(x) - float(y)) > 1e-4 for x, y in zip(a, b))
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+            return abs(a - b) > 1e-4
+        return a is not None and a != b
+    if any(differs(k) for k in GEN_FRAME_KEYS if k != "crop"):
+        return None
+    c0, c1 = g.get("crop"), list(r.crop or [0, 0, 1, 1])
+    if not isinstance(c0, list) or len(c0) < 4 or c0[2] <= 0 or c0[3] <= 0:
+        return None
+    m = ((c1[0] - c0[0]) / c0[2], (c1[1] - c0[1]) / c0[3], c1[2] / c0[2], c1[3] / c0[3])
+    return None if abs(m[0]) + abs(m[1]) + abs(m[2] - 1) + abs(m[3] - 1) < 1e-6 else m
+
+
 def apply_gen(s: np.ndarray, r: "Recipe") -> np.ndarray:
     """Lay a generated look over the finished photo. Mirrors the start of
     finish() in the FINAL shader. Two ways, mixed by the repaint map:
@@ -1545,7 +1582,23 @@ def apply_gen(s: np.ndarray, r: "Recipe") -> np.ndarray:
     if maps is None:
         return s
     h, w = s.shape[:2]
-    rs = lambda x: None if x is None else (cv2.resize(x, (w, h), interpolation=cv2.INTER_LINEAR) if x.shape[:2] != (h, w) else x)
+    gm = gen_map(r)
+    inside = None
+    if gm is None:
+        rs = lambda x: None if x is None else (cv2.resize(x, (w, h), interpolation=cv2.INTER_LINEAR) if x.shape[:2] != (h, w) else x)
+    else:
+        # the crop changed after painting: each frame pixel reads the painting where that spot of the photo was
+        pu = gm[0] + (np.arange(w, dtype=np.float32) + 0.5) / w * gm[2]
+        pv = gm[1] + (np.arange(h, dtype=np.float32) + 0.5) / h * gm[3]
+        gu, gv = np.meshgrid(pu, pv)
+        inside = ((gu >= 0) & (gu <= 1) & (gv >= 0) & (gv <= 1))[..., None]
+
+        def rs(x):
+            if x is None:
+                return None
+            gh, gw = x.shape[:2]
+            return cv2.remap(x, (gu * gw - 0.5).astype(np.float32), (gv * gh - 0.5).astype(np.float32),
+                             cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     g, d, m, kk = (rs(x) for x in maps)
     g, d = g[..., :3], d[..., :3]
     if m is not None and kk is not None:
@@ -1556,11 +1609,13 @@ def apply_gen(s: np.ndarray, r: "Recipe") -> np.ndarray:
     k = np.clip((lg + 0.02) / (ld + 0.02), 0.0, 1.6)[..., None].astype(np.float32)
     painted = g + (s - d) * k * keep
     if m is not None and kk is not None:
-        relit = s * np.exp2(m[..., :3] * np.float32(7.0) - np.float32(4.0))
-        o = relit + (painted - relit) * rep_
+        relit = s * np.exp2((m[..., :3] * np.float32(7.0) - np.float32(4.0)) * np.float32(r.gen_light))
+        o = relit + (painted - relit) * (rep_ * np.float32(r.gen_view))
     else:
         o = painted
     a = np.float32(r.gen_amount)
+    if inside is not None:
+        o = np.where(inside, o, s)
     return np.clip(s + (o - s) * a, 0.0, 1.0).astype(np.float32)
 
 
@@ -2142,9 +2197,11 @@ def _base_file(video_id: int, path: str, w: int) -> Path:
 
 @router.get("/{video_id}/developed")
 def developed(request: Request, video_id: int, token: Optional[str] = None, w: int = 1600,
-              copy: Optional[int] = None, db: Session = Depends(get_db)):
+              copy: Optional[int] = None, gen: Optional[str] = None, db: Session = Depends(get_db)):
     """The photo with its edit applied, as a JPEG - for the editor's
-    reference view (a finished photo beside the one being worked on)."""
+    reference view (a finished photo beside the one being worked on).
+    gen: show it with that look on it instead ("none": without any look),
+    for a look's before and after."""
     if token:
         get_user_from_token(token, db)
     else:
@@ -2152,6 +2209,12 @@ def developed(request: Request, video_id: int, token: Optional[str] = None, w: i
         if not auth.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
         get_user_from_token(auth[7:], db)
+    out = developed_file(db, video_id, w, copy, gen)
+    return FileResponse(str(out), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
+
+
+def developed_file(db: Session, video_id: int, w: int = 1600, copy: Optional[int] = None, gen: Optional[str] = None) -> Path:
+    """The photo with its edit applied, as a cached JPEG on disk (the reference view, print and web pages)."""
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Photo not found")
@@ -2165,25 +2228,47 @@ def developed(request: Request, video_id: int, token: Optional[str] = None, w: i
     else:
         row = db.query(PhotoEdit).filter(PhotoEdit.video_id == video_id).first()
         rtxt = row.recipe if row else "{}"
+    look = None
+    if gen:
+        if gen != "none" and not re.fullmatch(rf"{video_id}/gen[a-f0-9]{{12}}", gen):
+            raise HTTPException(status_code=400, detail="Not a look of this photo")
+        look = "" if gen == "none" else gen
+        if look:
+            mp = mask_dir(video_id) / f"{look.split('/')[1]}m.png"
+            if not mp.is_file():
+                raise HTTPException(status_code=404, detail="That look is gone")
+            rtxt = rtxt + f"|{look}|{mp.stat().st_mtime_ns}"      # its maps may be redone
+        else:
+            rtxt = rtxt + "|nolook"
     import hashlib
     key = hashlib.sha1(rtxt.encode()).hexdigest()[:12]
     base = _base_file(video_id, path, w)
-    out = base.parent / f"dev2_{video_id}_{copy or 0}_{key}_{base.stat().st_mtime_ns % 10**9}_{w}.jpg"
+    tag = "" if look is None else "g"
+    out = base.parent / f"dev2{tag}_{video_id}_{copy or 0}_{key}_{base.stat().st_mtime_ns % 10**9}_{w}.jpg"
     if not out.exists() or out.stat().st_size == 0:
         import cv2
-        for old in [*base.parent.glob(f"dev_{video_id}_{copy or 0}_*_{w}.jpg"),
-                    *base.parent.glob(f"dev2_{video_id}_{copy or 0}_*_{w}.jpg")]:
-            old.unlink(missing_ok=True)
+        if look is None:
+            for old in [*base.parent.glob(f"dev_{video_id}_{copy or 0}_*_{w}.jpg"),
+                        *base.parent.glob(f"dev2_{video_id}_{copy or 0}_*_{w}.jpg")]:
+                old.unlink(missing_ok=True)
+        else:
+            # a look's before and after and the look thumbnails: the last few dozen kept
+            olds = sorted(base.parent.glob(f"dev2g_{video_id}_*.jpg"), key=lambda p: p.stat().st_mtime)
+            for old in olds[:-40]:
+                old.unlink(missing_ok=True)
         try:
-            rec = Recipe(**json.loads(rtxt))
+            rec = Recipe(**json.loads(rtxt.split("|")[0]))
         except Exception:
             rec = Recipe()
+        if look is not None and look != rec.gen_ref:
+            # another result than the one on the photo: as it came (the one on it keeps its sliders)
+            rec.gen_ref, rec.gen_amount, rec.gen_light, rec.gen_view = look, 1.0, 1.0, 1.0
         bgr = cv2.imread(str(base), cv2.IMREAD_COLOR)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         res = apply_recipe(rgb, rec, _source_long(path), noise_profile(path) if (rec.dn_luma or rec.dn_colour) else None)
         cv2.imwrite(str(out), cv2.cvtColor((np.clip(res, 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return FileResponse(str(out), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=600"})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -2393,6 +2478,37 @@ def _snaps(row) -> list:
         return []
 
 
+class HistoryBody(BaseModel):
+    stack: List[dict] = Field(default_factory=list, max_length=80)
+    times: List[float] = Field(default_factory=list, max_length=80)
+    at: int = 0
+
+
+def _history_file(video_id: int) -> Path:
+    d = (_media_root or Path(".")) / ".edit-history"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{int(video_id)}.json"
+
+
+@router.get("/{video_id}/history")
+def get_history(video_id: int, current_user: User = Depends(get_current_user)):
+    """The editor's undo history for this photo, kept after it is closed (the last 80 steps)."""
+    f = _history_file(video_id)
+    try:
+        return json.loads(f.read_text()) if f.is_file() else {"stack": [], "times": [], "at": 0}
+    except Exception:
+        return {"stack": [], "times": [], "at": 0}
+
+
+@router.put("/{video_id}/history")
+def put_history(video_id: int, body: HistoryBody, current_user: User = Depends(get_current_user)):
+    f = _history_file(video_id)
+    tmp = f.with_suffix(".part")
+    tmp.write_text(json.dumps(body.model_dump()))
+    os.replace(tmp, f)
+    return {"ok": True}
+
+
 @router.get("/{video_id}/snapshots")
 def list_snapshots(video_id: int, db: Session = Depends(get_db),
                    current_user: User = Depends(get_current_user)):
@@ -2544,8 +2660,9 @@ def get_mask(video_id: int, name: str, request: Request, token: Optional[str] = 
     p = mask_dir(video_id) / f"{name}.png"
     if not p.is_file():
         raise HTTPException(status_code=404, detail="No such mask")
-    # a look's light maps can be worked out again later: ask each time (a 304 when unchanged)
-    cc = "private, no-cache" if name.startswith("gen") and name[-1:] in ("m", "k") else "private, max-age=86400"
+    # a look's light maps (and its painting's edges) can be worked out again later: ask each
+    # time (a 304 when unchanged)
+    cc = "private, no-cache" if name.startswith("gen") and name[-1:] in ("m", "k", "g") else "private, max-age=86400"
     return FileResponse(str(p), media_type="image/png", headers={"Cache-Control": cc})
 
 
@@ -2887,6 +3004,35 @@ def lens(video_id: int, db: Session = Depends(get_db), current_user: User = Depe
             out["distortion"], out["distortion2"] = d
             if out["source"] == "none":
                 out["source"] = "measured"
+    return out
+
+
+class GuidedBody(BaseModel):
+    lines: List[List[float]] = Field(..., min_length=1, max_length=8)   # x0, y0, x1, y1 in 0..1 of the source
+    distortion: float = 0.0
+    distortion2: float = 0.0
+    rotate: int = 0
+
+
+@router.post("/{video_id}/upright-guided")
+def upright_guided(video_id: int, body: GuidedBody, db: Session = Depends(get_db),
+                   current_user: User = Depends(get_current_user)):
+    """Guided Upright: straighten so the lines the user drew are upright (or level)."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    path = _resolve(video.filepath)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="The photo file is not on disk")
+    import cv2
+    import photo_geometry
+    b = cv2.imread(str(_base_file(video_id, path, 600)), cv2.IMREAD_REDUCED_GRAYSCALE_4)
+    aspect = b.shape[1] / float(b.shape[0]) if b is not None else 1.5
+    lines = [[float(np.clip(v, 0, 1)) for v in ln[:4]] for ln in body.lines if len(ln) >= 4]
+    out = photo_geometry.upright(None, "vertical", {"distortion": body.distortion, "distortion2": body.distortion2,
+                                                     "rotate": body.rotate}, guides=lines, aspect=aspect)
+    if "error" in out:
+        raise HTTPException(status_code=422, detail=out["error"])
     return out
 
 
@@ -4037,6 +4183,17 @@ def _portable_masks(masks: list) -> list:
     return out
 
 
+def _portable_nodes(nodes: list) -> list:
+    """Nodes travelling to another photo: each one's painted masks stay behind, like _portable_masks."""
+    out = []
+    for n in nodes or []:
+        st = dict(n.get("settings") or {})
+        if "masks" in st:
+            st["masks"] = _portable_masks(st.get("masks") or [])
+        out.append({**n, "settings": st})
+    return out
+
+
 def _for_photo(look: dict, mine: Optional[dict]) -> dict:
     """A look copied onto another photo. Whatever was drawn on the photo it
     came from - heal spots and painted masks - belongs to that
@@ -4045,10 +4202,11 @@ def _for_photo(look: dict, mine: Optional[dict]) -> dict:
     mine = mine or {}
     out["spots"] = mine.get("spots", [])
     out["removes"] = mine.get("removes", [])
-    for k in ("gen_ref", "gen_amount", "gen_look", "gen_geo"):
+    for k in ("gen_ref", "gen_amount", "gen_light", "gen_view", "gen_look", "gen_geo"):
         out[k] = mine.get(k, Recipe.model_fields[k].default)
     own_brushes = [m for m in mine.get("masks", []) if m.get("kind") == "brush"]
     out["masks"] = _portable_masks(look.get("masks", [])) + own_brushes
+    out["nodes"] = _portable_nodes(look.get("nodes", []))
     return out
 
 
@@ -4085,6 +4243,8 @@ def sync_to_many(body: SyncBody, db: Session = Depends(get_db),
                 # shapes travel; painted masks belong to the photo they were painted on
                 merged["masks"] = _portable_masks(src.get("masks", [])) + \
                                   [m for m in merged.get("masks", []) if m.get("kind") == "brush"]
+            elif k == "nodes":
+                merged["nodes"] = _portable_nodes(src.get("nodes", []))
             else:
                 merged[k] = src.get(k)
         payload = json.dumps(Recipe(**merged).model_dump())

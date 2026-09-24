@@ -63,7 +63,7 @@ class Caption(Base):
 # settings
 # --------------------------------------------------------------------------
 
-DEFAULT_SETTINGS = {"hashtags": "", "signoff": "", "ai_key": "", "ai_model": "claude-sonnet-4-5"}
+DEFAULT_SETTINGS = {"hashtags": "", "signoff": "", "ai_key": "", "ai_model": "claude-haiku-4-5-20251001"}
 
 
 def load_settings() -> dict:
@@ -85,10 +85,19 @@ def _shared_ai() -> bool:
         return False
 
 
+def _via() -> str:
+    """How Zerko's own AI (Manage > AI) reaches Claude, in words, or "" when it is off."""
+    if not _shared_ai():
+        return ""
+    import ai
+    how = "Claude Code on this computer" if ai.backend() == "claude_code" else "the Anthropic key in Manage > AI"
+    return f"{how}, with Haiku (the quick, cheap model)"
+
+
 def _public(s: dict) -> dict:
     key = s.get("ai_key") or ""
     return {"hashtags": s["hashtags"], "signoff": s["signoff"], "ai_model": s["ai_model"],
-            "ai": bool(key) or _shared_ai(), "ai_key_hint": ("..." + key[-4:]) if key else ""}
+            "ai": bool(key) or _shared_ai(), "ai_key_hint": ("..." + key[-4:]) if key else "", "via": _via()}
 
 
 # --------------------------------------------------------------------------
@@ -484,9 +493,11 @@ def write_ai(facts: dict, place: dict, o: Opts, earlier: List[str], settings: di
         rules.append("It must read clearly differently from these earlier captions for the same property "
                      "(different opening, structure and wording):\n---\n" + "\n---\n".join(earlier[:8]))
     rules.append("Reply with the caption text only.")
-    if not settings.get("ai_key"):
+    # Zerko's own AI first (Manage > AI: Claude Code signed in on this computer, or its key), on the cheap model;
+    # the caption writer's own key is only for when that is off
+    if _shared_ai() or not settings.get("ai_key"):
         import ai
-        return ai.ask("\n".join(rules), max_tokens=900, temperature=0.8, tier="fast")
+        return ai.ask("\n".join(rules), max_tokens=900, temperature=0.8, tier="cheap")
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps({"model": settings.get("ai_model") or DEFAULT_SETTINGS["ai_model"], "max_tokens": 900,

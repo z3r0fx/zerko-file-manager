@@ -39,6 +39,8 @@ DOWNLOADED = "downloaded"       # one file
 DOWNLOADED_ZIP = "downloaded_zip"
 UPLOADED = "uploaded"
 CONFIRMED = "confirmed"
+TERMS = "terms"                 # agreed to the studio's terms (Manage > Business)
+PAID_CLAIM = "paid_claim"       # said on the portal that they have paid
 
 EVENT_LABELS = {
     VIEWED: "Opened the link",
@@ -46,6 +48,8 @@ EVENT_LABELS = {
     DOWNLOADED_ZIP: "Downloaded everything as a zip",
     UPLOADED: "Sent a file in",
     CONFIRMED: "Said they were done",
+    TERMS: "Agreed to the terms",
+    PAID_CLAIM: "Said they have paid",
 }
 
 
@@ -386,7 +390,32 @@ def _first_mark(name: Optional[str] = None) -> Optional[Path]:
         for m in marks:
             if m.name == name:
                 return m
-    return marks[0] if marks else None
+    return marks[0] if marks else _plain_mark()
+
+
+def _plain_mark() -> Optional[Path]:
+    """A plain "PREVIEW" mark for a studio that has not added its own logo yet: an
+    unpaid or watermarked portal must never fall back to clean pictures."""
+    import tempfile
+    out = Path(tempfile.gettempdir()) / "zerko-preview-mark.png"
+    if out.is_file():
+        return out
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.new("RGBA", (1200, 300), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.load_default(size=220)
+        except TypeError:
+            font = ImageFont.load_default()
+        box = d.textbbox((0, 0), "PREVIEW", font=font, stroke_width=10)
+        x, y = (1200 - (box[2] - box[0])) // 2 - box[0], (300 - (box[3] - box[1])) // 2 - box[1]
+        d.text((x, y), "PREVIEW", font=font, fill=(255, 255, 255, 255), stroke_width=10, stroke_fill=(0, 0, 0, 200))
+        img.save(out)
+        return out
+    except Exception as e:
+        print(f"delivery: could not make the plain preview mark: {e}", flush=True)
+        return None
 
 
 def watermark_exists(name: Optional[str]) -> bool:
@@ -589,6 +618,8 @@ class EditShare(BaseModel):
     allow_download: Optional[bool] = None
     allow_zip: Optional[bool] = None
     extend_days: Optional[int] = Field(None, ge=1, le=365)
+    # ask the viewer to agree to the studio's terms before anything opens
+    ask_terms: Optional[bool] = None
 
 
 @router.patch("/api/shares/{share_id}")
@@ -621,6 +652,8 @@ def edit_share(share_id: int, body: EditShare, db: Session = Depends(get_db),
         share.allow_download = body.allow_download
     if body.allow_zip is not None:
         share.allow_zip = body.allow_zip
+    if body.ask_terms is not None:
+        share.ask_terms = body.ask_terms
     # A link that never expires stays that way - "extend" must not impose a date.
     if body.extend_days and share.expires_at:
         base = max(share.expires_at, datetime.utcnow())

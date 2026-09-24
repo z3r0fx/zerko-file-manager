@@ -11,7 +11,7 @@ rows that already exist, so there is no queue to keep in sync and no way for a
 notification to outlive the thing it points at.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends
@@ -42,7 +42,7 @@ class ActivitySeen(Base):
 
 class Event(BaseModel):
     id: str
-    kind: str                      # note | pick | comment | upload | share_view | download | done
+    kind: str                      # note | pick | comment | upload | share_view | download | done | terms | paid_claim
     at: datetime
     who: Optional[str] = None
     text: Optional[str] = None
@@ -52,6 +52,7 @@ class Event(BaseModel):
     share_title: Optional[str] = None
     share_id: Optional[int] = None
     count: int = 1                 # uploads: how many files arrived together
+    shoot_id: Optional[int] = None # a booking: the property
     unread: bool = False
 
 
@@ -141,11 +142,11 @@ def _collect(db: Session) -> List[Event]:
     # What clients did on the links: from the portal's own event log, so a
     # download or "I'm done" is news, not just the last visit.
     try:
-        from delivery import ShareEvent, VIEWED, DOWNLOADED, DOWNLOADED_ZIP, CONFIRMED
+        from delivery import ShareEvent, VIEWED, DOWNLOADED, DOWNLOADED_ZIP, CONFIRMED, TERMS, PAID_CLAIM
         from datetime import timedelta
         since = datetime.utcnow() - timedelta(days=30)
         evs = (db.query(ShareEvent).filter(ShareEvent.at >= since,
-                                           ShareEvent.kind.in_([VIEWED, DOWNLOADED, DOWNLOADED_ZIP, CONFIRMED]))
+                                           ShareEvent.kind.in_([VIEWED, DOWNLOADED, DOWNLOADED_ZIP, CONFIRMED, TERMS, PAID_CLAIM]))
                .order_by(ShareEvent.at.desc()).limit(2000).all())
         shares = {sh.id: sh for sh in db.query(Share).filter(
             Share.id.in_({e.share_id for e in evs} or {0})).all()}
@@ -179,6 +180,12 @@ def _collect(db: Session) -> List[Event]:
             elif e.kind == DOWNLOADED_ZIP:
                 out.append(Event(id=f"zip-{e.id}", kind="download", at=e.at, who=who,
                                  share_title=title, share_id=sh.id, text="everything as a zip"))
+            elif e.kind == TERMS:
+                out.append(Event(id=f"terms-{e.id}", kind="terms", at=e.at, who=who,
+                                 share_title=title, share_id=sh.id, text=e.detail))
+            elif e.kind == PAID_CLAIM:
+                out.append(Event(id=f"paid-{e.id}", kind="paid_claim", at=e.at, who=who,
+                                 share_title=title, share_id=sh.id, text=e.detail))
             elif e.kind == CONFIRMED:
                 out.append(Event(id=f"done-{e.id}", kind="done", at=e.at, who=who,
                                  share_title=title, share_id=sh.id, text=e.detail))
@@ -186,6 +193,33 @@ def _collect(db: Session) -> List[Event]:
             g["ev"].count = g["n"]
     except Exception as ex:
         print(f"activity: portal events: {ex}", flush=True)
+
+    # Shoots booked on the booking page.
+    try:
+        import shoots
+        from datetime import timedelta
+        for sh in (db.query(shoots.Shoot).filter(shoots.Shoot.booked_at >= datetime.utcnow() - timedelta(days=30))
+                   .order_by(shoots.Shoot.booked_at.desc()).limit(MAX_EVENTS).all()):
+            when = f"{sh.shoot_date:%a %d %b} {sh.shoot_time or ''}".strip() if sh.shoot_date else None
+            out.append(Event(id=f"book-{sh.id}-{int(sh.booked_at.timestamp())}", kind="booking", at=sh.booked_at,
+                             who=sh.agent, text=when, share_title=sh.address, shoot_id=sh.id))
+    except Exception as ex:
+        print(f"activity: bookings: {ex}", flush=True)
+
+    # Invoices past their due date, still open.
+    try:
+        import invoices
+        import shoots
+        late = invoices.late_invoices(db)
+        addr = {s.id: s.address for s in db.query(shoots.Shoot).filter(shoots.Shoot.id.in_({i.shoot_id for i in late})).all()} if late else {}
+        for inv in late:
+            days = (datetime.utcnow().date() - inv.due).days
+            out.append(Event(id=f"late-{inv.id}-{inv.due.isoformat()}", kind="overdue",
+                             at=datetime.combine(inv.due, datetime.min.time()) + timedelta(days=1),
+                             who=inv.to_name, text=f"{inv.number}, {days} day{'s' if days != 1 else ''} late",
+                             share_title=addr.get(inv.shoot_id, ""), shoot_id=inv.shoot_id))
+    except Exception as ex:
+        print(f"activity: late invoices: {ex}", flush=True)
 
     out.sort(key=lambda e: e.at, reverse=True)
     return out[:MAX_EVENTS]

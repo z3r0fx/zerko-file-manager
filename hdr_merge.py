@@ -471,6 +471,9 @@ def merge(frames: List[Frame], bright: np.ndarray, light: np.ndarray, align: boo
                 maps = local_flow(ty, _lum(lin), gain)
                 if maps is not None:
                     lin = cv2.remap(lin, maps[0], maps[1], cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    # cubic overshoots a little below black at hard edges; a negative light
+                    # made the deghost test's log NaN and the whole photo came out black
+                    np.maximum(lin, 0, out=lin)
                     v = cv2.remap(v, maps[0], maps[1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
                     del maps
             done_y[i] = _lum(lin)
@@ -488,7 +491,7 @@ def merge(frames: List[Frame], bright: np.ndarray, light: np.ndarray, align: boo
             # noise floor of each, in radiance: one 8-bit level at that exposure
             floor_i = np.float32(0.004 / bright[i])
             floor_e = np.float32(0.004 / bright[ref])
-            d = np.abs(np.log2(yi + floor_i) - np.log2(ye + floor_e))
+            d = np.abs(np.log2(np.maximum(yi, 0) + floor_i) - np.log2(np.maximum(ye, 0) + floor_e))
             agree = np.exp(-(d / 0.18) ** 2)
             agree = np.where(have, agree, 1.0).astype(np.float32)
             # spread the rejection a little (a moved edge is wider than its

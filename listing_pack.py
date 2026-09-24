@@ -62,7 +62,10 @@ def _photos(db: Session, paths: List[str]) -> List[Video]:
     # when some are edited, the edited ones are the set (the rest are brackets and rejects)
     try:
         import photo_edit as pe
-        edited = {r.video_id for r in db.query(pe.PhotoEdit.video_id).filter(pe.PhotoEdit.video_id.in_([v.id for v in out])).all()}
+        rows = db.query(pe.PhotoEdit.video_id, pe.PhotoEdit.pick).filter(pe.PhotoEdit.video_id.in_([v.id for v in out])).all()
+        rejects = {r.video_id for r in rows if r.pick == -1}
+        edited = {r.video_id for r in rows} - rejects
+        out = [v for v in out if v.id not in rejects]
         if edited:
             out = [v for v in out if v.id in edited]
     except Exception:

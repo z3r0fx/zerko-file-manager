@@ -245,13 +245,96 @@ def guided(guide: np.ndarray, src: np.ndarray, r: int, eps: float) -> np.ndarray
 RATIO_LO, RATIO_SPAN = -4.0, 7.0      # the light map holds log2 ratios from -4 to +3 stops
 
 
-def _lamps(lit: np.ndarray, guide: np.ndarray, lg: np.ndarray, sd: np.ndarray, grow: bool = True):
+def _colour_coeffs(I: np.ndarray, P: np.ndarray, r: int, eps: float):
+    """He's guided filter with a colour guide: per spot, P ~ A.I + B. A colour guide tells a
+    cyan pool from the grey table legs in it, which are just as bright."""
+    H, W = I.shape[:2]
+    C = P.shape[2]
+    mi = np.dstack([_box(I[..., j], r) for j in range(3)])
+    mp = np.dstack([_box(P[..., c], r) for c in range(C)])
+    sig = np.empty((H, W, 3, 3), np.float32)
+    for i in range(3):
+        for j in range(i, 3):
+            v = _box(I[..., i] * I[..., j], r) - mi[..., i] * mi[..., j]
+            sig[..., i, j] = sig[..., j, i] = v
+    sig += np.eye(3, dtype=np.float32) * eps
+    cov = np.empty((H, W, 3, C), np.float32)
+    for c in range(C):
+        for j in range(3):
+            cov[..., j, c] = _box(I[..., j] * P[..., c], r) - mi[..., j] * mp[..., c]
+    A = np.linalg.solve(sig, cov).transpose(0, 1, 3, 2)            # H, W, C, 3
+    B = mp - np.einsum("hwcj,hwj->hwc", A, mi)
+    A = np.stack([np.stack([_box(A[..., c, j], r) for j in range(3)], -1) for c in range(C)], -2)
+    B = np.dstack([_box(B[..., c], r) for c in range(C)])
+    return A.astype(np.float32), B.astype(np.float32)
+
+
+def upsample_light(m: np.ndarray, lo: np.ndarray, hi: np.ndarray, r: int = 3, eps: float = 2e-3,
+                   sky: Optional[np.ndarray] = None) -> np.ndarray:
+    """The light map (uint8, the painting's size) made at the full photo's size, following
+    the full photo's own edges. Stretched as it was, a twilight's light ran 5-25 px past
+    every edge at full size: a pale rim round the loungers, the pool's cyan on the coping and
+    the table legs. lo is the photo at the map's size, hi the same edit larger."""
+    import cv2
+    h, w = m.shape[:2]
+    Hh, Wh = hi.shape[:2]
+    if lo.shape[:2] != (h, w):
+        lo = cv2.resize(lo, (w, h), interpolation=cv2.INTER_AREA)
+    R = m[..., :3].astype(np.float32) / 255 * RATIO_SPAN + RATIO_LO
+    A, B = _colour_coeffs(lo.astype(np.float32) / 255, R, r, eps)
+    # never outside the light found round each spot (no overshoot where the fit extrapolates)
+    k = np.ones((2 * r + 1, 2 * r + 1), np.uint8)
+    lo_lim, hi_lim = cv2.erode(R, k), cv2.dilate(R, k)
+    out = np.empty((Hh, Wh, 3), np.uint8)
+    A9 = A.reshape(h, w, 9)
+    step = 256
+    for y0 in range(0, Hh, step):
+        y1 = min(Hh, y0 + step)
+        # the rows of the small maps these full-size rows need, resized as one piece
+        sy0, sy1 = max(0, int(y0 * h / Hh) - 2), min(h, int(math.ceil(y1 * h / Hh)) + 2)
+        big = lambda x: cv2.resize(x[sy0:sy1], (Wh, int(round((sy1 - sy0) * Hh / h))), interpolation=cv2.INTER_LINEAR)
+        off = int(round(sy0 * Hh / h))
+        cut = lambda x: big(x)[y0 - off:y1 - off]
+        a = cut(A9).reshape(-1, Wh, 3, 3)
+        n = a.shape[0]
+        I = hi[y0:y0 + n].astype(np.float32) / 255
+        q = np.einsum("hwcj,hwj->hwc", a, I) + cut(B)[:n]
+        q = np.clip(q, cut(lo_lim)[:n], cut(hi_lim)[:n])
+        if sky is not None:
+            # an evening sky that was blown white behind the trees (light_maps): each full-size
+            # pixel that shows the white sky takes the painting's sky colour, each leaf and frond
+            # the light of the trees
+            sk = cut(sky)[:n]
+            z, f, S, rf, T = sk[..., 0:1], sk[..., 1:2], sk[..., 2:5], sk[..., 5:8], sk[..., 8:9]
+            spread = I.max(-1) - I.min(-1)
+            lum = (I @ np.array([0.2126, 0.7152, 0.0722], np.float32))[..., None]
+            bl = (np.clip((lum[..., 0] - 0.78) / 0.12, 0, 1) * np.clip((0.12 - spread) / 0.06, 0, 1))[..., None]
+            # a leaf against the sky no brighter than the painting's leaves there
+            rf = np.minimum(rf, np.log2((T + 0.012) / (lum + 0.012)) + (rf - rf.mean(-1, keepdims=True)))
+            rs = np.log2((S + 0.012) / (I + 0.012))
+            # one soft band round the sky (a hard edge cut through the fronds in blocks)
+            q = q + (bl * rs + (1 - bl) * np.minimum(q, rf) - q) * z
+        out[y0:y0 + n] = (np.clip((q - RATIO_LO) / RATIO_SPAN, 0, 1) * 255 + 0.5).astype(np.uint8)
+    return out
+
+
+def _lamps(lit: np.ndarray, guide: np.ndarray, lg: np.ndarray, sd: np.ndarray, sat: np.ndarray, evening: bool = True,
+           warmth=None, green=None):
     """The lights the look switched on, checked against the photo.
     Each lit spot is grown to the whole window pane or lamp shade it sits in
     (the photo's own region round it, so a window lights up in one piece and
     not as a round blob). A spot with nothing in the photo for it to be - on
     a plain wall that runs on and on, in a tree, on brickwork - is a light the
     model made up: it is dropped, and so is the glow it threw.
+    A light is only kept where the photo has something that can be one: glass
+    (darker than what is round it, or already bright, and not a coloured car or
+    a painted door) that is not simply more of the road or wall round it. By day
+    (a look that does not bring the evening) no new lights at all.
+    A spot only grows to the pane round it where the painting is not blue or cyan
+    there (a dark rooftop pool it lit is not a window), and a compact dark pane
+    that cannot be traced (dark glass on a timber house) is kept as it is when it
+    is clearly darker than everything round it and not a hedge.
+    warmth: the painting's red minus blue; green: the photo's green over red and blue.
     Returns (lights 0..1, made_up 0..1)."""
     import cv2
     H, W = guide.shape
@@ -265,6 +348,15 @@ def _lamps(lit: np.ndarray, guide: np.ndarray, lg: np.ndarray, sd: np.ndarray, g
         x, y, w, h, a = (int(v) for v in stats[i])
         if a < 5 or a > big:
             continue                      # a speck, or a sunlit wall: left to the light map
+        if not evening:
+            # by day a brighter, warmer spot is the look's sun on a wall, a roof, a hillside -
+            # the light we want. Only a tiny, very bright new spot is a lamp the model switched
+            # on, and only that is left out
+            comp0 = lab[y:y + h, x:x + w] == i
+            if a <= 80 and float(lg[y:y + h, x:x + w][comp0].max()) > 0.85                     and float(guide[y:y + h, x:x + w][comp0].mean()) < 0.7:
+                b0 = bad[y:y + h, x:x + w]
+                b0[comp0] = 1.0
+            continue
         if max(w, h) > 6 * min(w, h) and a > 150 or a < 0.25 * w * h and a > 150:
             continue                      # a long streak (a sky it painted over a hilltop), not a lamp
         comp = lab[y:y + h, x:x + w] == i
@@ -283,23 +375,52 @@ def _lamps(lit: np.ndarray, guide: np.ndarray, lg: np.ndarray, sd: np.ndarray, g
         was_lit = float((guide[y:y + h, x:x + w] * cw).sum() / max(1.0, cw.sum())) > 0.72   # a lamp already on in the photo
         full = np.zeros((Y1 - Y0, X1 - X0), bool)
         full[y - Y0:y - Y0 + h, x - X0:x - X0 + w] = comp
-        if grow and ra and not edge and ra <= max(14 * a, 500):
+        # what the photo has there, against a ring round it
+        spot = full | (reg if ra <= max(14 * a, 500) else full)
+        ring = cv2.dilate(spot.astype(np.uint8), np.ones((9, 9), np.uint8)).astype(bool) & ~spot
+        gs, gr = guide[Y0:Y1, X0:X1], np.maximum(ring.sum(), 1)
+        mean_in = float(gs[full].mean())
+        mean_ring = float((gs * ring).sum() / gr)
+        colour = float(sat[Y0:Y1, X0:X1][full].mean())
+        glass = (was_lit or mean_in < mean_ring - 0.05 or mean_in > mean_ring + 0.12) and colour < 0.3
+        if not evening and was_lit:
+            continue                      # by day a lamp already on (or a sun patch) is simply relit
+        if not evening or not glass:
+            b = bad[Y0:Y1, X0:X1]
+            b[full] = 1.0                 # by day, or on a road, a car, a wall: made up
+            continue
+        cool = False
+        if warmth is not None and ra and ra <= max(14 * a, 500):
+            wr = reg & ~full
+            cool = bool(wr.any()) and float(warmth[Y0:Y1, X0:X1][wr].mean()) < -0.02
+        if ra and not edge and ra <= max(14 * a, 500) and not cool:
             ys, xs = np.nonzero(reg)
             box = (int(xs.max() - xs.min()) + 1) * (int(ys.max() - ys.min()) + 1)
-            if ra / box > 0.4:            # a pane, a shade: one compact piece of the photo
+            if ra / box > 0.5:            # a pane, a shade: one compact piece of the photo
                 o = out[Y0:Y1, X0:X1]
                 o[reg | full] = 1.0
                 continue
-        # outside, a lit window is taken as the model lit it (grown over a driveway or a garage
-        # door it made a blob of light); a spot on foliage or brickwork is still made up
-        if was_lit or (tex < 0.012 and not edge and a < 600) or (not grow and tex < 0.03):
+        if was_lit or (tex < 0.03 and not edge and a < 600):
             o = out[Y0:Y1, X0:X1]
             o[full] = 1.0                 # glass or a fitting too small to trace: the spot as it is
+        elif (mean_in < mean_ring - 0.08 and mean_in < 0.72 * mean_ring and a >= 0.45 * w * h and a < 3000
+              and (green is None or float(green[Y0:Y1, X0:X1][full].mean()) < 0.03)):
+            o = out[Y0:Y1, X0:X1]
+            o[full] = 1.0                 # a compact dark pane (dark glass, a door's glass): the spot as it is
         else:
             b = bad[Y0:Y1, X0:X1]
             b[full] = 1.0
     ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, ell)
+    # a pane lit only part of the way down (a ragged edge where the model's light
+    # stopped) is lit to its corners: each piece filled out to its outline when that
+    # outline is nearly the piece itself (not round an L-shaped corner of wall)
+    cnt, _ = cv2.findContours((out > 0.5).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnt:
+        hull = cv2.convexHull(c)
+        ca, ha = cv2.contourArea(c), cv2.contourArea(hull)
+        if ca >= 6 and ha <= 1.45 * ca:
+            cv2.fillPoly(out, [hull], 1.0)
     bad = cv2.dilate(bad, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
     return out, np.clip(bad - out, 0, 1)
 
@@ -346,7 +467,9 @@ def _night_view(where: Optional[np.ndarray], G: np.ndarray, guide: np.ndarray, l
     tg = np.sqrt(cv2.GaussianBlur(hg * hg, (0, 0), 3.0))
     darker = np.clip((-lum - 0.5) / 0.6, 0, 1)
     inside = where > 0.5
-    seed = inside & bluish & (tg < 0.02) & (guide > 0.5) & (darker > 0.2)
+    # a smooth blue in the painting, or - where the photo's window is blown out (behind
+    # blinds, say) - any sky blue the painting put there: the view through the window
+    seed = inside & bluish & (guide > 0.5) & (darker > 0.2) & ((tg < 0.02) | (guide > 0.8))
     seed = cv2.morphologyEx(seed.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     if seed.sum() < 0.001 * H * W:
         return np.zeros((H, W), np.float32)
@@ -356,7 +479,10 @@ def _night_view(where: Optional[np.ndarray], G: np.ndarray, guide: np.ndarray, l
     # Claude's box is a guess at the window: a blown-out pane or view that carries on past
     # its edge (a box stopping halfway down the window) is part of the outside too
     near = cv2.dilate(inside.astype(np.uint8), np.ones((int(0.12 * H) | 1, int(0.06 * W) | 1), np.uint8)) > 0
-    allowed = ((inside | (near & (guide > 0.8))) & (guide > 0.35) & (grad < 0.2)).astype(np.uint8)
+    # past the box only where the painting has a view there too (sky blue, or much darker as
+    # a dusk view is) - not onto a blown ceiling it painted as ceiling (a pale block)
+    viewish = bluish | (darker > 0.2)
+    allowed = (((inside | (near & (guide > 0.8))) & viewish) & (guide > 0.35) & (grad < 0.2)).astype(np.uint8)
     k = np.ones((3, 3), np.uint8)
     cur = seed.copy()
     for _ in range(max(8, int(0.15 * max(H, W)))):
@@ -391,23 +517,119 @@ def _snap(mask: np.ndarray, guide: np.ndarray) -> np.ndarray:
     return cv2.GaussianBlur(s_, (0, 0), 0.7).astype(np.float32)
 
 
-def _fill_edges(x: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """Along an edge the model's picture did not reach (it zoomed or shifted a
-    little), carry the light at the last real row or column out to the edge -
-    taken from further away it showed as a band of different light."""
+def _detail_ratio(G: np.ndarray, D: np.ndarray, sigma: float = 2.5) -> np.ndarray:
+    """The painting's light and colour as a log2 ratio over the photo, fine enough to keep a
+    porch light's pool and a lit window's edge, too coarse to carry the model's drawing of a
+    texture. Worked out in linear light and returned for the display values apply_gen
+    multiplies (s * 2^m), so the result is the photo's own detail under the painting's light."""
     import cv2
-    H, W = valid.shape
-    rows = np.where(valid.mean(1) > 0.98)[0]
-    cols = np.where(valid.mean(0) > 0.98)[0]
-    if not len(rows) or not len(cols):
+    lin = lambda x: np.power(np.clip(x, 0, 1), 2.2)
+    num = cv2.GaussianBlur(lin(G), (0, 0), sigma)
+    den = cv2.GaussianBlur(lin(D), (0, 0), sigma)
+    return (np.log2((num + 0.004) / (den + 0.004)) / 2.2).astype(np.float32)
+
+
+def _fill_edges(x: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Where the model's picture did not reach (it zoomed or turned a little), the light
+    of the nearest place it did reach, pixel by pixel. (Copying whole rows across the
+    frame made a hard-edged block of light where the photo had dark lens corners.)"""
+    if valid.min() >= 0.5:
         return x
-    y0, y1, x0, x1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
-    if (y0, y1, x0, x1) == (0, H, 0, W) or y1 - y0 < H // 2 or x1 - x0 < W // 2:
-        return x
-    y0, x0 = min(y0 + 2, y1 - 1), min(x0 + 2, x1 - 1)
-    y1, x1 = max(y1 - 2, y0 + 1), max(x1 - 2, x0 + 1)
-    inner = np.ascontiguousarray(x[y0:y1, x0:x1])
-    return cv2.copyMakeBorder(inner, y0, H - y1, x0, W - x1, cv2.BORDER_REPLICATE)
+    return extend_edges(x, valid)
+
+
+MATCH_MIN = 0.35      # below this the painting is a different picture (moved mountain, houses)
+
+
+def local_match(g: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """Per spot, 0..1: the painting still has the photo's shapes there (its edges run the
+    same way), even if it redrew the texture. Where it does, the painting's light can be
+    trusted up close - its sun and shade on that wall - not only as a broad wash."""
+    import cv2
+    lg = np.log(cv2.cvtColor(g, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    ld = np.log(cv2.cvtColor(d, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    s_ = 0.004 * max(g.shape[:2])
+
+    def grads(x):
+        x = cv2.GaussianBlur(x, (0, 0), s_)
+        return cv2.Sobel(x, cv2.CV_32F, 1, 0), cv2.Sobel(x, cv2.CV_32F, 0, 1)
+    ax, ay = grads(lg)
+    bx, by = grads(ld)
+    w = np.sqrt(bx * bx + by * by)
+    cos = (ax * bx + ay * by) / (w * np.sqrt(ax * ax + ay * ay) + 1e-6)
+    S = 0.02 * max(g.shape[:2])
+    agree = cv2.GaussianBlur(cos * w, (0, 0), S) / (cv2.GaussianBlur(w, (0, 0), S) + 1e-4)
+    edges = cv2.GaussianBlur(w, (0, 0), S)
+    # a plain area (no edges to compare) counts as matching when the rest round it does
+    return np.clip((agree - 0.4) / 0.35, 0, 1).astype(np.float32) * np.clip(edges / (np.median(edges) + 1e-6), 0.3, 1)
+
+
+def match_score(g: np.ndarray, d: np.ndarray) -> float:
+    """How well the painting keeps the photo's layout, 0..1: whether its edges run the same
+    way as the photo's, weighted by the photo's own edges. Good paintings score 0.6 to 1
+    (a dark twilight scores lower, it has fewer edges); one where the model redrew the
+    scene scores near 0."""
+    import cv2
+    lg = np.log(cv2.cvtColor(g, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    ld = np.log(cv2.cvtColor(d, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    s_ = 0.004 * max(g.shape[:2])
+
+    def grads(x):
+        x = cv2.GaussianBlur(x, (0, 0), s_)
+        return cv2.Sobel(x, cv2.CV_32F, 1, 0), cv2.Sobel(x, cv2.CV_32F, 0, 1)
+    ax, ay = grads(lg)
+    bx, by = grads(ld)
+    w, w2 = np.sqrt(bx * bx + by * by), np.sqrt(ax * ax + ay * ay)
+    cos = (ax * bx + ay * by) / (w * w2 + 1e-6)
+    return float((cos * w).sum() / (w.sum() + 1e-6))
+
+
+def missed_look(g: np.ndarray, d: np.ndarray, evening: Optional[bool]) -> bool:
+    """An evening look that came back as daylight (the model ignored the words)."""
+    if not evening:
+        return False
+    g, d = g.astype(np.float32), d.astype(np.float32)
+    bluer = float((g[..., 2] - g[..., 0]).mean() - (d[..., 2] - d[..., 0]).mean())   # RGB
+    return float(g.mean()) > 0.72 * float(d.mean()) and bluer < 6
+
+
+def painted_area(g: np.ndarray, d: np.ndarray, k: Optional[np.ndarray] = None) -> np.ndarray:
+    """Where the model really painted (1) - kept in the blue channel of the k map since
+    v6. For an older result: not black where the photo is not black either, and not in
+    a filled-in stretch along the edge (every pixel the same as its neighbour)."""
+    import cv2
+    if k is not None and k.ndim == 3 and k[..., 0].max() > 0:
+        return (k[..., 0] > 127).astype(np.float32)            # BGR as read: blue first
+    valid = ~((g.max(axis=2) == 0) & (d.max(axis=2) > 24))
+    eqx = np.all(g[:, 1:] == g[:, :-1], -1)
+    eqy = np.all(g[1:] == g[:-1], -1)
+    flat = np.zeros(g.shape[:2], bool)
+    flat[1:-1, 1:-1] = (eqx[1:-1, 1:] & eqx[1:-1, :-1]) | (eqy[1:, 1:-1] & eqy[:-1, 1:-1])
+    n, lab, st, _ = cv2.connectedComponentsWithStats(flat.astype(np.uint8), connectivity=4)
+    H, W = flat.shape
+    for i in range(1, n):
+        x, y, w, h, a = (int(v) for v in st[i])
+        if a > 150 and (x <= 1 or y <= 1 or x + w >= W - 1 or y + h >= H - 1):
+            valid[lab == i] = False
+    valid = cv2.erode(valid.astype(np.uint8), np.ones((3, 3), np.uint8))
+    return valid.astype(np.float32)
+
+
+def extend_edges(img: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """The painted picture carried out to the frame where the model did not reach (it
+    zoomed or turned a little): each empty pixel takes the nearest painted one, so a sky
+    runs to the edge instead of stopping in a band of the relit photo."""
+    import cv2
+    inv = (valid < 0.5).astype(np.uint8)
+    if not inv.any() or inv.all():
+        return img
+    _, lab = cv2.distanceTransformWithLabels(inv, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(inv == 0)                 # the labels count the painted pixels in this order
+    m = inv > 0
+    idx = np.clip(lab[m] - 1, 0, len(ys) - 1)
+    out = img.copy()
+    out[m] = img[ys[idx], xs[idx]]
+    return out
 
 
 def is_outdoors(scene: Optional[str], boxes) -> bool:
@@ -440,6 +662,9 @@ def _gone(guide: np.ndarray, lg: np.ndarray, G: Optional[np.ndarray] = None, D: 
     # model redrew is still as busy, only differently (that is left painted)
     gone = (np.clip((ed - 0.06) / 0.08, 0, 1) * np.clip((0.5 - cov) / 0.3, 0, 1)
             * np.clip((0.55 - eg / (ed + 1e-6)) / 0.25, 0, 1))
+    # a tree or a wall the evening turned into a dark silhouette lost its edges too, but it
+    # is still there, only dark: its own (dark) light is right
+    gone = gone * np.clip((lg - 0.06) / 0.08, 0, 1)
     # a pane the look lit is a lit window, not a thing gone: warm and bright in the painting,
     # window-sized, over grey glass in the photo (by day it only reflected the sky, so it
     # is not brighter than before); a coloured car under a glow the model drew stays the photo's
@@ -476,12 +701,171 @@ def _gone(guide: np.ndarray, lg: np.ndarray, G: Optional[np.ndarray] = None, D: 
     gone = np.maximum(gone, flip)
     ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     gone = cv2.morphologyEx(gone, cv2.MORPH_OPEN, ell)          # whole things, not specks of texture
+    # a thing: a car, a sign, a person - not a hillside of bushes the model drew smoother
+    n2, lab2, st2, _ = cv2.connectedComponentsWithStats((gone > 0.3).astype(np.uint8), connectivity=8)
+    if n2 > 1:
+        small2 = np.zeros(n2, bool)
+        small2[1:] = st2[1:, 4] < 0.01 * guide.size
+        gone = gone * small2[lab2]
     gone = cv2.dilate(gone, ell)
     return _snap(gone, guide)
 
 
+def _fill_holes(m: np.ndarray) -> np.ndarray:
+    import cv2
+    cnt, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros(m.shape, np.uint8)
+    cv2.drawContours(out, cnt, -1, 1, thickness=-1)
+    return out
+
+
+def _sky(G: np.ndarray, guide: np.ndarray, sd: np.ndarray, lg: np.ndarray, outside, D: Optional[np.ndarray] = None) -> np.ndarray:
+    """The photo's own sky, 0..1: the smooth, open area that runs down from the top
+    edge (or from a sky Claude marked) and stops at the first real edge - a ridge of
+    trees, a roofline, a wall. Worked out from the photo, not from Claude's box, so
+    it follows the ridge instead of cutting straight across it."""
+    import cv2
+    H, W = guide.shape
+    gg = lg
+    hg = gg - cv2.GaussianBlur(gg, (0, 0), 2.0)
+    sg = np.sqrt(cv2.GaussianBlur(hg * hg, (0, 0), 3.0))
+    gb = cv2.GaussianBlur(guide, (0, 0), 1.2)
+    gx, gy = cv2.Sobel(gb, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gb, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx * gx + gy * gy) / 8
+    # open sky in the photo: bright or plain, without the fine texture of leaves and roofs;
+    # the painting there is plain too (its sky), so a tree it kept is not taken
+    cand = (((sd < 0.018) & (guide > 0.35)) | ((guide > 0.82) & (sd < 0.035))) & (sg < 0.04) & (grad < 0.06)
+    # clouds and a hazy, blown sky: bright, soft (no sharp edges of a roofline or a railing)
+    # and pale or blue - a white wall is bright too, but has hard edges round it
+    hsv_d = cv2.cvtColor((np.clip(D if D is not None else np.dstack([guide] * 3), 0, 1) * 255).astype(np.uint8),
+                         cv2.COLOR_RGB2HSV).astype(np.float32)
+    skyish = ((hsv_d[..., 1] < 70) | ((hsv_d[..., 0] * 2 > 180) & (hsv_d[..., 0] * 2 < 250)))
+    soft = cv2.GaussianBlur(grad, (0, 0), 2) < 0.05
+    cand = cand | ((guide > 0.55) & skyish & soft & (sd < 0.03))
+    # a bright, busy cloudy sky where the painting has plain sky: sky too, as long as the
+    # photo has no hard edge there (a roof, a mast)
+    cand = cand | ((guide > 0.5) & skyish & (sg < 0.015) & (cv2.GaussianBlur(grad, (0, 0), 2) < 0.1))
+    cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=4)
+    seeds = np.zeros(n, bool)
+    top = np.unique(lab[0, :])
+    seeds[top] = True
+    box = outside_mask(outside, H, W)
+    if box is not None:
+        for i in np.unique(lab[box > 0.5]):
+            seeds[i] |= stats[i][1] < 0.05 * H          # a sky Claude marked that reaches the top
+    seeds[0] = False
+    seeds &= stats[:, 4] >= 0.01 * H * W
+    sky = seeds[lab].astype(np.uint8)
+    if not sky.any():
+        return np.zeros((H, W), np.float32)
+    # clouds, a bird, a power line inside it are part of it
+    sky = cv2.morphologyEx(sky, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    sky = _fill_holes(sky) & (guide > 0.2).astype(np.uint8)
+    if D is not None:
+        # right up to the treetops and the roofline: the strip of sky next to them is busier
+        # (it was left out above) but has the sky's own colour; left as the photo, relit, it
+        # showed as a pale rim round every tree
+        b = sky.astype(np.float32)
+        den = cv2.GaussianBlur(b, (0, 0), 4)
+        mean = cv2.GaussianBlur(D * b[..., None], (0, 0), 4) / np.maximum(den, 1e-4)[..., None]
+        like = (np.abs(D - mean).max(-1) < 0.07) & (den > 0.05)
+        cur = sky.copy()
+        for _ in range(10):
+            nxt = cv2.dilate(cur, np.ones((3, 3), np.uint8)) & like.astype(np.uint8) | cur
+            if np.array_equal(nxt, cur):
+                break
+            cur = nxt
+        sky = cur
+    # a pixel or two over the ridge: the photo's bright sky between the leaves, relit, showed
+    # as a pale line along it
+    sky = _snap(sky.astype(np.float32), guide)
+    return cv2.dilate(sky, np.ones((3, 3), np.uint8))
+
+
+def _haze(G: np.ndarray, D: np.ndarray, guide: np.ndarray, lg: np.ndarray, sky: np.ndarray) -> np.ndarray:
+    """The far view under the sky that the photo only shows through haze (pale, flat,
+    washed out) and the painting shows clearly, 0..1. Relit, haze stays a grey fog
+    over the town; there the painting (with the photo's detail laid back) is used,
+    fading in with distance the way haze does."""
+    import cv2
+    H, W = guide.shape
+    if sky.max() < 0.5:
+        return np.zeros((H, W), np.float32)
+    ld, lgl = np.log(guide + 0.03), np.log(lg + 0.03)
+    s = 0.006 * max(H, W)
+    cd = np.sqrt(cv2.GaussianBlur((ld - cv2.GaussianBlur(ld, (0, 0), s)) ** 2, (0, 0), s))
+    cg = np.sqrt(cv2.GaussianBlur((lgl - cv2.GaussianBlur(lgl, (0, 0), s)) ** 2, (0, 0), s))
+    # haze lifts the darkest of the three colours everywhere in a patch (the dark-channel
+    # rule): a near roof or tree always has something dark, a view through haze does not
+    dark = cv2.erode(D.min(-1), np.ones((7, 7), np.uint8))
+    dark = cv2.GaussianBlur(dark, (0, 0), 3)
+    washed = np.clip((dark - 0.4) / 0.2, 0, 1)
+    clearer = np.clip((cg / (cd + 0.01) - 1.1) / 0.6, 0, 1)
+    hz = cv2.GaussianBlur(washed * clearer, (0, 0), 0.01 * max(H, W))
+    # only the view that carries on below the sky, not a pale wall in the front
+    near = cv2.dilate((sky > 0.5).astype(np.uint8), np.ones((int(0.25 * H) | 1, 3), np.uint8)).astype(np.float32)
+    near = cv2.GaussianBlur(near, (0, 0), 0.03 * max(H, W))
+    hz = np.clip((hz - 0.15) / 0.35, 0, 1) * near * (1 - sky)
+    return hz.astype(np.float32)
+
+
+NEUTRAL_WORDS = re.compile(r"neutral|no colou?r cast|white walls|white balance|cast-free", re.I)
+
+
+def wants_neutral(look_words: str) -> bool:
+    """A look that asks for white walls and ceilings (Clean and bright, Blue sky day): its
+    whites are made white, not left the painting's cream."""
+    w = look_words or ""
+    return bool(NEUTRAL_WORDS.search(w)) and not re.search(r"golden|sunset|twilight|dusk|night", w, re.I)
+
+
+def wants_evening(look_words: str) -> Optional[bool]:
+    """Whether a look brings the evening (lights switched on, a dusk view), from its words;
+    None when they do not say (then the painting's brightness decides)."""
+    w = look_words or ""
+    if re.search(r"twilight|dusk|blue hour|night|evening", w, re.I):
+        return True
+    if re.search(r"golden hour|sunset glow|sunny|daylight|day\b|bright|morning|midday", w, re.I):
+        return False
+    return None
+
+
+def _neutral(ratio: np.ndarray, D: np.ndarray, skip: np.ndarray, valid: np.ndarray,
+             G: Optional[np.ndarray] = None) -> np.ndarray:
+    """White balance on what should be white. The relit room's pale, nearly grey
+    surfaces (walls, ceiling, linen) are measured, and the whole light is turned so
+    they come out neutral - keeping a fifth of the warmth, and every warm glow near a
+    window stays warmer than the rest, since the whole room turns together. A dim
+    white is lifted a little too (at most half a stop)."""
+    R = np.clip(D * np.exp2(ratio), 1e-4, 1.0)
+    y = R @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    ch = (R.max(-1) - R.min(-1)) / (R.max(-1) + 1e-4)
+    pale = (y > 0.4) & (y < 0.97) & (ch < 0.28) & (skip < 0.2) & (valid > 0)
+    if pale.sum() < 0.02 * pale.size:
+        return ratio
+    Lw = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    cast = np.median(np.log2(R[pale]) - np.log2(y[pale])[:, None], axis=0)
+    cast = cast - cast @ Lw
+    if G is not None:
+        # what the relit whites lost against the painting's is put back, and the painting's
+        # own cast (a cream it left) is taken a third further towards white; a room of warm
+        # stone or wood is warm in the painting too and is left warm (corrected against a
+        # grey ideal, a purple wall went bluer still)
+        Gc = np.clip(G, 1e-4, 1.0)
+        yg = Gc @ Lw
+        cg = np.median(np.log2(Gc[pale]) - np.log2(yg[pale])[:, None], axis=0)
+        cg = cg - cg @ Lw
+        fix = np.clip(-(cast - cg) - 0.35 * cg, -0.3, 0.3).astype(np.float32)
+    else:
+        fix = np.clip(-0.5 * cast, -0.2, 0.2).astype(np.float32)
+    lift = float(np.clip(np.log2(0.78 / max(float(np.median(y[pale])), 1e-3)), 0.0, 0.5))
+    return ratio + fix + np.float32(lift)
+
+
 def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray, real: bool = True, outside=None,
-               outdoors: bool = False):
+               outdoors: bool = False, neutral: bool = False, evening: Optional[bool] = None, loose: bool = False,
+               blend: str = "detail", extra: Optional[dict] = None):
     """What a look does to the photo, split in two:
     - the light (m): how much brighter or darker, and what colour, each spot
       became - taken from the painted picture, smoothed along the photo's own
@@ -497,12 +881,26 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
     G = g.astype(np.float32) / 255
     D = d.astype(np.float32) / 255
     lr = np.log2((G + 0.012) / (D + 0.012))
+    # the colour of the change, measured so a channel the photo has almost none of (the blue
+    # in dark wood) does not read as a huge change - that turned wood lilac
+    Lw = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    lc = np.log2((G + 0.08) / (D + 0.08))
+    # (a look that asks for clean whites may take a coloured cast - a purple LED wash - out)
+    cmax = 1.4 if neutral else 0.6
+    lr = (lr @ Lw)[..., None] + np.clip(lc - (lc @ Lw)[..., None], -cmax, cmax)
     guide = cv2.cvtColor(d, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
     lg = cv2.cvtColor(g, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
     hd = guide - cv2.GaussianBlur(guide, (0, 0), 2.0)
     sd = np.sqrt(cv2.GaussianBlur(hd * hd, (0, 0), 3.0))
     lum = lr @ np.array([0.30, 0.59, 0.11], np.float32)
     ell = lambda n: cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (n, n))
+    # (the +0.25 keeps dark warm glass - a window on a brown timber house - from reading as a
+    # coloured car or a painted door)
+    sat = (D.max(-1) - D.min(-1)) / (D.max(-1) + 0.25)
+    # a look that brings the evening (a twilight is about a third as bright): only then are
+    # lights switched on
+    if evening is None:
+        evening = float(lg[valid > 0].mean() if valid.any() else lg.mean()) < 0.55 * float(guide.mean())
     lights = made_up = None
     if real:
         # Lights the look switched on (lit windows, wall and garden lights):
@@ -510,7 +908,8 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
         # painted sky is not.
         warm = np.clip((G[..., 0] - G[..., 2]) / 0.08, 0, 1)
         lit = np.clip((lg - guide - 0.10) / 0.15, 0, 1) * np.clip((lg - 0.25) / 0.2, 0, 1) * warm
-        lights, made_up = _lamps(lit, guide, lg, sd, grow=not outdoors)
+        lights, made_up = _lamps(lit, guide, lg, sd, sat, evening, G[..., 0] - G[..., 2],
+                                 D[..., 1] - np.maximum(D[..., 0], D[..., 2]))
         # how much brighter than its surroundings each spot is, in the photo and in the painting
         ex_d = guide - cv2.GaussianBlur(guide, (0, 0), 25)
         ex_g = lg - cv2.GaussianBlur(lg, (0, 0), 25)
@@ -518,6 +917,14 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
         # smudge - not a warm lamp): no light is taken from it.
         spike = np.clip((ex_g - np.maximum(ex_d, 0) - 0.10) / 0.08, 0, 1) * (1 - warm) * (1 - lights)
         spike = cv2.dilate(cv2.morphologyEx(spike, cv2.MORPH_OPEN, ell(5)), ell(15))
+        strips = np.zeros_like(guide)
+        if evening and not outdoors:
+            # thin warm lines the model drew that stand out from everything round them (LED
+            # strips round a window frame, along a ceiling) and are not a light
+            # in the photo: made up, their glow too
+            strips = warm * np.clip((ex_g - np.maximum(ex_d, 0) - 0.08) / 0.1, 0, 1) * (1 - lights)
+            strips = cv2.morphologyEx(strips, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            made_up = np.maximum(made_up, cv2.dilate(strips, ell(5)))
         if outdoors:
             # outside, a lit spot counts as made up only on plants and trees: glass that
             # reflected the day is busy too, and a lit window there is a real one
@@ -539,20 +946,171 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
     # nothing about the light there: take the light from the matching parts
     # around it instead
     wgt = (np.clip((keep - 0.3) / 0.4, 0, 1) * valid).astype(np.float32)
+    if real and not loose:
+        # where the painting still has the photo's shapes (it only redrew the texture), its
+        # light is trusted up close too: the golden sun on this wall, the shade under that
+        # tree - taken only from the matching fine detail it came out flat
+        wgt = np.maximum(wgt, local_match(g, d) * valid)
+    # a hillside or a roof the look turned into a dark silhouette has lost its fine structure,
+    # but its light is still right: dark (taken from far away it came out a pale patch with
+    # a round edge over the hill)
+    wgt = np.maximum(wgt, np.clip((0.12 - lg) / 0.06, 0, 1) * np.clip((guide - lg - 0.1) / 0.1, 0, 1) * valid)
     if made_up is not None:
         wgt = wgt * (1 - made_up)
     num = cv2.GaussianBlur(lr * wgt[..., None], (0, 0), 40)
     den = cv2.GaussianBlur(wgt, (0, 0), 40)[..., None]
     sel = wgt > 0.5
     overall = np.median(lr[sel], axis=0) if sel.sum() > 100 else np.zeros(3, np.float32)
-    coarse = np.where(den > 0.02, num / np.maximum(den, 1e-6), overall).astype(np.float32)
+    # far from anything that matched, the light of a wider area, then the picture's overall
+    # light - blended, never switched (a hard switch drew a block of light over a hillside
+    # the model had redrawn)
+    s2 = 0.12 * max(guide.shape)
+    num2 = cv2.GaussianBlur(lr * wgt[..., None], (0, 0), s2)
+    den2 = cv2.GaussianBlur(wgt, (0, 0), s2)[..., None]
+    e = np.float32(0.01)
+    coarse = ((num + 0.3 * num2 + e * overall) / (den + 0.3 * den2 + e)).astype(np.float32)
     kb = cv2.GaussianBlur(wgt, (0, 0), 12)[..., None]
+    if loose:
+        # the model drew a different picture (its houses, its mountain are elsewhere): only
+        # its overall light is taken, in broad strokes, and none of its picture is shown
+        allw = cv2.GaussianBlur(valid, (0, 0), s2)[..., None]
+        broad2 = cv2.GaussianBlur(lr * valid[..., None], (0, 0), s2) / np.maximum(allw, 1e-4)
+        broad2 = np.dstack([guided(guide, broad2[..., c], 30, 2e-2) for c in range(3)])
+        m = (np.clip((_fill_edges(broad2, valid) - RATIO_LO) / RATIO_SPAN, 0, 1) * 255 + 0.5).astype(np.uint8)
+        return m, np.zeros_like(guide)
     # along an edge the painted picture did not cover, the light around it carries on
     ratio = coarse + (fine - coarse) * kb
     if made_up is not None:
         mu = cv2.GaussianBlur(made_up, (0, 0), 6)[..., None]
         ratio = ratio + (coarse - ratio) * mu      # no glow from a lamp that is not there
+    # Sunbeams: the stripes of sun the look threw across a floor, a bed or a wall. They are
+    # not in the photo, so the edge-aware light (which only changes at the photo's own edges)
+    # smoothed them away. What the light missed that is brighter, several pixels wide (finer
+    # than that is the model redrawing a texture) and on a plain, lit surface is added back
+    # as light - on the photo's own floorboards, never as the model's drawing of them.
+    if real and not evening:
+        Lw3 = np.array([0.2126, 0.7152, 0.0722], np.float32)
+        miss = (lr @ Lw3) - (ratio @ Lw3)
+        miss = cv2.GaussianBlur(miss, (0, 0), 2.5)
+        hd2 = cv2.GaussianBlur(guide, (0, 0), 1.0)
+        ex, ey = cv2.Sobel(hd2, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(hd2, cv2.CV_32F, 0, 1, ksize=3)
+        calm = np.clip(1 - np.sqrt(ex * ex + ey * ey) / 8 / 0.08, 0, 1)
+        trust = calm * np.clip((guide - 0.12) / 0.1, 0, 1) * valid
+        if made_up is not None:
+            trust = trust * (1 - made_up)
+        beam = np.clip((miss - 0.12) * 1.3, 0, 1.5) * cv2.GaussianBlur(trust, (0, 0), 1.5)
+        beam = cv2.morphologyEx(beam, cv2.MORPH_OPEN, ell(3))
+        # the beam's colour is the painting's, as it is round it
+        ratio = ratio + beam[..., None]
+    # The colour of light changes slowly across a room; a patch where the model drew a
+    # different colour (a sun patch on warm wood it painted white) turned the wood round it
+    # lilac. The colour of the light is held near the colour round it; its brightness is not.
+    y_r = ratio @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    chroma = ratio - y_r[..., None]
+    wide = cv2.GaussianBlur(chroma, (0, 0), 0.015 * max(guide.shape))
+    chroma = wide + np.clip(chroma - wide, -(0.6 if neutral else 0.2), 0.6 if neutral else 0.2)
+    ratio = y_r[..., None] + chroma
+    if real and not evening:
+        # By day the light stays soft and your own shadows stay yours. The model draws
+        # shadows of its own (palms across a wall where the photo has sun): they came out
+        # as blue blotches, so a dip well below the light round it is only kept where the
+        # photo itself has an edge there. And the photo's own shadows are never pushed down
+        # more than about half a stop - crushed, they looked flat, not golden.
+        Lw4 = np.array([0.2126, 0.7152, 0.0722], np.float32)
+        y4 = ratio @ Lw4
+        broad = cv2.GaussianBlur(y4, (0, 0), 0.02 * max(guide.shape))
+        gb4 = cv2.GaussianBlur(guide, (0, 0), 1.5)
+        ex4, ey4 = cv2.Sobel(gb4, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gb4, cv2.CV_32F, 0, 1, ksize=3)
+        edge4 = cv2.GaussianBlur(np.clip(np.sqrt(ex4 * ex4 + ey4 * ey4) / 8 / 0.12, 0, 1), (0, 0), 3)
+        dev = y4 - broad
+        # where the painting's sun and shade disagree with the photo's own (its sun where the
+        # photo is in shade, or the other way round) the model moved a shadow: left out
+        lp = np.log2(guide + 0.02)
+        pl = lp - cv2.GaussianBlur(lp, (0, 0), 0.02 * max(guide.shape))
+        conflict = np.where(dev > 0, np.clip((-pl - 0.15) / 0.3, 0, 1), np.clip((pl - 0.1) / 0.3, 0, 1))
+        dev = dev * (1 - cv2.GaussianBlur(conflict.astype(np.float32), (0, 0), 2))
+        dip = np.minimum(dev, 0)
+        keep_dip = np.maximum(dip * edge4, np.maximum(dip, -0.25))
+        y5 = broad + np.maximum(dev, 0) + keep_dip
+        dark = np.clip((0.3 - cv2.GaussianBlur(guide, (0, 0), 2)) / 0.2, 0, 1)
+        y5 = np.where(y5 < 0, y5 * (1 - dark) + np.maximum(y5, -0.5) * dark, y5)
+        ratio = ratio + (y5 - y4)[..., None]
+    if real and blend != "strict":
+        # "detail" (the default since the owner compared them, 2026-09-24): all of the painting's
+        # light and colour - the porch glow, the pools on the steps, the lit garden - on the
+        # photo's own fine detail, as ComfyUI relight workflows do ("frequency detail restore").
+        # The strict light above drops every glow it cannot trace to a lamp in the photo, which
+        # left twilights looking like a darkened photo with a few lit windows.
+        # Where the model took a thing away or redrew it in another colour (a blue car it
+        # painted teal), the strict light is kept: the car stays the photo's, lit like round it.
+        det = _detail_ratio(G, D)
+        # and where it drew something else there, much brighter (a dark mirror turned into a glowing white
+        # panel): taken as light, that lifted the dark reflection 2-3 stops into blotches and noise
+        up = det @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+        swapped = (np.clip((up - 1.8) / 0.6, 0, 1) * np.clip((0.25 - local_match(g, d)) / 0.15, 0, 1)
+                   * np.clip((cv2.GaussianBlur(lg, (0, 0), 3) - 0.7) / 0.12, 0, 1))   # a near-white panel, not a lamp's glow
+        # only a panel's worth of it (a mirror, a picture, a screen): the bright core of a lamp's glow or a
+        # sliver of gloss is small, and taking the room's light there left dark blots
+        nsw, lsw, ssw, _ = cv2.connectedComponentsWithStats((swapped > 0.5).astype(np.uint8), connectivity=8)
+        big = np.zeros(nsw, np.float32)
+        big[1:] = ssw[1:, 4] > 0.006 * guide.size
+        swapped = swapped * big[lsw]
+        swapped = cv2.GaussianBlur(cv2.dilate(swapped, ell(9)), (0, 0), 4)
+        gone = cv2.GaussianBlur(_gone(guide, lg, G, D), (0, 0), 3)[..., None]
+        # where the painting shows another scene altogether (a lawn where the photo has a patio,
+        # through a window with burglar bars) its light up close is a ghost of that scene: only
+        # the broad light is taken there. By day only: at dusk a lit window is just where the
+        # painting differs, and the broad light made it a flat glowing block
+        if not evening:
+            other = np.clip((0.3 - local_match(g, d)) / 0.15, 0, 1) * valid
+            other = cv2.morphologyEx(other, cv2.MORPH_OPEN, ell(9))
+            gone = np.maximum(gone, cv2.GaussianBlur(other, (0, 0), 4)[..., None])
+        ratio = det + (ratio - det) * gone
+        Lw5 = np.array([0.2126, 0.7152, 0.0722], np.float32)
+        warmth = ratio[..., 0] - ratio[..., 2]
+        warm_look = float(np.median(warmth[valid > 0.5] if (valid > 0.5).any() else warmth)) >= 0.12
+        if not evening:
+            # By day the model still switches lights on inside: a sunroom's glass and a covered
+            # patio came back glowing yellow (Blue sky day, Clean and bright on DJI_0403). In a look
+            # that is not warm as a whole (not a golden hour), a spot that turned much warmer and
+            # brighter than the light round it is a lamp, not daylight: it takes the light round it.
+            sw = 0.03 * max(guide.shape)
+            y5 = ratio @ Lw5
+            glow = (np.clip((y5 - cv2.GaussianBlur(y5, (0, 0), sw) - 0.25) / 0.3, 0, 1)
+                    * np.clip((warmth - cv2.GaussianBlur(warmth, (0, 0), sw) - 0.12) / 0.2, 0, 1))
+            if warm_look:
+                # a golden hour lights whole walls warm and bright: only a glow on what is glass in
+                # the photo (darker than the wall round it, as windows are by day) is a lamp
+                glass = np.clip((cv2.GaussianBlur(guide, (0, 0), 6) - guide - 0.04) / 0.08, 0, 1)
+                glow = glow * cv2.GaussianBlur(glass, (0, 0), 1.5)
+            glow = cv2.GaussianBlur(cv2.dilate(glow, ell(7)), (0, 0), 3)
+            if glow.max() > 0.05:
+                wk5 = 1 - np.clip(glow * 2, 0, 1)
+                around = cv2.GaussianBlur(ratio * wk5[..., None], (0, 0), sw) / np.maximum(cv2.GaussianBlur(wk5, (0, 0), sw), 1e-3)[..., None]
+                ratio = ratio + (around - ratio) * glow[..., None]
+        if swapped.max() > 0.05:
+            # there it takes the light of the room round it (a mirror is as much brighter as the room it shows)
+            s3 = 0.05 * max(guide.shape)
+            wk = 1 - swapped
+            around = cv2.GaussianBlur(ratio * wk[..., None], (0, 0), s3) / np.maximum(cv2.GaussianBlur(wk, (0, 0), s3), 1e-3)[..., None]
+            ratio = ratio + (around - ratio) * swapped[..., None]
+        where_out = np.ones_like(guide) if outdoors else outside_mask(outside, *guide.shape)
+        if not evening and not neutral and where_out is not None:
+            # By day, trees and fronds the sun blew out pale against a white sky (a gap in the canopy): the
+            # painting drew its blue sky there, and taken as colour it turned the photo's own leaves sky-blue so
+            # they seemed cut away. Where the photo is bright and colourless but has structure, only the
+            # painting's brightness is taken, not its colour.
+            spread = D.max(-1) - D.min(-1)
+            pale = np.clip((guide - 0.70) / 0.13, 0, 1) * np.clip((0.18 - spread) / 0.08, 0, 1)
+            busy = np.clip((sd - 0.008) / 0.012, 0, 1)
+            leaf = cv2.GaussianBlur(pale * busy * cv2.GaussianBlur(where_out.astype(np.float32), (0, 0), 6), (0, 0), 2.5)[..., None]
+            y_ = (ratio @ np.array([0.2126, 0.7152, 0.0722], np.float32))[..., None]
+            # only the painted sky's blue (golden light on those leaves is the look, and stays)
+            blue = np.clip((ratio[..., 2] - ratio[..., 0] - 0.05) / 0.2, 0, 1)[..., None]
+            ratio = ratio + (y_ - ratio) * leaf * blue
     ratio = _fill_edges(ratio, valid)
+    if neutral and real and blend == "strict":
+        ratio = _neutral(ratio, D, lights if lights is not None else np.zeros_like(guide), valid, G)
     m = (np.clip((ratio - RATIO_LO) / RATIO_SPAN, 0, 1) * 255 + 0.5).astype(np.uint8)
     if not real:
         return m, valid.astype(np.float32)
@@ -564,25 +1122,105 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
     # whole areas, not specks and holes: a window pane is painted in one piece
     flat = cv2.morphologyEx(flat, cv2.MORPH_CLOSE, ell(15))
     flat = cv2.morphologyEx(flat, cv2.MORPH_OPEN, ell(19))
-    night = _night_view(outside_mask(outside, *guide.shape), G, guide, lum)
+    H, W = guide.shape
+    box = outside_mask(outside, H, W)
+    if outdoors:
+        # Outside, the photo stays the photo - every house, car, sign and tree relit, never
+        # redrawn. The painting shows only in the sky (traced from the photo, so it follows
+        # the ridge and the rooftops), in the far view the photo only shows through haze,
+        # in the windows the look lit and where the photo is blown out to nothing.
+        sky = _sky(G, guide, sd, lg, outside, D)
+        haze = _haze(G, D, guide, lg, sky)
+        view = np.maximum(sky, haze)
+        blown_sky = np.clip((guide - 0.70) / 0.15, 0, 1) * np.clip((0.16 - (D.max(-1) - D.min(-1))) / 0.08, 0, 1)
+        # only a sky that was blown white, not a pale blue one with clouds (that is painted over as before)
+        skyb = sky > 0.5
+        bluish = float(((D[..., 2] - D[..., 0]) > 0.08)[skyb].mean()) if skyb.any() else 1.0
+        if real and evening and skyb.any() and float(blown_sky[skyb].mean()) > 0.6 and bluish < 0.1:
+            # An evening over a sky that was blown white behind the trees: the painting's own
+            # trees there are soft and drawn elsewhere (pasted in, the photo's sharp palm fronds
+            # became a blurred double), and its light smeared over the leaves left the white
+            # gaps between them as pale speckles. So the photo stays the photo here too: its
+            # leaves and fronds darken like the trees below, and only what shows the white sky
+            # takes the painting's sky colour - through the light map, which is lined up with
+            # the full-size photo's edges later (upsample_light).
+            R = m.astype(np.float32) / 255 * RATIO_SPAN + RATIO_LO
+            blown = np.clip((guide - 0.70) / 0.15, 0, 1) * np.clip((0.16 - (D.max(-1) - D.min(-1))) / 0.08, 0, 1)
+            tex = np.sqrt(cv2.GaussianBlur((lg - cv2.GaussianBlur(lg, (0, 0), 2.0)) ** 2, (0, 0), 3.0))
+            ws = sky * blown * np.clip((0.03 - tex) / 0.02, 0, 1) * valid
+            s1, s2 = 8, 0.06 * max(H, W)
+            S1 = cv2.GaussianBlur(G * ws[..., None], (0, 0), s1) / np.maximum(cv2.GaussianBlur(ws, (0, 0), s1), 1e-4)[..., None]
+            S2 = cv2.GaussianBlur(G * ws[..., None], (0, 0), s2) / np.maximum(cv2.GaussianBlur(ws, (0, 0), s2), 1e-4)[..., None]
+            c1 = np.clip(cv2.GaussianBlur(ws, (0, 0), s1) / 0.3, 0, 1)[..., None]
+            S = S2 + (S1 - S2) * c1
+            r_sky = np.log2((S + 0.012) / (D + 0.012))
+            # the light of the trees below the sky, carried up into it
+            near = cv2.dilate(sky, ell(int(0.12 * H) | 1))
+            wf = valid * (1 - cv2.dilate(sky, ell(9))) * (1 - blown) * np.clip(near, 0, 1)
+            sf = 0.05 * max(H, W)
+            den_f = cv2.GaussianBlur(wf, (0, 0), sf)
+            if den_f.max() > 1e-3:
+                r_fol = cv2.GaussianBlur(R * wf[..., None], (0, 0), sf) / np.maximum(den_f, 1e-4)[..., None]
+                r_fol = np.where((den_f > 1e-3)[..., None], r_fol, np.median(R[wf > 0.5], axis=0) if (wf > 0.5).any() else R)
+            else:
+                r_fol = R
+            z = cv2.GaussianBlur(sky, (0, 0), 1.0)[..., None]
+            inside = blown[..., None] * r_sky + (1 - blown[..., None]) * r_fol
+            R = R + (inside - R) * z
+            # white sky showing through the canopy just under it: sky colour too
+            fringe = (np.clip(near, 0, 1) * (1 - sky) * blown * valid)[..., None]
+            R = R + (r_sky - R) * fringe
+            m = (np.clip((R - RATIO_LO) / RATIO_SPAN, 0, 1) * 255 + 0.5).astype(np.uint8)
+            view = haze * (1 - sky)
+            if extra is not None:
+                # frond or sky is decided again on the full-size photo (a frond is thinner than
+                # one pixel here): where the sky is, the sky colour and the trees' light
+                # and how dark the painting drew the leaves against that sky: at dusk a sunlit
+                # frond is a dark shape, not a pale one (kept at the trees' light it stayed daylit)
+                wt = z[..., 0] * np.clip((cv2.GaussianBlur(lg, (0, 0), 6) - lg - 0.03) / 0.05, 0, 1) * valid
+                st = 0.04 * max(H, W)
+                dt = cv2.GaussianBlur(wt, (0, 0), st)
+                T = np.where(dt > 1e-3, cv2.GaussianBlur(lg * wt, (0, 0), st) / np.maximum(dt, 1e-4),
+                             float(np.percentile(lg[sky > 0.5], 10)) if (sky > 0.5).any() else 0.15)
+                band = cv2.GaussianBlur(np.maximum(sky, np.clip(near, 0, 1)) * valid, (0, 0), 0.02 * max(H, W))
+                extra["sky"] = np.dstack([np.maximum(z[..., 0], band), np.zeros_like(band), S, r_fol,
+                                          np.clip(T, 0.03, 0.5)]).astype(np.float32)
+        where = None
+    else:
+        view = _night_view(box, G, guide, lum)
+        if real:
+            view = view * (1 - cv2.dilate(strips, ell(5)))      # no made-up strip lights in the window
+        # blown-out and flat only counts at a window (near what Claude marked as outdoors, or
+        # high up in the room with nothing marked): a blown sheet, a sun patch on the floor
+        # or a white pillow is relit, never drawn over by the model
+        if box is not None:
+            where = cv2.dilate(box, np.ones((int(0.1 * H) | 1, int(0.1 * W) | 1), np.uint8))
+        else:
+            where = np.zeros((H, W), np.float32)
+            where[:int(0.6 * H)] = 1
+    if where is not None:
+        n, lab, stats, _ = cv2.connectedComponentsWithStats((flat > 0.5).astype(np.uint8), connectivity=8)
+        ok = np.zeros(n, bool)
+        if n > 1:
+            inw = np.bincount(lab.ravel(), weights=where.ravel(), minlength=n) / np.maximum(stats[:, 4], 1)
+            ok[1:] = (inw[1:] > 0.6) & (stats[1:, 4] > 0.002 * H * W)
+        flat = flat * cv2.dilate(ok[lab].astype(np.uint8), ell(9)).astype(np.float32)
+    # only where the painting put something there (a view, a sky, a colour): a blown ceiling
+    # it left plain white too is relit, not swapped for its own white (a pale block)
+    tex_g = np.sqrt(cv2.GaussianBlur((lg - cv2.GaussianBlur(lg, (0, 0), 2.0)) ** 2, (0, 0), 3.0))
+    changed = (np.abs(lg - guide) > 0.08) | ((G.max(-1) - G.min(-1)) > 0.12) | (tex_g > 0.012)
+    changed = cv2.dilate(cv2.morphologyEx(changed.astype(np.uint8), cv2.MORPH_OPEN, ell(5)), ell(9)).astype(np.float32)
+    flat = flat * cv2.GaussianBlur(changed, (0, 0), 3)
+    if real and not evening:
+        # by day a blown window stays the photo's, relit: the model painted lamps on behind the
+        # glass (a sunroom came back glowing yellow on Blue sky day)
+        lampish = np.clip((((G[..., 0] - G[..., 2]) - (D[..., 0] - D[..., 2])) - 0.08) / 0.10, 0, 1)
+        flat = flat * (1 - cv2.GaussianBlur(cv2.dilate(lampish, ell(9)), (0, 0), 3))
     flat = _snap(flat, guide)
     lights = cv2.GaussianBlur(lights, (0, 0), 0.8)
-    if outdoors:
-        # Outside, the whole picture changes together (sky, hill, town, street): relit
-        # piece by piece it came out with a seam where Claude's sky box ended, the sky's
-        # blue on the trees next to it and the daytime haze over the town. The painted
-        # picture is used wherever it still matches the photo - the photo's own detail is
-        # laid back over it there, so every house, car and tree is the real one - and the
-        # relit photo only where the model changed something (a car it moved, a roof it
-        # redrew). Its made-up lights stay out, and along an edge it did not reach the
-        # painting's border carries on rather than a strip of different light.
-        rep_ = np.ones_like(guide)
-        if made_up is not None:
-            rep_ = rep_ * (1 - cv2.GaussianBlur(made_up, (0, 0), 2.0))
-        edge = cv2.GaussianBlur(1 - valid.astype(np.float32), (0, 0), 3.0)
-        rep_ = np.maximum(rep_, np.clip(edge * 2, 0, 1))
-        return m, np.clip(rep_, 0, 1).astype(np.float32)
-    rep_ = np.clip(np.maximum(np.maximum(flat, night), lights), 0, 1) * valid
+    # the sky and the view run to the frame's edge (the painting is carried out there, see
+    # extend_edges); a pane or a blown patch only where the model really painted
+    rep_ = np.clip(np.maximum(np.maximum(flat, lights) * valid, view), 0, 1)
     return m, rep_.astype(np.float32)
 
 
@@ -885,6 +1523,8 @@ def _edit_raw(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray
         out = _gemini_edit(photo, ex, prompt, seed)
     else:
         out = _openai_edit(photo, ex, prompt, seed)
+    import ai_usage
+    ai_usage.record(b, "" if b == "comfyui" else model_for(b), photo.shape[1], photo.shape[0])
     return out
 
 
@@ -1044,11 +1684,13 @@ class LookBody(BaseModel):
     prompt: str = Field(..., min_length=3, max_length=2000)
     tailor: bool = True
     real: bool = True       # keep the photo's own detail; only light, sky and window views change
+    blend: str = Field("detail", pattern=r"^(detail|strict)$")   # detail: all the painting's light on the photo's detail; strict: only light traced to the photo
     seed: Optional[int] = Field(None, ge=0, le=2 ** 31)
 
 
 def _public(x: dict) -> dict:
-    return {**{k: x.get(k) for k in ("id", "name", "prompt", "examples", "tailor", "seed")}, "real": x.get("real", True)}
+    return {**{k: x.get(k) for k in ("id", "name", "prompt", "examples", "tailor", "seed")}, "real": x.get("real", True),
+            "blend": x.get("blend", "detail")}
 
 
 @router.get("/looks")
@@ -1185,7 +1827,10 @@ def _admin(u: User):
 
 @router.get("/status")
 def status(current_user: User = Depends(get_current_user)):
-    return {"on": enabled(), "backend": backend(), "name": NAMES[backend()]}
+    import ai_usage
+    b = backend()
+    # what one full-size painting probably costs (the prices in Manage > AI), shown before paid actions
+    return {"on": enabled(), "backend": b, "name": NAMES[b], "price": ai_usage.estimate(b, GEN_PIXELS / 1e6)}
 
 
 @router.get("/settings")
@@ -1230,6 +1875,8 @@ def put_settings(body: ImageSettings, current_user: User = Depends(get_current_u
 def test(current_user: User = Depends(get_current_user)):
     """Paint one small picture end to end: proves the model loads and answers."""
     _admin(current_user)
+    import ai_usage
+    ai_usage.context.set({"kind": "test", "user": current_user.username})
     import cv2
     w, h = fit_size(4, 3, 512 * 512)
     img = np.zeros((h, w, 3), np.uint8)

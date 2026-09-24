@@ -800,6 +800,11 @@ def _pipeline(m: dict, src: Optional[str] = None):
                 _stage(m, "Cleaning up the scene", 0.98)
                 _finish_ply(m, d, plys[-1])
                 _done(m, "brush")
+        try:
+            _stage(m, "Compressing the scene for the viewer", 0.99)
+            m["spz_size"] = _write_spz(d)
+        except Exception as e:
+            print(f"splat: {m['id']}: no .spz ({e}); the viewer uses the .ply", flush=True)
         m["state"], m["stage"], m["progress"] = "done", "Ready", 1.0
         m["size"] = (d / "scene.ply").stat().st_size
         # the frames can go: the scene and the camera path are what is kept
@@ -854,6 +859,10 @@ def list_(video_id: Optional[int] = None, current_user: User = Depends(get_curre
         finally:
             db.close()
         for x in out:
+            if x.get("state") == "done":
+                n = _spz_ready(work_dir() / x["id"])
+                if n:
+                    x["spz_size"] = n
             x["thumb"] = th.get(x.get("video_id"))
     return {"items": out}
 
@@ -889,9 +898,63 @@ def new(body: NewBody, current_user: User = Depends(get_current_user)):
     return m
 
 
+def _write_spz(d: Path) -> int:
+    import spz
+    return spz.ply_to_spz(d / "scene.ply", d / "scene.spz")
+
+
+def _spz_ready(d: Path) -> Optional[int]:
+    """The .spz's size when it is there and made from the current scene.ply."""
+    z, p = d / "scene.spz", d / "scene.ply"
+    try:
+        if z.is_file() and z.stat().st_mtime >= p.stat().st_mtime:
+            return z.stat().st_size
+    except OSError:
+        pass
+    return None
+
+
+_spz_making: set = set()
+_spz_gate = threading.Lock()
+
+
+def _spz_later(sid: str, d: Path):
+    """A scene made before .spz existed (or rebuilt since): compressed in the background, once."""
+    with _lock:
+        if sid in _spz_making:
+            return
+        _spz_making.add(sid)
+
+    def go():
+        try:
+            with _spz_gate:            # one at a time: a big scene needs a few GB while it is read
+                n = _write_spz(d)
+            print(f"splat: {sid}: compressed to {n / 1e6:.0f} MB", flush=True)
+        except Exception as e:
+            print(f"splat: {sid}: could not compress the scene: {e}", flush=True)
+        finally:
+            with _lock:
+                _spz_making.discard(sid)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def _with_spz(m: dict) -> dict:
+    if m.get("state") != "done":
+        return m
+    d = work_dir() / m["id"]
+    n = _spz_ready(d)
+    if n:
+        m["spz_size"] = n
+    else:
+        m.pop("spz_size", None)
+        if (d / "scene.ply").is_file():
+            _spz_later(m["id"], d)
+    return m
+
+
 @router.get("/{sid}")
 def get(sid: str, current_user: User = Depends(get_current_user)):
-    m = _load(sid)
+    m = _with_spz(_load(sid))
     if m.get("state") == "done" and (not m.get("view") or m["view"].get("v") != VIEW_VERSION):
         # a scene made before the camera path was kept: work it out from the saved cameras
         try:
@@ -1028,6 +1091,127 @@ def delete(sid: str, current_user: User = Depends(get_current_user)):
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------
+# sharing a scene with the client: one link, and in the portals of its property
+# --------------------------------------------------------------------------
+
+def _shoot_of(m: dict) -> Optional[int]:
+    """The property the scene's footage belongs to (its folder), if any."""
+    if not m.get("folder_id"):
+        return None
+    db = SessionLocal()
+    try:
+        import shoots
+        from database import IndexedFolder
+        path = db.query(IndexedFolder.path).filter(IndexedFolder.id == m["folder_id"]).scalar()
+        s = shoots.shoot_for_path(db, path) if path else None
+        return s.id if s else None
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+@router.post("/{sid}/share")
+def share_scene(sid: str, current_user: User = Depends(get_current_user)):
+    """A link the client can open without an account: the scene to look around in, nothing to download."""
+    import secrets
+    m = _load(sid)
+    if m.get("state") != "done":
+        raise HTTPException(status_code=400, detail="The scene is not finished yet")
+    if not m.get("public"):
+        m["public"] = secrets.token_urlsafe(18)
+    m["shoot_id"] = _shoot_of(m)
+    _save(m)
+    return {"url": f"/3d/{m['public']}", "shoot_id": m["shoot_id"]}
+
+
+@router.delete("/{sid}/share")
+def unshare_scene(sid: str, current_user: User = Depends(get_current_user)):
+    m = _load(sid)
+    m.pop("public", None)
+    _save(m)
+    return {"ok": True}
+
+
+def _shared(token: str) -> tuple:
+    if not tools() or not re.fullmatch(r"[A-Za-z0-9_-]{16,40}", token or ""):
+        raise HTTPException(status_code=404, detail="This link is no longer available")
+    for p in work_dir().glob("*/meta.json"):
+        try:
+            m = json.loads(p.read_text())
+        except Exception:
+            continue
+        if m.get("public") == token and _mine(m) and m.get("state") == "done":
+            return m, p.parent
+    raise HTTPException(status_code=404, detail="This link is no longer available")
+
+
+def shared_for_shoot(shoot_id: Optional[int]) -> List[dict]:
+    """The scenes shared with the client for this property, for its portals."""
+    if not shoot_id or not tools():
+        return []
+    out = []
+    for p in sorted(work_dir().glob("*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            m = json.loads(p.read_text())
+        except Exception:
+            continue
+        if m.get("public") and m.get("shoot_id") == shoot_id and _mine(m) and m.get("state") == "done":
+            out.append({"name": m.get("name") or "3D walk-through", "url": f"/3d/{m['public']}",
+                        "poster": f"/api/public/3d/{m['public']}/poster.jpg?v={m.get('poster') or 0}"})
+    return out
+
+
+public_router = APIRouter(prefix="/api/public/3d", tags=["3d"])
+
+
+@public_router.get("/{token}")
+def public_scene(token: str):
+    m, d = _shared(token)
+    return {"name": m.get("name") or "3D walk-through", "view": m.get("view"),
+            "size": _spz_ready(d) or m.get("size"), "poster": m.get("poster")}
+
+
+@public_router.get("/{token}/scene")
+def public_scene_file(token: str):
+    m, d = _shared(token)
+    p = d / "scene.spz" if _spz_ready(d) else d / "scene.ply"
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="The scene is not built yet")
+    return FileResponse(str(p), media_type="application/octet-stream", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@public_router.get("/{token}/poster.jpg")
+def public_poster(token: str):
+    m, d = _shared(token)
+    p = d / "poster.jpg"
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="No picture yet")
+    return FileResponse(str(p), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get("/{sid}/scene.spz")
+def scene_spz(sid: str, request: Request, token: Optional[str] = None, download: bool = False):
+    """The scene compressed (about a tenth of the .ply), for the viewer and for sharing."""
+    from auth import get_user_from_token
+    db = SessionLocal()
+    try:
+        auth = request.headers.get("Authorization") or ""
+        get_user_from_token(token or auth[7:], db)
+    finally:
+        db.close()
+    m = _load(sid)
+    d = work_dir() / sid
+    if not _spz_ready(d):
+        raise HTTPException(status_code=404, detail="The compressed scene is not made yet")
+    p = d / "scene.spz"
+    if download:
+        name = re.sub(r'[\\/:*?"<>|]', "_", m.get("name") or sid) + ".spz"
+        return FileResponse(str(p), media_type="application/octet-stream", filename=name)
+    return FileResponse(str(p), media_type="application/octet-stream", headers={"Cache-Control": "private, max-age=86400"})
+
+
 @router.get("/{sid}/scene.ply")
 def scene(sid: str, request: Request, token: Optional[str] = None, download: bool = False):
     from auth import get_user_from_token
@@ -1118,5 +1302,6 @@ def install_log(current_user: User = Depends(get_current_user)):
 def install(app, resolve_media_path=None):
     global _resolve
     _resolve = resolve_media_path
+    app.include_router(public_router)
     app.include_router(router)
     threading.Thread(target=_resume_all, daemon=True).start()

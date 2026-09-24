@@ -91,6 +91,9 @@ RULES = [
     # sign in and out, change their own password, and mint the short-lived
     # tokens their browser needs to play back what they can already see.
     (ANY, r"^/api/(login|logout|me|me/password|video-access-token)$", None),
+    # Your own profile and picture, and the team column / chat (which check
+    # who may see what themselves).
+    (ANY, r"^/api/(team|access/(me|profile))(/|$)", None),
     # Pasting a copy makes new files; pasting a move only reorganises.
     (("POST",), r"^/api/videos/copy$", UPLOAD),
     (ANY, r"^/api/videos/\d+/download-token$", DOWNLOAD),
@@ -129,6 +132,9 @@ RULES = [
     (("POST", "DELETE"), r"^/api/photo-edit/\d+$", ANNOTATE),
     (("POST",), r"^/api/photo-edit/\d+/(pick|stars)$", ANNOTATE),
     (("GET",), r"^/api/photo-edit/\d+/snapshots$", READ),
+    (("GET",), r"^/api/photo-edit/\d+/history$", READ),
+    (("POST",), r"^/api/photo-edit/\d+/upright-guided$", READ),
+    (("PUT",), r"^/api/photo-edit/\d+/history$", ANNOTATE),
     (("POST", "DELETE"), r"^/api/photo-edit/\d+/snapshots(/\d+)?$", ANNOTATE),
     (("POST",), r"^/api/photo-edit/\d+/export$", UPLOAD),
     # Presets and copying settings onto other photos are annotations: they
@@ -150,6 +156,7 @@ RULES = [
     (ANY, r"^/api/proxies(/|$)", PROXY),
     (("POST",), r"^/api/videos/\d+/transcribe$", TRANSCRIBE),
     (("POST",), r"^/api/videos/batch-transcribe$", TRANSCRIBE),
+    (("POST",), r"^/api/videos/transcribe-all$", TRANSCRIBE),
 
     # Destroying things.
     (("POST",), r"^/api/trash/empty$", HARD_DELETE),
@@ -185,9 +192,17 @@ RULES = [
     # out and whether it was paid for. Editors and admins only - reading
     # included, because a client has no business browsing your job list.
     (ANY, r"^/api/shoots(/|$)", SHOOTS),
+    # The shoot pipeline works on a property's photos: the same people as the properties.
+    (ANY, r"^/api/pipeline(/|$)", SHOOTS),
+    # Importing from a camera card writes new files into the library.
+    (ANY, r"^/api/ingest(/|$)", UPLOAD),
+    # Enhance writes new (enlarged, cleaned) photos next to the originals.
+    (ANY, r"^/api/enhance(/|$)", UPLOAD),
     # The caption writer's settings: editors set hashtags and the sign-off
     # (the endpoint itself keeps the Claude key to administrators).
     (ANY, r"^/api/captions(/|$)", SHOOTS),
+    (ANY, r"^/api/invoices(/|$)", SHOOTS),
+    (ANY, r"^/api/archive(/|$)", ADMIN),
 
     # Sub-clips: marking a range is an annotation (the catch-all below);
     # rendering one writes a new file into the library; fetching the render

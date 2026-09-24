@@ -33,7 +33,7 @@ _resolve = lambda p: p
 # Where a job is up to. Deliberately short: a longer list is a list nobody
 # keeps up to date.
 # Delivered is the end of the line: payments are not handled here.
-STATUSES = ["shot", "editing", "posted"]
+STATUSES = ["booked", "shot", "editing", "posted"]
 DEFAULT_STATUS = "shot"
 
 
@@ -113,6 +113,26 @@ class Shoot(Base):
     floor_m2 = Column(Integer, nullable=True)
     erf_m2 = Column(Integer, nullable=True)
     features = Column(Text, nullable=True)           # one per line
+    # When the client paid. Until then the property's portals show the photos
+    # watermarked and refuse downloads. Zerko never takes the payment itself.
+    paid_at = Column(DateTime, nullable=True)
+    # What the client owes for the shoot, and the reference they pay with (Manage > Business
+    # makes one from the invoice prefix when this is empty). The client may say "I have paid"
+    # on the portal; it opens once you switch Paid on.
+    fee = Column(Float, nullable=True)
+    invoice_no = Column(String, nullable=True)
+    pay_claimed_at = Column(DateTime, nullable=True)
+    # a booking (booking.py): the owner, who booked (the agent's contacts), what was booked, and the link
+    # of its confirmation page
+    owner_name = Column(String, nullable=True)
+    owner_phone = Column(String, nullable=True)
+    owner_email = Column(String, nullable=True)
+    agency = Column(String, nullable=True)
+    booked_email = Column(String, nullable=True)
+    booked_phone = Column(String, nullable=True)
+    services = Column(Text, nullable=True)            # JSON [{name, price, minutes}]
+    booked_at = Column(DateTime, nullable=True)
+    book_token = Column(String, nullable=True, index=True)
 
 
 class Agent(Base):
@@ -222,6 +242,15 @@ def _cover(db: Session, shoot: Shoot, paths: List[str]) -> Optional[dict]:
             "folder_id": v.folder_id}
 
 
+def _json_list(s) -> list:
+    import json
+    try:
+        v = json.loads(s or "[]")
+        return v if isinstance(v, list) else []
+    except ValueError:
+        return []
+
+
 def _as_dict(db: Session, shoot: Shoot, with_counts: bool = True) -> dict:
     paths = [f.path for f in db.query(ShootFolder)
              .filter(ShootFolder.shoot_id == shoot.id)
@@ -244,6 +273,14 @@ def _as_dict(db: Session, shoot: Shoot, with_counts: bool = True) -> dict:
         "editing_at": shoot.editing_at.isoformat() if shoot.editing_at else None,
         "posted_at": shoot.posted_at.isoformat() if shoot.posted_at else None,
         "facts": facts_of(shoot),
+        "paid_at": shoot.paid_at.isoformat() if shoot.paid_at else None,
+        "fee": shoot.fee,
+        "invoice_no": shoot.invoice_no,
+        "pay_claimed_at": shoot.pay_claimed_at.isoformat() if shoot.pay_claimed_at else None,
+        "owner": {"name": shoot.owner_name, "phone": shoot.owner_phone, "email": shoot.owner_email},
+        "booking": ({"agency": shoot.agency, "email": shoot.booked_email, "phone": shoot.booked_phone,
+                     "services": _json_list(shoot.services), "at": shoot.booked_at.isoformat() if shoot.booked_at else None,
+                     "token": shoot.book_token} if shoot.booked_at else None),
     }
     if with_counts:
         out["counts"] = _counts(db, shoot)
@@ -363,6 +400,13 @@ class EditShoot(BaseModel):
     shoot_time: Optional[str] = None
     # the listing facts; a key sent as null clears it
     facts: Optional[dict] = None
+    # paid (downloads open on its portals) or not paid yet
+    paid: Optional[bool] = None
+    # what the client owes (0 or less clears it) and the invoice / payment reference
+    fee: Optional[float] = Field(None, ge=-1, le=10_000_000)
+    invoice_no: Optional[str] = Field(None, max_length=40)
+    # the owner's contacts ({name, phone, email}; a key sent as "" clears it)
+    owner: Optional[dict] = None
 
 
 class FolderRef(BaseModel):
@@ -486,6 +530,16 @@ def edit_shoot(shoot_id: int, body: EditShoot, db: Session = Depends(get_db),
         shoot.lat, shoot.lng = body.lat, body.lng
     if body.cover_video_id is not None:
         shoot.cover_video_id = body.cover_video_id or None
+    if body.paid is not None:
+        shoot.paid_at = (shoot.paid_at or datetime.utcnow()) if body.paid else None
+    if body.fee is not None:
+        shoot.fee = round(body.fee, 2) if body.fee > 0 else None
+    if body.invoice_no is not None:
+        shoot.invoice_no = body.invoice_no.strip() or None
+    if body.owner is not None:
+        for k in ("name", "phone", "email"):
+            if k in body.owner:
+                setattr(shoot, f"owner_{k}", (str(body.owner[k] or "").strip()[:200]) or None)
 
     db.commit()
     db.refresh(shoot)
@@ -931,6 +985,14 @@ def _remember_agent(db: Session, name: Optional[str]) -> None:
         db.add(Agent(name=n))
 
 
+def unpaid(db: Session, shoot_id: Optional[int]) -> bool:
+    """True when this property is not paid for yet: its portals stay watermarked, no downloads."""
+    if not shoot_id:
+        return False
+    s = db.query(Shoot.paid_at).filter(Shoot.id == shoot_id).first()
+    return bool(s) and s.paid_at is None
+
+
 def install(app, media_root, resolve_media_path):
     global _media_root, _resolve
     _media_root = Path(media_root) if media_root else None
@@ -946,9 +1008,18 @@ def install(app, media_root, resolve_media_path):
                                ("shoot_time", "VARCHAR"), ("editing_at", "DATETIME"), ("posted_at", "DATETIME"),
                                ("listing", "VARCHAR"), ("price", "INTEGER"), ("beds", "FLOAT"),
                                ("baths", "FLOAT"), ("parking", "INTEGER"), ("floor_m2", "INTEGER"),
-                               ("erf_m2", "INTEGER"), ("features", "TEXT"), ("kind", "VARCHAR")):
+                               ("erf_m2", "INTEGER"), ("features", "TEXT"), ("kind", "VARCHAR"),
+                               ("fee", "FLOAT"), ("invoice_no", "VARCHAR"), ("pay_claimed_at", "DATETIME"),
+                               ("owner_name", "VARCHAR"), ("owner_phone", "VARCHAR"), ("owner_email", "VARCHAR"),
+                               ("agency", "VARCHAR"), ("booked_email", "VARCHAR"), ("booked_phone", "VARCHAR"),
+                               ("services", "TEXT"), ("booked_at", "DATETIME"), ("book_token", "VARCHAR")):
                 if name not in cols:
                     conn.execute(text(f"ALTER TABLE shoots ADD COLUMN {name} {kind}"))
+            if "paid_at" not in cols:
+                # Downloads lock until a property is paid. Properties from before the lock
+                # count as paid, so links already with clients keep working.
+                conn.execute(text("ALTER TABLE shoots ADD COLUMN paid_at DATETIME"))
+                conn.execute(text("UPDATE shoots SET paid_at = COALESCE(posted_at, created_at, CURRENT_TIMESTAMP)"))
             # "invoiced" was dropped as a status; those jobs were delivered.
             # "delivered" became "posted" (shot -> editing -> posted)
             conn.execute(text("UPDATE shoots SET status = 'posted' WHERE status IN ('invoiced', 'delivered')"))
