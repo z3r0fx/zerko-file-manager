@@ -175,6 +175,40 @@ def put_site(shoot_id: int, body: SiteBody, db: Session = Depends(get_db), curre
     return _out(db, site)
 
 
+@router.get("/api/sites")
+def all_sites(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Every property's website, for the Websites tab: newest first, with the property's cover."""
+    import shoots
+    _may(current_user)
+    rows = db.query(ListingSite).order_by(ListingSite.id.desc()).all()
+    props = {s.id: s for s in db.query(shoots.Shoot).filter(shoots.Shoot.id.in_([r.shoot_id for r in rows])).all()} if rows else {}
+    out = []
+    for r in rows:
+        s = props.get(r.shoot_id)
+        if not s:
+            continue
+        cover = None
+        if s.cover_video_id:
+            v = db.query(Video).filter(Video.id == s.cover_video_id).first()
+            cover = v.thumbnail_path if v else None
+        out.append({"shoot_id": s.id, "address": s.address, "suburb": s.suburb, "agent": s.agent, "status": s.status,
+                    "slug": r.slug, "url": f"/l/{r.slug}", "on": bool(r.on), "views": r.views or 0, "cover": cover,
+                    "photos": len(json.loads(r.photos or "[]")), "video": bool(r.video_id), "scene": bool(r.scene),
+                    "created_at": r.created_at.isoformat() + "Z" if r.created_at else None})
+    return {"sites": out}
+
+
+@router.delete("/api/shoots/{shoot_id}/site")
+def delete_site(shoot_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Take a property's website away (its address stops working). The photos are not touched."""
+    _may(current_user)
+    site = _site_for(db, shoot_id, make=False)
+    if site:
+        db.delete(site)
+        db.commit()
+    return {"ok": True}
+
+
 # --------------------------------------------------------------------------
 # the public page
 # --------------------------------------------------------------------------

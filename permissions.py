@@ -202,6 +202,7 @@ RULES = [
     # (the endpoint itself keeps the Claude key to administrators).
     (ANY, r"^/api/captions(/|$)", SHOOTS),
     (ANY, r"^/api/invoices(/|$)", SHOOTS),
+    (ANY, r"^/api/sites$", SHOOTS),
     (ANY, r"^/api/archive(/|$)", ADMIN),
 
     # Sub-clips: marking a range is an annotation (the catch-all below);

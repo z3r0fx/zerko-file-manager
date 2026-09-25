@@ -53,6 +53,26 @@ NAMES = {"off": "Off", "comfyui": "My own PC (ComfyUI)", "fal": "fal.ai key", "g
 # Qwen Image Edit works at about one megapixel; the result is laid over the
 # full-size photo as light and colour, the photo's own detail kept under it
 GEN_PIXELS = 1024 * 1024
+# The finishing models a look can ask for (through the fal.ai key), for the ListingLabs kind of
+# look where the model's relight is the result: they draw at 2K and more, so they get a bigger photo.
+FINISH_MODELS = {"seedream": "fal-ai/bytedance/seedream/v4.5/edit", "nbpro": "fal-ai/nano-banana-pro/edit"}
+FINISH_NAMES = {"default": "The usual model", "auto": "Best for the photo", "seedream": "Seedream 4.5", "nbpro": "Nano Banana Pro"}
+FINISH_PIXELS = 2048 * 1366
+# Seedream costs the same at any size up to 4K: it gets a bigger photo and draws a sharper picture
+SEEDREAM_PIXELS = 3200 * 2134
+# per picture, US dollars (fal.ai, September 2026)
+MODEL_PRICES = {"fal-ai/bytedance/seedream/v4.5/edit": 0.04, "fal-ai/nano-banana-pro/edit": 0.15}
+
+
+def finish_model(look: dict, outdoors: bool = False) -> str:
+    """The fal model this look paints with ("" = the usual one). "auto": Seedream inside (bold, cheap,
+    keeps rooms), Nano Banana Pro outside (keeps mountains and rooflines where Seedream redrew them)."""
+    m = (look.get("model") or "default").strip()
+    if m == "default" or backend() != "fal":
+        return ""
+    if m == "auto":
+        m = "nbpro" if outdoors else "seedream"
+    return FINISH_MODELS.get(m, "")
 
 
 class ImageOff(ai.AiOff):
@@ -564,6 +584,96 @@ def local_match(g: np.ndarray, d: np.ndarray) -> np.ndarray:
     return np.clip((agree - 0.4) / 0.35, 0, 1).astype(np.float32) * np.clip(edges / (np.median(edges) + 1e-6), 0.3, 1)
 
 
+def local_align(g: np.ndarray, d: np.ndarray, valid: Optional[np.ndarray] = None) -> tuple:
+    """The painting moved onto the photo point by point. A finishing model that redraws the whole room
+    shifts parts of it (a chair 20-100 px over, a table edge bent); lined up only as a whole, the
+    photo's own detail laid over it then shows every edge twice. Dense optical flow on local contrast
+    (the relight changed the brightness everywhere), smoothed, and never more than 8% of the width.
+    Returns (painting, valid) lined up."""
+    import cv2
+    def norm(x):
+        x = cv2.cvtColor(x, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        m = cv2.GaussianBlur(x, (0, 0), 15)
+        s = np.sqrt(cv2.GaussianBlur((x - m) ** 2, (0, 0), 15)) + 4
+        return np.clip((x - m) / s * 40 + 128, 0, 255).astype(np.uint8)
+    try:
+        dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        flow = dis.calc(norm(d), norm(g), None)
+    except Exception as e:
+        print(f"ai_image: local align skipped: {e}", flush=True)
+        return g, valid
+    h, w = d.shape[:2]
+    flow = cv2.GaussianBlur(flow, (0, 0), max(2.0, 0.001 * w))
+    mag = np.linalg.norm(flow, axis=2, keepdims=True)
+    lim = 0.08 * w
+    flow = flow * np.minimum(1.0, lim / (mag + 1e-6))
+    gx, gy = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    mx, my = gx + flow[..., 0], gy + flow[..., 1]
+    g2 = cv2.remap(g, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    v2 = None
+    if valid is not None:
+        v2 = cv2.remap(valid.astype(np.float32), mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    # only when it lines up better than before (a flow that went wrong is not used)
+    if match_score(g2, d) < match_score(g, d):
+        return g, valid
+    return g2, v2
+
+
+def shape_agree(g: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """0..1 per spot: the painting has the photo's shapes there (a pillow, a bed, a wall - even if it
+    smoothed their pattern); plain areas count as agreeing. Low where it drew something else: a new
+    view through a window, a new sky, a thing it took away."""
+    import cv2
+    lg = np.log(cv2.cvtColor(g, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    ld = np.log(cv2.cvtColor(d, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    s_ = 0.004 * max(g.shape[:2])
+
+    def grads(x):
+        x = cv2.GaussianBlur(x, (0, 0), s_)
+        return cv2.Sobel(x, cv2.CV_32F, 1, 0), cv2.Sobel(x, cv2.CV_32F, 0, 1)
+    ax, ay = grads(lg)
+    bx, by = grads(ld)
+    w = np.sqrt(bx * bx + by * by)
+    cos = (ax * bx + ay * by) / (w * np.sqrt(ax * ax + ay * ay) + 1e-6)
+    S = 0.015 * max(g.shape[:2])
+    agree = cv2.GaussianBlur(cos * w, (0, 0), S) / (cv2.GaussianBlur(w, (0, 0), S) + 1e-4)
+    edges = cv2.GaussianBlur(w, (0, 0), S)
+    plain = np.clip(1 - edges / (0.5 * np.median(edges) + 1e-6), 0, 1)
+    return np.maximum(np.clip((agree - 0.2) / 0.35, 0, 1), plain).astype(np.float32)
+
+
+def lost_shapes(g: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """Where the photo has a clear shape - an armchair in the foreground, a table, a car - whose
+    edges the painting no longer follows at all (the model took it away or turned it into
+    something else), 0..1, whole regions only (a few percent of the frame and up). Sun patches
+    and shadows the model added cross plain floors and walls, which have no shape to lose."""
+    import cv2
+    lg = np.log(cv2.cvtColor(g, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    ld = np.log(cv2.cvtColor(d, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255 + 0.02)
+    s_ = 0.004 * max(g.shape[:2])
+
+    def grads(x):
+        x = cv2.GaussianBlur(x, (0, 0), s_)
+        return cv2.Sobel(x, cv2.CV_32F, 1, 0), cv2.Sobel(x, cv2.CV_32F, 0, 1)
+    ax, ay = grads(lg)
+    bx, by = grads(ld)
+    w = np.sqrt(bx * bx + by * by)
+    cos = (ax * bx + ay * by) / (w * np.sqrt(ax * ax + ay * ay) + 1e-6)
+    S = 0.02 * max(g.shape[:2])
+    agree = cv2.GaussianBlur(cos * w, (0, 0), S) / (cv2.GaussianBlur(w, (0, 0), S) + 1e-4)
+    edges = cv2.GaussianBlur(w, (0, 0), S)
+    lost = ((agree < 0.25) & (edges > 0.8 * np.median(edges))).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(lost, 8)
+    keep = np.zeros_like(lost)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= 0.012 * lost.size:
+            keep[lab == i] = 1
+    if not keep.any():
+        return np.zeros(lost.shape, np.float32)
+    keep = cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(S) | 1, int(S) | 1)))
+    return cv2.GaussianBlur(keep.astype(np.float32), (0, 0), S / 2)
+
+
 def match_score(g: np.ndarray, d: np.ndarray) -> float:
     """How well the painting keeps the photo's layout, 0..1: whether its edges run the same
     way as the photo's, weighted by the photo's own edges. Good paintings score 0.6 to 1
@@ -918,7 +1028,7 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
         spike = np.clip((ex_g - np.maximum(ex_d, 0) - 0.10) / 0.08, 0, 1) * (1 - warm) * (1 - lights)
         spike = cv2.dilate(cv2.morphologyEx(spike, cv2.MORPH_OPEN, ell(5)), ell(15))
         strips = np.zeros_like(guide)
-        if evening and not outdoors:
+        if (evening or blend == "commit") and not outdoors:
             # thin warm lines the model drew that stand out from everything round them (LED
             # strips round a window frame, along a ceiling) and are not a light
             # in the photo: made up, their glow too
@@ -936,6 +1046,8 @@ def light_maps(g: np.ndarray, d: np.ndarray, keep: np.ndarray, valid: np.ndarray
             # relit with the light round it - not with the glow the model put in its place
             made_up = np.maximum(made_up, _gone(guide, lg, G, D))
         made_up = np.clip(np.maximum(made_up, spike), 0, 1)
+        if extra is not None:
+            extra["made_up"] = made_up
     # Light is smooth: it changes at edges (a roofline, a window frame) but not
     # inside a textured wall. A wide edge-aware filter takes the light and
     # leaves the model's own version of every texture behind - with a narrow
@@ -1447,13 +1559,21 @@ def _idle_watch():
 threading.Thread(target=_idle_watch, daemon=True).start()
 
 
-def _fal_edit(photo, examples, prompt, seed):
+def _fal_edit(photo, examples, prompt, seed, model: str = ""):
     k = _key("fal")
     imgs = ["data:image/jpeg;base64," + base64.b64encode(to_jpeg(x)).decode() for x in [photo, *examples[:2]]]
-    body = {"prompt": prompt, "image_urls": imgs, "num_images": 1, "seed": seed, "output_format": "png",
-            "enable_safety_checker": False, "image_size": {"width": photo.shape[1], "height": photo.shape[0]}}
+    model = model or model_for("fal")
+    if "nano-banana" in model:
+        body = {"prompt": prompt, "image_urls": imgs, "num_images": 1, "output_format": "png", "aspect_ratio": "auto",
+                "resolution": "2K"}
+    elif "seedream" in model:
+        body = {"prompt": prompt, "image_urls": imgs, "num_images": 1, "seed": seed, "enable_safety_checker": False,
+                "image_size": {"width": photo.shape[1], "height": photo.shape[0]}}
+    else:
+        body = {"prompt": prompt, "image_urls": imgs, "num_images": 1, "seed": seed, "output_format": "png",
+                "enable_safety_checker": False, "image_size": {"width": photo.shape[1], "height": photo.shape[0]}}
     try:
-        d = _json(f"https://fal.run/{model_for('fal')}", body, {"Authorization": f"Key {k}"}, timeout=300)
+        d = _json(f"https://fal.run/{model}", body, {"Authorization": f"Key {k}"}, timeout=400)
     except urllib.error.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"fal.ai answered {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
     url = ((d.get("images") or [{}])[0]).get("url")
@@ -1505,7 +1625,8 @@ def edit(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray]] = 
     return align(_edit_raw(photo, prompt, examples, seed), photo)[0]
 
 
-def _edit_raw(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray]] = None, seed: Optional[int] = None) -> np.ndarray:
+def _edit_raw(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray]] = None, seed: Optional[int] = None,
+              model: str = "") -> np.ndarray:
     b = backend()
     if not enabled():
         raise ImageOff("Image generation is off: set it up in Manage > AI > Image generation.")
@@ -1518,19 +1639,20 @@ def _edit_raw(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray
             out = _comfy_edit(photo, ex, prompt, seed)
             _last_use[0] = time.time()
     elif b == "fal":
-        out = _fal_edit(photo, ex, prompt, seed)
+        out = _fal_edit(photo, ex, prompt, seed, model)
     elif b == "gemini":
         out = _gemini_edit(photo, ex, prompt, seed)
     else:
         out = _openai_edit(photo, ex, prompt, seed)
     import ai_usage
-    ai_usage.record(b, "" if b == "comfyui" else model_for(b), photo.shape[1], photo.shape[0])
+    ai_usage.record(b, "" if b == "comfyui" else (model if b == "fal" and model else model_for(b)), photo.shape[1], photo.shape[0])
     return out
 
 
-def edit_aligned(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray]] = None, seed: Optional[int] = None):
+def edit_aligned(photo: np.ndarray, prompt: str, examples: Optional[List[np.ndarray]] = None, seed: Optional[int] = None,
+                 model: str = ""):
     """Like edit(), and where the lined-up picture has real content."""
-    raw = _edit_raw(photo, prompt, examples, seed)
+    raw = _edit_raw(photo, prompt, examples, seed, model)
     return align(raw, photo)
 
 
@@ -1684,13 +1806,16 @@ class LookBody(BaseModel):
     prompt: str = Field(..., min_length=3, max_length=2000)
     tailor: bool = True
     real: bool = True       # keep the photo's own detail; only light, sky and window views change
-    blend: str = Field("detail", pattern=r"^(detail|strict)$")   # detail: all the painting's light on the photo's detail; strict: only light traced to the photo
+    # detail: all the painting's light on the photo's detail; strict: only light traced to the photo;
+    # commit: the model's relit picture is the result, with the photo's fine detail laid back where it matches
+    blend: str = Field("detail", pattern=r"^(detail|strict|commit)$")
+    model: str = Field("default", pattern=r"^(default|auto|seedream|nbpro)$")
     seed: Optional[int] = Field(None, ge=0, le=2 ** 31)
 
 
 def _public(x: dict) -> dict:
     return {**{k: x.get(k) for k in ("id", "name", "prompt", "examples", "tailor", "seed")}, "real": x.get("real", True),
-            "blend": x.get("blend", "detail")}
+            "blend": x.get("blend", "detail"), "model": x.get("model", "default")}
 
 
 @router.get("/looks")
@@ -1727,6 +1852,58 @@ def delete_look(look_id: str, current_user: User = Depends(get_current_user)):
         looks = [x for x in _looks_load() if x.get("id") != look_id]
         _looks_save(looks)
     return {"ok": True}
+
+
+# The relight set (after ListingLabs, the owner's reference): the model relights the whole photo and that
+# relight is the result. Added from Manage > Looks by the studio itself, never on its own.
+RELIGHT_SET = [
+    {"name": "Golden hour side light", "prompt": "Relight it as late golden hour: warm, low sunlight comes in from one side, "
+     "through the windows indoors, casting long soft-edged shadows and warm highlights across the floor, walls and furniture "
+     "(outdoors: across the walls, lawn and paving, with a warm clear sky). The lamps and ceiling lights that are there glow softly."},
+    {"name": "Blue hour", "prompt": "Relight it as blue hour just after sunset: a clear, deep blue sky, soft even light with no "
+     "hard shadows, every window glowing warm from the lights inside, the light fittings that are there switched on. Calm and "
+     "cool outside, warm inside."},
+    {"name": "True dusk", "prompt": "Relight it as true dusk: a deep blue evening sky with a soft warm glow low at the horizon, "
+     "every window glowing warm from the lights inside, garden and outside lights on, soft ambient light on the walls. "
+     "Indoors: the lamps and ceiling lights on and warm, the windows showing the dusk sky."},
+    {"name": "Soft morning", "prompt": "Relight it as a soft, bright morning: gentle sunlight from low on one side, a pale clear "
+     "sky with a little haze, light and airy, soft shadows, fresh neutral whites with a hint of warmth."},
+    {"name": "Warm evening inside", "prompt": "Relight this room for a cosy evening: the lamps and ceiling lights that are there "
+     "switched on with a warm glow and soft pools of light, the windows showing a deep blue dusk outside, warm and inviting "
+     "but not orange."},
+    {"name": "Bright and clean", "prompt": "Relight it as a bright, clean, airy daytime interior: soft, even daylight "
+     "filling the whole room from the windows, crisp neutral whites on the walls and ceiling with no yellow, blue or green "
+     "cast, true colours on the furniture and floor, gentle soft shadows, the window views clear and balanced (not blown "
+     "white), fresh and inviting like a magazine interior. Lights may stay off."},
+    {"name": "Wet surfaces fix", "prompt": "Dry every wet surface: puddles, wet paving, a wet deck, wet roads and dark damp patches "
+     "become dry and even, as on a dry day. Keep the light, the sky and everything else as it is."},
+]
+
+
+class StarterBody(BaseModel):
+    replace: bool = False
+
+
+@router.post("/looks/relight-set")
+def add_relight_set(body: StarterBody, current_user: User = Depends(get_current_user)):
+    """Add the relight set (or put it in place of the studio's looks, which are kept in a backup file)."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Administrators only")
+    with _looks_lock:
+        looks = _looks_load()
+        if body.replace and looks:
+            from datetime import datetime
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            (LOOKS_FILE.parent / f"ai_looks.before-relight-{stamp}.json").write_text(json.dumps(looks, indent=1))
+            looks = []
+        have = {x.get("name") for x in looks}
+        for x in RELIGHT_SET:
+            if x["name"] in have:
+                continue
+            looks.append({"id": uuid.uuid4().hex[:10], "examples": [], "tailor": True, "seed": None, "real": True,
+                          "blend": "commit", "model": "auto", **x})
+        _looks_save(looks)
+        return {"looks": [_public(x) for x in looks]}
 
 
 class OrderBody(BaseModel):
@@ -1830,7 +2007,8 @@ def status(current_user: User = Depends(get_current_user)):
     import ai_usage
     b = backend()
     # what one full-size painting probably costs (the prices in Manage > AI), shown before paid actions
-    return {"on": enabled(), "backend": b, "name": NAMES[b], "price": ai_usage.estimate(b, GEN_PIXELS / 1e6)}
+    return {"on": enabled(), "backend": b, "name": NAMES[b], "price": ai_usage.estimate(b, GEN_PIXELS / 1e6),
+            "finish": {k: MODEL_PRICES[v] for k, v in FINISH_MODELS.items()} if b == "fal" else {}}
 
 
 @router.get("/settings")

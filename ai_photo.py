@@ -1035,6 +1035,109 @@ def _scene(d) -> Optional[str]:
     return "outdoors" if x.startswith("out") else "indoors" if x.startswith("in") else None
 
 
+def _whole_things(photo: np.ndarray, lost: np.ndarray) -> np.ndarray:
+    """A lost shape is found where its edges were clearest (the top of an armchair); Segment Anything,
+    given a point in it, finds the whole thing in the photo. Without the model, the shape as found."""
+    import cv2
+    import hashlib
+    hard = (lost > 0.5).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(hard, 8)
+    if n <= 1:
+        return lost
+    out = lost.copy()
+    key = ("lost", hashlib.sha1(photo[::7, ::7].tobytes()).hexdigest())
+    h, w = hard.shape
+    for i in range(1, n):
+        comp = (lab == i).astype(np.uint8)
+        dist = cv2.distanceTransform(comp, cv2.DIST_L2, 5)
+        y, x = np.unravel_index(int(dist.argmax()), dist.shape)
+        try:
+            import editor_ai
+            if not editor_ai._have_files():
+                continue
+            sm = editor_ai.sam_click(photo, key, [(x / w, y / h)], [1], (h, w))
+        except Exception as e:
+            print(f"ai_photo: whole-thing mask skipped: {e}", flush=True)
+            continue
+        area = float((sm > 0.5).mean())
+        over = float(((sm > 0.5) & (comp > 0)).sum()) / max(1, comp.sum())
+        # the thing it found must hold the shape and not be the whole room (a wall, the floor)
+        if 0.005 < area < 0.35 and over > 0.3:
+            out = np.maximum(out, cv2.GaussianBlur(cv2.dilate((sm > 0.5).astype(np.float32), np.ones((9, 9), np.uint8)), (0, 0), 3))
+    return out
+
+
+def commit_keep(keep: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """A relight that keeps the room lines up with the photo, so more of the photo's own fine detail
+    (carpet, fabric, wood grain) goes back over the painting - the painting is drawn smaller and
+    softer than the photo. Where the fine structure really differs it still stays the painting's."""
+    return np.clip(keep * 1.35 + 0.15, 0, 1) * valid
+
+
+def guard_commit(g: np.ndarray, photo: np.ndarray, m: np.ndarray, rep: np.ndarray, valid: np.ndarray, made_up) -> tuple:
+    """A look that keeps the model's light shows its picture everywhere it painted - except where it
+    changed things: a thing it took away (the armchair in the foreground) or a light it made up (LED
+    strips along the skirting). There the photo's own pixels stay, relit with the light round them."""
+    import cv2
+    lost = _whole_things(photo, ai_image.lost_shapes(g, photo))
+    thin = None
+    if made_up is not None:
+        # only thin made-up lights (LED strips, a new fitting's line): a wide warm band across the
+        # floor is the sun the look is for
+        mu = made_up.astype(np.float32)
+        k = max(3, int(0.008 * max(mu.shape)) | 1)
+        thin = np.clip(mu - cv2.morphologyEx(mu, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))), 0, 1)
+        # a made-up strip runs along a real edge of the photo (the skirting, a ceiling line); the edge
+        # of a sun patch lies on plain floor, where the photo has none
+        edges = cv2.Canny(cv2.cvtColor(photo, cv2.COLOR_RGB2GRAY), 40, 120)
+        near = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))).astype(np.float32) / 255
+        thin = cv2.dilate(thin * near, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    sus = lost if thin is None else np.maximum(lost, cv2.GaussianBlur(thin, (0, 0), 2))
+    rep = np.maximum(rep, valid.astype(np.float32) * (1 - np.clip(sus * 1.5, 0, 1)))
+    # the light over a lost thing (wide, from all round it) and over a made-up strip and its glow
+    # (narrow, from just beside it): not the floor or the glow the model drew there
+    def fill(m, soft, sigma):
+        mask = cv2.resize(soft, (m.shape[1], m.shape[0]))
+        hard = (mask > 0.5).astype(np.float32)
+        mf = m.astype(np.float32)
+        s_ = sigma * max(m.shape[:2])
+        num = cv2.GaussianBlur(mf * (1 - hard)[..., None], (0, 0), s_)
+        den = cv2.GaussianBlur(1 - hard, (0, 0), s_)[..., None] + 1e-4
+        return np.clip(mf * (1 - mask[..., None]) + (num / den) * mask[..., None] + 0.5, 0, 255).astype(np.uint8)
+    if lost.max() > 0.05:
+        m = fill(m, lost, 0.06)
+    if thin is not None and thin.max() > 0.05:
+        glow = cv2.GaussianBlur(cv2.dilate(thin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))), (0, 0), 4)
+        m = fill(m, np.clip(glow * 1.5, 0, 1), 0.012)
+    return m, rep, sus
+
+
+def relight_texture(g: np.ndarray, photo: np.ndarray, sus: np.ndarray, valid: np.ndarray) -> tuple:
+    """The relight's light with the photo's own texture: the painting's broad light and colour (its
+    sun patches, shadows, glow) under the photo's fine detail (the damask on a pillow, the blanket's
+    weave), which the model smooths away when it relights. Where it draws its own picture on purpose
+    (a view through a window, a sky) or changed a thing, the painting stays as it is.
+    Returns the new painting and where the photo's texture went in (0..1)."""
+    import cv2
+    w = ai_image.shape_agree(g, photo) * (1 - np.clip(sus * 1.5, 0, 1)) * valid
+    G, D = g.astype(np.float32) / 255, photo.astype(np.float32) / 255
+    s_ = max(1.5, 0.0012 * max(g.shape[:2]))
+    gl, dl = cv2.GaussianBlur(G, (0, 0), s_), cv2.GaussianBlur(D, (0, 0), s_)
+    # where the painting has detail the photo never had (a view painted into a blown-out window, clouds
+    # in a white sky) its own detail stays: the photo has nothing there to lay back
+    L1 = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    eg = np.sqrt(cv2.GaussianBlur(((G - gl) @ L1) ** 2, (0, 0), 3 * s_))
+    ed = np.sqrt(cv2.GaussianBlur(((D - dl) @ L1) ** 2, (0, 0), 3 * s_))
+    w = w * np.clip(1 - (eg - 2.0 * ed - 0.004) / 0.008, 0, 1)
+    w = cv2.GaussianBlur(w, (0, 0), 2 * s_)
+    L = np.array([0.2126, 0.7152, 0.0722], np.float32)
+    # the detail scaled by how much brighter or darker the relight made that spot
+    r = np.clip((gl @ L + 0.02) / (dl @ L + 0.02), 0.1, 8.0)[..., None]
+    t = gl + (D - dl) * r
+    out = t * w[..., None] + G * (1 - w[..., None])
+    return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8), w
+
+
 def outside_boxes(photo: np.ndarray) -> tuple:
     """(the outdoors boxes, "outdoors"/"indoors"), for a look whose words are used as they are."""
     if not ai.enabled():
@@ -1100,21 +1203,31 @@ def _words(look: dict, body: GenBody, photo: np.ndarray) -> tuple:
     return (base, *outside_boxes(photo)) if look.get("real", True) else (base, None, None)
 
 
+COMMIT_MIN = 0.6          # a finishing model's relight must keep the photo's layout this well to be used (good ones: 0.9+)
+
+
 def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, rec: dict, photo: np.ndarray, words):
     import cv2
     words, outside, scene = (tuple(words) + (None, None))[:3] if isinstance(words, tuple) else (words, None, None)
     prompt = ai_image.look_prompt({**look, "prompt": words}, len(examples))
+    model = "" if body.preview else ai_image.finish_model(look, ai_image.is_outdoors(scene, outside))
+    commit = look.get("blend") == "commit" and not look.get("stage")
+    if model and "seedream" not in model and photo.shape[0] * photo.shape[1] > ai_image.FINISH_PIXELS * 1.1:
+        # Nano Banana Pro draws at 2K (4K costs double): the photo at its size
+        w_, h_ = ai_image.fit_size(photo.shape[1], photo.shape[0], ai_image.FINISH_PIXELS)
+        photo = ai_image.resize(photo, w_, h_)
     import ai_usage
     for n in range(body.variations):
         seed = body.seed if body.seed is not None else look.get("seed")
         seed = int(seed) + n if seed is not None else random.randint(1, 2 ** 31 - 1)
         ai_usage.context.set({"video_id": vid, "look": look.get("name", ""), "user": j.get("user"),
                               "kind": "stage" if look.get("stage") else ("preview" if body.preview else "look")})
-        g, valid = ai_image.edit_aligned(photo, prompt, examples, seed)
+        g, valid = ai_image.edit_aligned(photo, prompt, examples, seed, model)
         real = look.get("real", True) and not look.get("stage")
         score = ai_image.match_score(g, photo)
         ev = ai_image.wants_evening(look.get("prompt", ""))
-        if real and (score < ai_image.MATCH_MIN or ai_image.missed_look(g, photo, ev)):
+        # (a finishing model costs more: no second painting; its result is shown as it came)
+        if real and not model and (score < ai_image.MATCH_MIN or ai_image.missed_look(g, photo, ev)):
             # the model drew a different picture (moved the mountain, the houses): once more,
             # and the better of the two is kept
             ai_usage.context.set({**ai_usage.context.get(), "kind": "retry"})
@@ -1125,6 +1238,25 @@ def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, r
             bad2 = s2 < ai_image.MATCH_MIN or ai_image.missed_look(g2, photo, ev)
             if (bad1 and not bad2) or (bad1 == bad2 and s2 > score):
                 g, valid, score, seed = g2, v2, s2, seed2
+        if model and real:
+            # a finishing model redraws the room and shifts parts of it: lined up point by point
+            g, valid = ai_image.local_align(g, photo, valid)
+            score = ai_image.match_score(g, photo)
+        if model and real and score < COMMIT_MIN:
+            # a finishing model that drew another room (wider, reframed, a second window) instead of
+            # relighting this one: Seedream is tried once more as Nano Banana Pro, which keeps the
+            # framing; if that misses too nothing is kept - never a painting laid over the wrong room
+            if "seedream" in model:
+                ai_usage.context.set({**ai_usage.context.get(), "kind": "retry"})
+                m2 = ai_image.FINISH_MODELS["nbpro"]
+                g2, v2 = ai_image.edit_aligned(photo, prompt, examples, seed, m2)
+                g2, v2 = ai_image.local_align(g2, photo, v2)
+                s2 = ai_image.match_score(g2, photo)
+                if s2 > score:
+                    g, valid, score, model = g2, v2, s2, m2
+            if score < COMMIT_MIN:
+                raise HTTPException(status_code=422, detail="The model drew a different room instead of relighting this one, so "
+                                    "nothing was kept. Paint it again, or try another look.")
         loose = bool(real and score < ai_image.MATCH_MIN)
         name = "gen" + uuid.uuid4().hex[:12]
         d = pe.mask_dir(vid)
@@ -1134,12 +1266,20 @@ def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, r
         if look.get("label"):
             g = ai_image.label_staged(g)
         keep = ai_image.detail_keep(g, photo) * valid
+        if commit:
+            keep = commit_keep(keep, valid)
         ex_: dict = {}
         m, rep_ = ai_image.light_maps(g, photo, keep, valid, real=look.get("real", True), outside=outside,
                                       outdoors=ai_image.is_outdoors(scene, outside),
                                       neutral=ai_image.wants_neutral(look.get("prompt", "")),
                                       evening=ai_image.wants_evening(look.get("prompt", "")), loose=loose,
-                                      blend=look.get("blend", "detail"), extra=ex_)
+                                      blend="commit" if commit else look.get("blend", "detail"), extra=ex_)
+        if commit:
+            # the model's light is the look: its picture shows wherever it did not change things
+            m, rep_, sus_ = guard_commit(g, photo, m, rep_, valid, ex_.get("made_up"))
+            raw_g = g
+            g, tex = relight_texture(g, photo, sus_, valid)
+            keep = np.maximum(keep, tex)
         m = hi_light(vid, _path(_video(db, vid)), rec, m, photo, ex_.get("sky"))
         # BGR: B where the model painted, G where its picture shows, R where the photo's detail goes back
         k8 = (np.dstack([valid, rep_, keep]) * 255 + 0.5).astype(np.uint8)
@@ -1148,10 +1288,14 @@ def _gen_one(db, j: dict, body: GenBody, vid: int, look: dict, examples: list, r
                          ("m", cv2.cvtColor(m, cv2.COLOR_RGB2BGR)), ("k", k8)):
             if not cv2.imwrite(str(d / f"{name}{end}.png"), img):
                 raise HTTPException(status_code=500, detail="Could not save the look")
+        if commit:
+            # the model's own picture, kept so the texture can be worked out again later
+            cv2.imwrite(str(d / f"{name}r.png"), cv2.cvtColor(ai_image.extend_edges(raw_g, valid), cv2.COLOR_RGB2BGR))
         item = {"video_id": vid, "ref": f"{vid}/{name}", "look": look.get("name", ""), "look_id": look.get("id"),
                 "prompt": words, "geo": frame_sig(rec), "made": datetime.utcnow().isoformat(), "stage": look.get("stage"),
                 "maps": MAPS_VERSION, "outside": outside, "scene": scene, "match": round(score, 3), "loose": loose,
-                "seed": seed, "preview": bool(body.preview), "pipeline": body.pipeline}
+                "seed": seed, "preview": bool(body.preview), "pipeline": body.pipeline, "commit": commit,
+                "model": model or None}
         # a note beside the pictures, so the photo's looks are listed again next time
         (d / f"{name}.json").write_text(json.dumps(item))
         j["items"].append(item)
@@ -1177,6 +1321,10 @@ def _gen_run(j: dict, body: GenBody):
                 path = _path(v)
                 rec = body.recipe if (body.recipe is not None and len(body.video_ids) == 1) else saved_recipe(db, vid)
                 photo = gen_input(vid, path, rec, PREVIEW_PIXELS if body.preview else 0)
+                # a look with a finishing model (a quick look never uses one: it is only to judge by) gets a bigger photo
+                big = None
+                if not body.preview and any((l.get("model") or "default") != "default" for l in looks) and ai_image.backend() == "fal":
+                    big = gen_input(vid, path, rec, ai_image.SEEDREAM_PIXELS)
                 # Claude writes every look's instruction at once; the card then paints them in turn
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(max_workers=min(4, len(looks))) as pool:
@@ -1186,7 +1334,8 @@ def _gen_run(j: dict, body: GenBody):
                     # (a twilight came back as a different house, garden and camera) and only the light could be
                     # used. The look's words carry the finish; the examples stay the look's picture in the lists.
                     ex = ai_image.look_examples(look) if look.get("id") and look.get("send_examples") else []
-                    _gen_one(db, j, body, vid, look, ex, rec, photo, w)
+                    fine = big is not None and (look.get("model") or "default") != "default"
+                    _gen_one(db, j, body, vid, look, ex, rec, big if fine else photo, w)
                 if body.apply and j["items"]:
                     it = j["items"][-1]
                     cur = saved_recipe(db, vid)
@@ -1212,7 +1361,7 @@ def _gen_run(j: dict, body: GenBody):
         db.close()
 
 
-MAPS_VERSION = 14          # how the light and where-it-paints maps are worked out; older ones are redone
+MAPS_VERSION = 17          # how the light and where-it-paints maps are worked out; older ones are redone
 _remapping: set = set()
 
 
@@ -1272,11 +1421,18 @@ def _rebuild_maps(ref: str):
     import shutil
     vid, name = ref.split("/")
     d = pe.mask_dir(int(vid))
-    g = cv2.imread(str(d / f"{name}g.png"), cv2.IMREAD_COLOR)
+    g = cv2.imread(str(d / f"{name}r.png"), cv2.IMREAD_COLOR)       # a kept relight: the model's own picture
+    if g is None:
+        g = cv2.imread(str(d / f"{name}g.png"), cv2.IMREAD_COLOR)
     p = cv2.imread(str(d / f"{name}d.png"), cv2.IMREAD_COLOR)
     if g is None or p is None:
         raise HTTPException(status_code=404, detail="That result is gone - make it again")
     g, p = cv2.cvtColor(g, cv2.COLOR_BGR2RGB), cv2.cvtColor(p, cv2.COLOR_BGR2RGB)
+    try:
+        if json.loads((d / f"{name}.json").read_text()).get("model"):
+            g, _ = ai_image.local_align(g, p)          # results from before it was lined up point by point
+    except Exception:
+        pass
     real = True
     note = {}
     look_words, blend = "", "detail"
@@ -1291,6 +1447,8 @@ def _rebuild_maps(ref: str):
     kk = cv2.imread(str(d / f"{name}k.png"), cv2.IMREAD_COLOR)
     valid = ai_image.painted_area(g, p, kk)
     keep = ai_image.detail_keep(g, p) * valid
+    if note.get("commit") or blend == "commit":
+        keep = commit_keep(keep, valid)
     if note and "outside" not in note and real:
         note["outside"], note["scene"] = outside_boxes(p)      # a result from before the outdoors was marked
     score = ai_image.match_score(g, p)
@@ -1301,7 +1459,15 @@ def _rebuild_maps(ref: str):
     m, rep_ = ai_image.light_maps(g, p, keep, valid, real=real, outside=note.get("outside"), loose=loose,
                                   outdoors=ai_image.is_outdoors(note.get("scene"), note.get("outside")),
                                   neutral=ai_image.wants_neutral(look_words),
-                                  evening=ai_image.wants_evening(look_words), blend=blend, extra=ex_)
+                                  evening=ai_image.wants_evening(look_words),
+                                  blend="commit" if (note.get("commit") or blend == "commit") else blend, extra=ex_)
+    tex_g = None
+    if note.get("commit") or blend == "commit":
+        if not (d / f"{name}r.png").is_file():
+            cv2.imwrite(str(d / f"{name}r.png"), cv2.cvtColor(g, cv2.COLOR_RGB2BGR))
+        m, rep_, sus_ = guard_commit(g, p, m, rep_, valid, ex_.get("made_up"))
+        tex_g, tex = relight_texture(g, p, sus_, valid)
+        keep = np.maximum(keep, tex)
     # the light lined up with the full-size photo, when the photo is still framed as it was painted
     from database import SessionLocal
     db = SessionLocal()
@@ -1313,7 +1479,9 @@ def _rebuild_maps(ref: str):
     finally:
         db.close()
     k8 = (np.dstack([valid, rep_, keep]) * 255 + 0.5).astype(np.uint8)
-    if (valid < 0.5).any():
+    if tex_g is not None:
+        cv2.imwrite(str(d / f"{name}g.png"), cv2.cvtColor(ai_image.extend_edges(tex_g, valid), cv2.COLOR_RGB2BGR))
+    elif (valid < 0.5).any():
         cv2.imwrite(str(d / f"{name}g.png"), cv2.cvtColor(ai_image.extend_edges(g, valid), cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(d / f"{name}m.png"), cv2.cvtColor(m, cv2.COLOR_RGB2BGR))
     cv2.imwrite(str(d / f"{name}k.png"), k8)
@@ -1339,7 +1507,10 @@ def gens(video_id: int, current_user: User = Depends(get_current_user)):
         if not (d / f"{f.stem}g.png").is_file() or not (d / f"{f.stem}d.png").is_file():
             continue
         try:
-            out.append(json.loads(f.read_text()))
+            it = json.loads(f.read_text())
+            if it.get("model") and (it.get("match") or 0) < COMMIT_MIN:
+                continue          # a finishing model that drew another room (before that was caught)
+            out.append(it)
         except Exception:
             continue
     # results made before the maps got better are redone in the background (no repaint)
@@ -1389,6 +1560,44 @@ def look_results(look_id: str, db: Session = Depends(get_db), current_user: User
         if len(out) >= 12:
             break
     return {"items": out}
+
+
+@router.get("/made")
+def made(limit: int = 200, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Everything painted lately, newest first, across all photos (the Looks tab's Everything you made): each
+    result with its photo's name and whether it is the look on the photo now. Found through the paintings log."""
+    import ai_usage
+    rows = (db.query(ai_usage.AiUsage.video_id).filter(ai_usage.AiUsage.video_id.isnot(None))
+            .order_by(ai_usage.AiUsage.at.desc()).limit(3000).all())
+    vids = list(dict.fromkeys(r.video_id for r in rows))[:300]
+    names = {v.id: v.filename for v in db.query(Video).filter(Video.id.in_(vids)).all()} if vids else {}
+    on = {}
+    if vids:
+        for r in db.query(pe.PhotoEdit.video_id, pe.PhotoEdit.recipe).filter(pe.PhotoEdit.video_id.in_(vids)).all():
+            try:
+                on[r.video_id] = json.loads(r.recipe or "{}").get("gen_ref") or ""
+            except ValueError:
+                pass
+    out = []
+    for vid in vids:
+        if vid not in names:
+            continue
+        d = pe.mask_dir(vid)
+        for f in d.glob("gen*.json"):
+            try:
+                x = json.loads(f.read_text())
+            except Exception:
+                continue
+            if x.get("preview") or not (d / f"{f.stem}g.png").is_file():
+                continue
+            if x.get("model") and (x.get("match") or 0) < COMMIT_MIN:
+                continue
+            x["filename"] = names[vid]
+            x["on_photo"] = on.get(vid) == x.get("ref")
+            x.setdefault("made", datetime.utcfromtimestamp(f.stat().st_mtime).isoformat())
+            out.append(x)
+    out.sort(key=lambda x: x.get("made") or "", reverse=True)
+    return {"items": out[:max(1, min(limit, 500))]}
 
 
 class GenExampleBody(BaseModel):

@@ -71,7 +71,9 @@ def record(backend: str, model: str, width: int, height: int) -> None:
             shoot_id = ctx.get("shoot_id")
             if shoot_id is None and ctx.get("video_id"):
                 shoot_id = _shoot_of(db, ctx["video_id"])
-            db.add(AiUsage(backend=backend, model=model, megapixels=round(mp, 3), cost=estimate(backend, mp),
+            import ai_image
+            cost = ai_image.MODEL_PRICES.get(model or "")
+            db.add(AiUsage(backend=backend, model=model, megapixels=round(mp, 3), cost=cost if cost is not None else estimate(backend, mp),
                            kind=ctx.get("kind") or "look", video_id=ctx.get("video_id"), shoot_id=shoot_id,
                            look=(ctx.get("look") or "")[:80], user=ctx.get("user")))
             db.commit()
